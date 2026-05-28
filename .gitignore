@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+logs/
+*.log
+sessions.json
+.env
+.antigravitycli/
+test_out.txt
+test_stderr.txt
+test_stdout.txt
