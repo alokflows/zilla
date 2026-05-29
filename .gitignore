@@ -8,3 +8,10 @@ sessions.json
 test_out.txt
 test_stderr.txt
 test_stdout.txt
+
+.env
+
+agy_bot_instance.lock
+selected_model.txt
+settings.json
+sessions.json

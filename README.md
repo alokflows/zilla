@@ -1,43 +1,43 @@
-# AGI Telegram Bot (Thin Pipe)
+# 🚀 AGY Telegram Bot (Version 1.0 - Stable)
 
-This repository contains the source code for a Telegram Bot that acts as a "Thin Pipe" interface to the Antigravity CLI, turning it into an accessible, persistent AGI Brain.
+The AGY Telegram Bot acts as a powerful "thin pipe" UI connecting you directly to your local Antigravity (AGY) agent engine. It allows you to operate a fully autonomous AI assistant locally from anywhere in the world via your mobile phone.
 
-## Overview
-Instead of building complex conversation logic into the bot itself, this bot is designed with a specific philosophy: **The bot does zero thinking.** It takes user input from Telegram (text, voice, images, documents), standardizes it, and pipes it directly to the Antigravity CLI engine. The AI handles all the reasoning, web searching, and task execution, and the bot simply relays the result back to Telegram.
+## ✨ What's New in Version 1.0 (The Big Update)
 
-## Core Features
-1. **Direct Pass-Through (`bot.py` & `agy_runner.py`)**:
-   - Any text message sent to the bot is forwarded directly to the Antigravity CLI. 
-   - State and conversation IDs are mapped to Telegram sessions using `sessions.py`, allowing continuous, context-aware conversations.
+This major release transforms the bot from a basic text-relay script into a robust, state-aware AI assistant capable of advanced multitasking, background execution, and direct file management.
 
-2. **Voice Transcription (`audio_handler.py`)**:
-   - Accepts direct Telegram Voice Notes (`.ogg`).
-   - Uses `ffmpeg` and `pydub` to convert the audio into `16kHz` mono `.wav` files.
-   - Transcribes the audio locally using Google Speech Recognition.
-   - The resulting text transcript is piped directly into the AI as if the user typed it.
+### 🛡️ Iron-Clad Stability
+*   **The Single-Instance "Kill Switch":** Rebuilt the startup logic with aggressive OS-level file locking (`msvcrt`). This permanently prevents multiple ghost instances of the bot from running simultaneously and causing Telegram API conflicts.
+*   **FORCE_KILL_BOT.bat:** A dedicated script has been added to forcefully sweep and terminate any background Python processes instantly, ensuring you always have a clean slate.
 
-3. **Media & Document Handling (`file_handler.py`)**:
-   - Photos, Documents, and Videos sent to the bot are automatically downloaded.
-   - Files are fed into the AI, allowing it to perform visual analysis on photos or summarize documents.
+### 🧠 Deep UI Integration
+*   **Live Settings Persistence:** The UI Settings menu now actively communicates with the local `SettingsManager`. Toggling "Auto Describe Photos" or changing the "Max Sub-Agents" count instantly persists across restarts.
+*   **Dynamic Skills Menu:** The Skills menu now actively queries the local agent environment. It instantly displays installed native skills (like Kimi WebBridge).
 
-4. **Karpathy-Inspired AGI-Brain (`brain_manager.py`)**:
-   - Automatically maintains a structured local file system (the "Brain") in the user's directory (`C:\Users\Isha\AGI-Brain`).
-   - Contains an `Inbox/` (for raw incoming media and telegram drops) and a `Knowledge/` base (for transcripts, notes, and research summaries).
-   - Serves as the AI's long-term memory and working directory.
+### 📤 Automated File Delivery Queue
+*   **Telegram File Sender Skill:** A dedicated skill was injected into the AI engine. Whenever you ask the agent to "send", "give", or "upload" a file, the AI is strictly instructed to output the absolute Windows file path.
+*   **Auto-Regex Uploader:** The bot actively scans the agent's thoughts in real-time. If it detects a generated file path, the bot automatically grabs the file from your local hard drive and uploads it to your Telegram chat.
+*   **Sub-Agent Queue System:** If you ask for 5 separate reports, the AI will use parallel sub-agents to generate them. The bot's internal queue system will capture up to 10 files at once and deliver them to your phone sequentially.
 
-## Setup Requirements
-1. **Python Dependencies**:
-   - `python-telegram-bot`
-   - `pydub`
-   - `SpeechRecognition`
-2. **External Tools**:
-   - `ffmpeg` must be present in the Tools directory (`AGI-Brain\Tools\ffmpeg\ffmpeg.exe`) for audio conversion to work.
-3. **Environment**:
-   - Configured via `config.py` with your `BOT_TOKEN` and allowed user ID.
+### 🌐 Browser Automation (Kimi WebBridge)
+*   **Native Web Integration:** Because the bot acts as a direct pipe to the Antigravity engine, it automatically inherits the Kimi WebBridge capability. 
+*   **The Hands and Legs:** The AI can now safely open a local Chrome browser window on your machine, navigate Wikipedia, scrape GitHub repositories, and execute complex web navigation tasks—all commanded remotely from your phone.
 
-## Running the Bot
-Run the bot locally using:
-```bash
-python bot.py
+### 🏗️ Future-Proof Architecture (Version 2 Roadmap)
+*   **Modular Workspaces:** We have successfully laid the architectural groundwork (`workspaces_manager.py`) for a highly modular external API system. This will soon allow seamless OAuth integration directly into Google Drive, Docs, and Calendar.
+*   **GUI Desktop Application:** The next major milestone (Version 2) will transition this console-based script into a fully-fledged Windows Graphical Application.
+
+---
+
+## 🛠️ Setup & Security
+
+**Security First:** All hardcoded credentials have been securely scrubbed from `config.py`. 
+To run the bot, you must create a local `.env` file in this directory containing your keys. (This file is ignored by git to prevent accidental credential leaks).
+
+**`.env` Format:**
 ```
-The bot will verify the brain directory structure on startup and begin polling for Telegram updates.
+TELEGRAM_BOT_TOKEN="YOUR_TOKEN_HERE"
+TELEGRAM_OWNER_ID="YOUR_USER_ID"
+```
+
+Enjoy seamless, remote control over your local AGI!
