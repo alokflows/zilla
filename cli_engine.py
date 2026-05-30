@@ -540,8 +540,6 @@ def run_cli(
         pty = winpty.PTY(200, 1000, backend=CONPTY_BACKEND, agent_config=COLOR_ESCAPES)
         pty.spawn(command, cwd=CLI_WORKING_DIR, env=env_str)
 
-        if progress_callback:
-            progress_callback("🧠 Processing your request...")
         poller.start()
 
         output_chunks = []

@@ -108,11 +108,46 @@ def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]
 
 
 async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
+    """
+    Show Telegram typing indicator. Rules:
+    - First 60 seconds: just typing bubble, NO messages
+    - After 60s: send "⏳ Still working on it..."
+    - Then every 30s: send "⏳ Still processing..." so user knows bot is alive
+    """
+    start = asyncio.get_event_loop().time()
+    notified_60 = False
+    last_alive_msg = 0.0
+
     while not stop_event.is_set():
         try:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception:
             pass
+
+        elapsed = asyncio.get_event_loop().time() - start
+
+        # After 60s: first "still working" message
+        if elapsed >= 60 and not notified_60:
+            notified_60 = True
+            last_alive_msg = elapsed
+            try:
+                await bot.send_message(chat_id=chat_id, text="⏳ Still working on it...")
+            except Exception:
+                pass
+
+        # After that: every 30s send alive ping
+        elif notified_60 and (elapsed - last_alive_msg) >= 30:
+            last_alive_msg = elapsed
+            minutes = int(elapsed) // 60
+            secs = int(elapsed) % 60
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏳ Still processing... ({minutes}m {secs}s)"
+                )
+            except Exception:
+                pass
+
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=4.0)
             break
