@@ -51,7 +51,6 @@ from config import (
     BOT_TOKEN, OWNER_CHAT_ID, USERS_FILE, SESSIONS_FILE,
     TELEGRAM_MAX_LENGTH, TELEGRAM_MAX_SEND_FILE, BOT_VERSION,
     AGI_BRAIN_DIR, HOME_DIR, ensure_dirs, KIMI_BRIDGE_URL,
-    OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES,
     get_model, set_model, get_timeout, get_setting, set_setting,
 )
 from sessions import SessionManager
@@ -1032,46 +1031,6 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"WebBridge error: {str(e)[:300]}")
 
 
-# ══════════════════════════════════════════════════════════
-#  OUTBOX WATCHER — Auto-deliver files CLI drops in Outbox
-# ══════════════════════════════════════════════════════════
-
-_outbox_seen: set = set()
-
-
-async def outbox_watcher(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic job: scan Outbox for new files and auto-send to owner."""
-    global _outbox_seen
-
-    if not OWNER_CHAT_ID:
-        return
-
-    for folder in [OUTBOX_DOCUMENTS, OUTBOX_IMAGES]:
-        if not os.path.isdir(folder):
-            continue
-        for fname in os.listdir(folder):
-            fpath = os.path.join(folder, fname)
-            if not os.path.isfile(fpath):
-                continue
-            if fpath in _outbox_seen:
-                continue
-            _outbox_seen.add(fpath)
-            # Skip files modified more than 60 seconds ago (old files)
-            try:
-                age = time.time() - os.path.getmtime(fpath)
-                if age > 60:
-                    continue
-            except Exception:
-                continue
-            try:
-                await safe_send_file(
-                    context.bot, OWNER_CHAT_ID, fpath,
-                    caption=f"📤 Outbox: {fname}", user_id=OWNER_CHAT_ID,
-                )
-                logger.info(f"[OUTBOX] Auto-delivered: {fname}")
-            except Exception as e:
-                logger.error(f"[OUTBOX] Failed to deliver {fname}: {e}")
-
 
 # ══════════════════════════════════════════════════════════
 #  ERROR HANDLER
@@ -1193,9 +1152,6 @@ def main():
 
     # Error handler
     app.add_error_handler(error_handler)
-
-    # Outbox watcher — auto-deliver files every 10 seconds
-    app.job_queue.run_repeating(outbox_watcher, interval=10, first=5)
 
     # Run
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

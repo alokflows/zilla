@@ -74,6 +74,33 @@ KIMI_BRIDGE_URL = "http://127.0.0.1:10086"
 SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
+#
+# ┌─────────────────────────────────────────────────────────┐
+# │  MANUAL USER MANAGEMENT                                │
+# │                                                         │
+# │  Option 1: Use Telegram (owner only)                    │
+# │    /adduser <telegram_id>                               │
+# │    /removeuser <telegram_id>                            │
+# │                                                         │
+# │  Option 2: Edit authorized_users.json directly          │
+# │    Format:                                              │
+# │    {                                                    │
+# │      "TELEGRAM_USER_ID": {                              │
+# │        "name": "Friend Name",                           │
+# │        "role": "user",                                  │
+# │        "added_at": "2026-01-01 00:00:00"                │
+# │      }                                                  │
+# │    }                                                    │
+# │                                                         │
+# │    Roles: "user" (normal), "admin" (skip permissions)   │
+# │    The OWNER (TELEGRAM_OWNER_ID in .env) is always      │
+# │    authorized — no need to add them here.               │
+# │                                                         │
+# │  How to get someone's Telegram ID:                      │
+# │    1. They message @userinfobot on Telegram             │
+# │    2. Or forward their message to @userinfobot          │
+# │    3. The ID is the number (e.g. 1278335195)            │
+# └─────────────────────────────────────────────────────────┘
 
 # --- Telegram Limits ---
 TELEGRAM_MAX_LENGTH = 4000
