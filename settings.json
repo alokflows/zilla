@@ -1,0 +1,9 @@
+{
+  "model": "gemini-3.1-pro",
+  "timeout": 60,
+  "progress_style": "minimal",
+  "auto_describe_photos": false,
+  "max_agents": 10,
+  "whisper_model": "base",
+  "cli_backend": "agy"
+}

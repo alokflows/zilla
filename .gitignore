@@ -1,18 +1,30 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Environment
+.env
+venv/
+.venv/
+
+# State files (regenerated at runtime)
+*.lock
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Logs
 logs/
-*.log
-sessions.json
-authorized_users.json
-.env
-.antigravitycli/
-test_out.txt
-test_stderr.txt
-test_stdout.txt
 
-.env
+# OS
+Thumbs.db
+.DS_Store
 
-agy_bot_instance.lock
-selected_model.txt
-settings.json
-sessions.json
+# IDE
+.vscode/
+.idea/

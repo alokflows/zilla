@@ -1,0 +1,17 @@
+{
+  "sessions": {
+    "8740189938_main": {
+      "original_name": "main",
+      "user_id": 8740189938,
+      "created": "2026-05-30 15:14:54",
+      "messages": 3,
+      "last_seen_step": 0,
+      "conversation_id": "4e4de375-d906-47f7-98d7-4976467fcc56",
+      "last_used": "2026-05-30 15:45:17",
+      "source": "telegram"
+    }
+  },
+  "active_per_user": {
+    "0": "main"
+  }
+}
