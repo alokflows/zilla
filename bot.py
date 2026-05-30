@@ -1,48 +1,29 @@
 # ============================================================
-#  agy Telegram Bot v7 — THIN PIPE + INTERACTIVE UI
+#  AGY Telegram Bot v8 — THIN PIPE TO CLI
 # ============================================================
 #
-#  PHILOSOPHY:
-#  The bot is a THIN PIPE between Telegram and Antigravity CLI.
-#  - User sends message → pass DIRECTLY to agy → send response
-#  - Agy handles EVERYTHING: thinking, searching, decomposing
-#  - We don't wrap, classify, orchestrate, or modify the message
-#  - We just forward it and return the clean result
+#  The bot is a THIN WRAPPER around the AI CLI.
+#  - User sends message → pass DIRECTLY to CLI → send response
+#  - CLI does ALL the thinking. Bot just relays.
+#  - Bot's unique value: Telegram UI + file bridge + media
 #
-#  NEW in v7:
-#  - Interactive button menus (/menu)
-#  - Real-time progress via transcript polling
-#  - Sub-agent orchestration with async monitoring
-#  - Settings panel (model, timeout, progress style)
-#  - Skills management
-#  - File sending to user (bot → Telegram)
-#  - Image analysis (auto-describe photos)
-#  - Startup notification
-#  - Error recovery with buttons
-#  - Conversation dump bug fix
-#
-#  COMMANDS:
+#  Commands:
 #  /start     — Welcome + status
 #  /help      — Full command reference
 #  /ping      — Health check
-#  /menu      — Master control panel
+#  /menu      — Master control panel (inline buttons)
 #  /new       — New session
-#  /sessions  — List sessions (button UI)
+#  /sessions  — List sessions
 #  /switch    — Switch session
 #  /end       — End current session
 #  /model     — Select AI model
-#  /agents    — Sub-agent dashboard
-#  /sub       — Spawn background task
-#  /brain     — AGI-Brain stats
-#  /inbox     — Show inbox items
-#  /note      — Save a note
-#  /web       — Web search via agy
-#  /skills    — Manage skills
 #  /settings  — Bot settings
-#  /service   — Bot status & uptime
-#  Send photo — Auto-save + analyze
-#  Send voice — Auto-transcribe + respond
-#  Send doc   — Auto-save to inbox
+#  /adduser   — Add authorized user (owner only)
+#  /removeuser — Remove user (owner only)
+#  /brain     — Inbox stats
+#  Send voice — Transcribe first, then CLI
+#  Send photo — Save + analyze
+#  Send doc   — Save to inbox
 # ============================================================
 
 import asyncio
@@ -50,9 +31,10 @@ import sys
 import os
 import logging
 import time
+import json
 from datetime import datetime
 
-from telegram import Update, ForceReply
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -64,47 +46,23 @@ from telegram.ext import (
     TypeHandler,
     ApplicationHandlerStop,
 )
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import (
-    BOT_TOKEN,
-    OWNER_CHAT_ID,
-    USERS_FILE,
-    TELEGRAM_MAX_LENGTH,
-    TELEGRAM_MAX_SEND_FILE,
-    AGI_BRAIN_DIR,
-    AGY_TIMEOUT,
-    BOT_VERSION,
-    SETTINGS_FILE,
-    AGENTS_FILE,
-    MAX_CONCURRENT_AGENTS,
-    SKILLS_DIR,
+    BOT_TOKEN, OWNER_CHAT_ID, USERS_FILE, SESSIONS_FILE,
+    TELEGRAM_MAX_LENGTH, TELEGRAM_MAX_SEND_FILE, BOT_VERSION,
+    AGI_BRAIN_DIR, HOME_DIR, ensure_dirs, KIMI_BRIDGE_URL,
+    OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES,
+    get_model, set_model, get_timeout, get_setting, set_setting,
 )
-
 from sessions import SessionManager
-from agy_runner import run_agy_async
-from brain_manager import (
-    ensure_brain_structure,
-    save_note,
-    save_research,
-    save_transcript,
-    get_brain_stats,
-    get_inbox_pending,
+from cli_engine import run_cli_async, get_latest_step
+from media import (
+    is_audio_capable, get_audio_status, transcribe_audio,
+    save_photo, save_voice, save_audio, save_document, save_video,
+    get_inbox_stats, get_inbox_items, format_file_size,
 )
-from audio_handler import transcribe_audio, is_audio_capable, get_audio_status
-from file_handler import (
-    save_photo,
-    save_voice,
-    save_audio,
-    save_document,
-    save_video,
-    format_file_size,
-)
-from settings_manager import SettingsManager
-from agent_manager import AgentManager
-from skills_manager import SkillsManager
-from telegram_formatter import format_for_telegram, detect_file_paths
-from user_manager import AuthorizedUsersManager
+from formatter import format_for_telegram, detect_file_paths
+from users import AuthManager
 
 # ── Logging ────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -123,12 +81,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Track bot start time for uptime
 BOT_START_TIME = time.time()
 
-# Chat bus — injected by gui_app.py for GUI message capture
-# When None, no messages are captured (headless mode)
-chat_bus = None
+# ── Global State ───────────────────────────────────────────
+sessions: SessionManager = None
+auth: AuthManager = None
 
 
 # ══════════════════════════════════════════════════════════
@@ -136,7 +93,6 @@ chat_bus = None
 # ══════════════════════════════════════════════════════════
 
 def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]:
-    """Split long messages for Telegram's 4096-char limit."""
     if len(text) <= max_length:
         return [text]
     chunks = []
@@ -153,7 +109,6 @@ def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]
 
 
 async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
-    """Send typing indicator every 4 seconds until stopped."""
     while not stop_event.is_set():
         try:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -167,114 +122,196 @@ async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
 
 
 async def safe_send(bot, chat_id: int, text: str, parse_mode: str = None):
-    """Send a message safely."""
     try:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
     except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+        logger.error(f"Failed to send: {e}")
 
 
 async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None,
                          conv_id: str = None, user_id: int = None):
-    """Send a file to the user if it exists, is within size limits,
-    and passes the path allowlist check."""
-    # SECURITY: Verify recipient is authorized before sending any file
-    if user_id is not None and not auth_manager.is_authorized(user_id):
-        logger.warning(f"SECURITY: Blocked file send to unauthorized user {user_id}")
+    """Send a file to the user if it passes security checks."""
+    if user_id is not None and not auth.is_authorized(user_id):
         return False
 
     if not os.path.exists(filepath):
-        logger.warning(f"[FILE] Not found: {filepath}")
         return False
 
-    # Security: validate file path against allowlist
-    normalized = os.path.normpath(filepath).lower()
-    from config import AGI_BRAIN_DIR, HOME_DIR
-    SAFE_PREFIXES = [
-        os.path.normpath(os.path.join(HOME_DIR, "Downloads")).lower(),
-        os.path.normpath(AGI_BRAIN_DIR).lower(),
-        os.path.normpath(os.path.dirname(os.path.abspath(__file__))).lower(),
+    # Security: validate against allowlist
+    abs_path = os.path.abspath(filepath).lower()
+    safe_prefixes = [
+        os.path.abspath(HOME_DIR).lower(),
+        os.path.abspath(AGI_BRAIN_DIR).lower(),
     ]
-    # If we have a conversation ID, allow files from that specific brain dir
+    # Allow temp directory (for screenshots etc.)
+    temp_dir = os.environ.get("TEMP", os.environ.get("TMP", ""))
+    if temp_dir:
+        safe_prefixes.append(os.path.abspath(temp_dir).lower())
     if conv_id:
         from config import BRAIN_DIR
-        conv_dir = os.path.normpath(os.path.join(BRAIN_DIR, conv_id)).lower()
-        SAFE_PREFIXES.append(conv_dir)
+        safe_prefixes.append(
+            os.path.abspath(os.path.join(BRAIN_DIR, os.path.basename(conv_id))).lower()
+        )
 
-    path_allowed = any(normalized.startswith(prefix) for prefix in SAFE_PREFIXES)
-    if not path_allowed:
-        logger.warning(f"[FILE] BLOCKED — path outside allowlist: {filepath}")
+    if not any(abs_path == p or abs_path.startswith(p + os.sep) for p in safe_prefixes):
+        logger.warning(f"[FILE] BLOCKED: {filepath}")
         return False
 
     size = os.path.getsize(filepath)
     if size > TELEGRAM_MAX_SEND_FILE:
-        logger.warning(f"[FILE] Too large ({size} bytes): {filepath}")
-        await safe_send(bot, chat_id, f"⚠️ File too large to send ({format_file_size(size)} > 50MB)")
+        await safe_send(bot, chat_id, f"⚠️ File too large ({format_file_size(size)} > 50MB)")
         return False
 
     try:
         with open(filepath, "rb") as f:
             await bot.send_document(
-                chat_id=chat_id,
-                document=f,
+                chat_id=chat_id, document=f,
                 caption=caption or os.path.basename(filepath),
             )
         logger.info(f"[FILE] Sent: {filepath} ({format_file_size(size)})")
         return True
     except Exception as e:
-        logger.error(f"[FILE] Failed to send: {e}")
+        logger.error(f"[FILE] Send failed: {e}")
         return False
 
 
-def is_authorized(update: Update) -> bool:
-    """Check if user is authorized via AuthorizedUsersManager.
-    Reloads from disk every time to catch revocations instantly."""
-    user_id = update.effective_user.id
-    # Re-read from disk to catch real-time revocations
-    auth_manager._load_fresh()
-    if not auth_manager.is_authorized(user_id):
-        user_name = update.effective_user.first_name or "Unknown"
-        logger.warning(f"[AUTH] BLOCKED unauthorized user {user_id} ({user_name})")
-        return False
-    return True
+def get_uptime_str() -> str:
+    elapsed = int(time.time() - BOT_START_TIME)
+    d, r = divmod(elapsed, 86400)
+    h, r = divmod(r, 3600)
+    m, _ = divmod(r, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return " ".join(parts)
+
 
 async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """SECURITY: Global auth gate — runs before ALL handlers at group -1.
-    Unauthorized users get dead silence; no error, no acknowledgement."""
-    if update.effective_user and not is_authorized(update):
-        # Prevent callback query spinner for unauthorized users
+    """Global auth gate — runs before ALL handlers."""
+    if not update.effective_user:
+        raise ApplicationHandlerStop()
+    auth.reload()
+    if not auth.is_authorized(update.effective_user.id):
         if update.callback_query:
             await update.callback_query.answer()
         raise ApplicationHandlerStop()
 
 
-def get_uptime_str() -> str:
-    """Get bot uptime as human-readable string."""
-    elapsed = int(time.time() - BOT_START_TIME)
-    days, remainder = divmod(elapsed, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    return " ".join(parts)
+# ══════════════════════════════════════════════════════════
+#  KEYBOARDS (inline buttons — all in one place)
+# ══════════════════════════════════════════════════════════
+
+def kb_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📁 Sessions", callback_data="menu_sessions"),
+         InlineKeyboardButton("🤖 Model", callback_data="menu_model")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
+         InlineKeyboardButton("📥 Inbox", callback_data="menu_inbox")],
+        [InlineKeyboardButton("🌐 Browse", callback_data="menu_browse"),
+         InlineKeyboardButton("🖥️ Status", callback_data="menu_status")],
+    ])
 
 
+def kb_sessions(all_sessions: dict, active: str):
+    buttons = []
+    for name, info in all_sessions.items():
+        marker = " ◀" if name == active else ""
+        msgs = info.get("messages", 0)
+        buttons.append([InlineKeyboardButton(
+            f"{name}{marker} ({msgs} msgs)",
+            callback_data=f"sess_switch_{name}",
+        )])
+    buttons.append([
+        InlineKeyboardButton("➕ New", callback_data="sess_new"),
+        InlineKeyboardButton("◀ Menu", callback_data="menu_back"),
+    ])
+    return InlineKeyboardMarkup(buttons)
 
+
+def kb_session_detail(name: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔀 Switch", callback_data=f"sess_switch_{name}"),
+         InlineKeyboardButton("🗑️ Delete", callback_data=f"sess_delete_{name}")],
+        [InlineKeyboardButton("◀ Sessions", callback_data="sess_list")],
+    ])
+
+
+def kb_delete_confirm(name: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, delete", callback_data=f"sess_confirm_del_{name}"),
+         InlineKeyboardButton("❌ Cancel", callback_data="sess_list")],
+    ])
+
+
+def kb_model(current: str):
+    models = [
+        ("Gemini 2.5 Pro", "gemini-2.5-pro"),
+        ("Gemini 2.5 Flash", "gemini-2.5-flash"),
+        ("Gemini 2.0 Flash", "gemini-2.0-flash"),
+        ("Gemini 3.1 Pro", "gemini-3.1-pro"),
+        ("Claude Sonnet 4", "claude-sonnet-4"),
+        ("Claude Opus 4", "claude-opus-4"),
+    ]
+    buttons = []
+    for display, model_id in models:
+        marker = " ✓" if model_id == current else ""
+        buttons.append([InlineKeyboardButton(
+            f"{display}{marker}", callback_data=f"model_{model_id}",
+        )])
+    buttons.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def kb_settings():
+    auto_photo = get_setting("auto_describe_photos", True)
+    timeout = get_timeout()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"📸 Auto-analyze photos: {'ON' if auto_photo else 'OFF'}",
+            callback_data="set_toggle_photo",
+        )],
+        [InlineKeyboardButton(
+            f"⏱️ Timeout: {timeout}s",
+            callback_data="set_cycle_timeout",
+        )],
+        [InlineKeyboardButton("◀ Menu", callback_data="menu_back")],
+    ])
+
+
+def kb_back():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀ Menu", callback_data="menu_back")],
+    ])
+
+
+def kb_error():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Retry", callback_data="err_retry"),
+         InlineKeyboardButton("🤖 Change Model", callback_data="err_model")],
+    ])
 
 
 # ══════════════════════════════════════════════════════════
-#  GLOBAL STATE
+#  RESPONSE PIPELINE
 # ══════════════════════════════════════════════════════════
 
-sessions: SessionManager = None
-settings: SettingsManager = None
-agents: AgentManager = None
-skills: SkillsManager = None
-auth_manager: AuthorizedUsersManager = None
+async def send_response(update, context, response: str, user_id: int, chat_id: int):
+    """Format, split, send text response + auto-deliver any files."""
+    formatted_text, parse_mode = format_for_telegram(response)
+    chunks = split_message(formatted_text)
+    for chunk in chunks:
+        await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
+
+    # Auto-deliver files mentioned in response
+    file_paths = detect_file_paths(response)
+    conv_id = sessions.get_conversation_id(user_id=user_id)
+    files_sent = 0
+    for fp in file_paths[:3]:
+        if await safe_send_file(context.bot, chat_id, fp, conv_id=conv_id, user_id=user_id):
+            files_sent += 1
+    if files_sent:
+        await safe_send(context.bot, chat_id, f"📎 {files_sent} file(s) delivered.")
 
 
 # ══════════════════════════════════════════════════════════
@@ -282,116 +319,83 @@ auth_manager: AuthorizedUsersManager = None
 # ══════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return  # Dead silence for unauthorized users
-
-    active = sessions.get_active_name(update.effective_user.id)
-    conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
-    session_count = len(sessions.list_sessions(update.effective_user.id))
-    stats = get_brain_stats()
-    audio_ok = is_audio_capable()
-    model = settings.get_model()
-
-    total_inbox = sum(stats["inbox"].values())
-    total_knowledge = sum(stats["knowledge"].values())
+    uid = update.effective_user.id
+    active = sessions.get_active_name(uid)
+    conv_id = sessions.get_conversation_id(user_id=uid)
+    session_count = len(sessions.list_sessions(uid))
+    model = get_model()
+    inbox = get_inbox_stats()
 
     await update.message.reply_text(
-        f"🧠 AGI Brain — Mother Bot v{BOT_VERSION}\n"
+        f"🧠 AGY Bot v{BOT_VERSION}\n"
         "═══════════════════════════\n\n"
-        f"📌 Session: [{active}] {'(persistent)' if conv_id else '(new)'}\n"
+        f"📌 Session: [{active}] {'(active)' if conv_id else '(new)'}\n"
         f"📊 Sessions: {session_count}\n"
-        f"🤖 Model: {model}\n\n"
-        f"🧠 Brain: {total_inbox} inbox | {total_knowledge} knowledge\n"
-        f"🎤 Audio: {'Ready' if audio_ok else 'N/A'}\n\n"
-        "Thin pipe to Antigravity CLI.\n"
-        "Just type anything — agy handles the rest.\n\n"
+        f"🤖 Model: {model}\n"
+        f"📥 Inbox: {inbox['images']}img {inbox['audio']}aud {inbox['documents']}doc\n"
+        f"🎤 Audio: {'Ready' if is_audio_capable() else 'N/A'}\n\n"
+        "Just type anything — the CLI handles everything.\n"
         "/menu for control panel • /help for commands."
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
     await update.message.reply_text(
-        "🧠 AGI Brain Commands\n"
+        "🧠 AGY Bot Commands\n"
         "═════════════════════\n\n"
         "💬 CHAT:\n"
-        "  Just type anything — goes straight to agy\n"
-        "  Agy handles everything internally\n\n"
+        "  Just type anything — goes straight to CLI\n\n"
         "📎 MEDIA:\n"
-        "  Send voice → auto-transcribe → respond\n"
-        "  Send photo → auto-analyze\n"
-        "  Send doc   → save to inbox\n\n"
+        "  Voice → transcribe → respond\n"
+        "  Photo → analyze (add caption for specific questions)\n"
+        "  Document → save to inbox\n\n"
         "📁 SESSIONS:\n"
-        "  /new <name>     — New session\n"
-        "  /sessions       — List all (buttons)\n"
-        "  /switch <name>  — Switch\n"
-        "  /end            — End current\n\n"
-        "🧠 AGI BRAIN:\n"
-        "  /brain    — Stats\n"
-        "  /inbox    — Inbox items\n"
-        "  /note     — Save a note\n"
-        "  /web      — Web search\n\n"
-        "🤖 AGENTS:\n"
-        "  /sub <task> — Run task in background\n"
-        "  /agents     — Agent dashboard\n\n"
+        "  /new <name> — New session\n"
+        "  /sessions — List all\n"
+        "  /switch <name> — Switch\n"
+        "  /end — End current\n\n"
         "⚙️ SETTINGS:\n"
-        "  /menu     — Control panel\n"
-        "  /model    — Select AI model\n"
+        "  /menu — Control panel\n"
+        "  /model — Select AI model\n"
         "  /settings — Bot settings\n"
-        "  /skills   — Manage skills\n"
-        "  /service  — Bot status\n\n"
-        "🔧 UTILITY:\n"
-        "  /start /help /ping\n"
+        "  /brain — Inbox stats\n\n"
+        "🌐 BROWSER:\n"
+        "  /browse <url> — Open URL\n"
+        "  /browse status — WebBridge health\n"
+        "  /browse screenshot — Take screenshot\n"
+        "  /browse tabs — List open tabs\n\n"
+        "👥 ADMIN (owner only):\n"
+        "  /adduser <id> — Add user\n"
+        "  /removeuser <id> — Remove user\n"
     )
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
-    # SECURITY FIX: Use per-user scoped session access instead of legacy global
-    active = sessions.get_active_name(update.effective_user.id)
-    conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
-    now = datetime.now().strftime("%H:%M:%S")
-    model = settings.get_model()
-
+    uid = update.effective_user.id
+    active = sessions.get_active_name(uid)
+    conv_id = sessions.get_conversation_id(user_id=uid)
     await update.message.reply_text(
-        f"🏓 Pong! ({now})\n"
+        f"🏓 Pong!\n"
         f"Session: [{active}] | Conv: {'active' if conv_id else 'new'}\n"
-        f"Model: {model}\n"
+        f"Model: {get_model()}\n"
         f"Uptime: {get_uptime_str()}\n"
         f"Audio: {get_audio_status()}\n"
-        f"Engine: v{BOT_VERSION} Thin Pipe"
+        f"Engine: v{BOT_VERSION}"
     )
 
-
-# ══════════════════════════════════════════════════════════
-#  MENU SYSTEM
-# ══════════════════════════════════════════════════════════
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    from ui_buttons import build_menu_keyboard
-    keyboard = build_menu_keyboard()
     await update.message.reply_text(
-        f"🧠 AGI Brain — Control Panel\n"
-        "═════════════════════════════",
-        reply_markup=keyboard,
+        "🧠 AGY Bot — Control Panel\n═════════════════════════════",
+        reply_markup=kb_menu(),
     )
 
 
-# ── Session Commands ──────────────────────────────────────
-
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     uid = update.effective_user.id
-    args = context.args
-    if args:
-        name = "-".join(args).lower().strip()
+    if context.args:
+        name = "-".join(context.args).lower().strip()
+        name = "".join(c for c in name if c.isalnum() or c in "-_")
     else:
         existing = sessions.list_sessions(uid)
         i = 1
@@ -400,66 +404,49 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if name not in existing:
                 break
             i += 1
-    if sessions.create_session(name, uid, source="telegram"):
+
+    if sessions.create_session(name, uid):
         await update.message.reply_text(
-            f"📁 New session [{name}] created!\n"
-            "Next message starts a fresh conversation."
+            f"📁 New session [{name}] created!\nNext message starts fresh."
         )
     else:
         sessions.set_active_name(name, uid)
-        await update.message.reply_text(
-            f"Switched to [{name}]."
-        )
+        await update.message.reply_text(f"Switched to [{name}].")
 
 
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     uid = update.effective_user.id
-    from ui_buttons import build_sessions_list_keyboard
     all_sessions = sessions.list_sessions(uid)
     active = sessions.get_active_name(uid)
     if not all_sessions:
         await update.message.reply_text("No sessions. Send a message to start!")
         return
-
-    lines = [f"📁 Sessions ({len(all_sessions)})\n════════════\n"]
+    lines = [f"📁 Sessions ({len(all_sessions)})\n"]
     for name, info in all_sessions.items():
         marker = " ◀" if name == active else ""
         msgs = info.get("messages", 0)
         title = info.get("title", "")
         title_str = f' — "{title}"' if title else ""
         lines.append(f"  {name}{marker}{title_str} — {msgs} msgs")
-
-    keyboard = build_sessions_list_keyboard(all_sessions, active)
     await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=keyboard,
+        "\n".join(lines), reply_markup=kb_sessions(all_sessions, active),
     )
 
 
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     uid = update.effective_user.id
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /switch <name>\nUse /sessions to see list.")
+    if not context.args:
+        await update.message.reply_text("Usage: /switch <name>")
         return
-    name = "-".join(args).lower().strip()
-    all_sessions = sessions.list_sessions(uid)
-    if name not in all_sessions:
-        await update.message.reply_text(
-            f"[{name}] not found. Available: " + ", ".join(all_sessions.keys())
-        )
+    name = "-".join(context.args).lower().strip()
+    if name not in sessions.list_sessions(uid):
+        await update.message.reply_text(f"[{name}] not found.")
         return
     sessions.set_active_name(name, uid)
     await update.message.reply_text(f"Switched to [{name}].")
 
 
 async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     uid = update.effective_user.id
     name = sessions.get_active_name(uid)
     sessions.delete_session(name, uid)
@@ -468,305 +455,64 @@ async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── AGI Brain Commands ────────────────────────────────────
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current = get_model()
+    await update.message.reply_text(
+        f"🤖 AI Model Selection\n═══════════════════════\nCurrent: {current}\n",
+        reply_markup=kb_model(current),
+    )
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚙️ Settings\n═══════════", reply_markup=kb_settings(),
+    )
+
 
 async def cmd_brain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    stats = get_brain_stats()
-    inbox = stats["inbox"]
-    knowledge = stats["knowledge"]
+    stats = get_inbox_stats()
     await update.message.reply_text(
-        "🧠 AGI Brain\n"
-        "════════════\n\n"
-        f"📥 Inbox: {inbox['images']}img {inbox['audio']}aud "
-        f"{inbox['documents']}doc {inbox['telegram']}tg\n\n"
-        f"📚 Knowledge: {knowledge['notes']}notes "
-        f"{knowledge['transcripts']}trans "
-        f"{knowledge['summaries']}sum {knowledge['research']}res\n\n"
-        f"📁 Projects: {stats['projects']}\n"
+        "🧠 AGI Brain\n════════════\n\n"
+        f"📥 Inbox: {stats['images']}img {stats['audio']}aud {stats['documents']}doc\n"
         f"🎤 Audio: {get_audio_status()}"
     )
 
 
-async def cmd_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not auth.is_owner(uid):
         return
-    pending = get_inbox_pending()
-    if not pending:
-        await update.message.reply_text("📥 Inbox empty!")
+    if not context.args:
+        await update.message.reply_text("Usage: /adduser <telegram_id> [name]")
         return
-    lines = [f"📥 Inbox: {len(pending)} items\n"]
-    for item in pending[:20]:
-        size = format_file_size(item["size"])
-        lines.append(f"  [{item['category']}] {item['name']} ({size})")
-    if len(pending) > 20:
-        lines.append(f"  ... +{len(pending) - 20} more")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /note <text>")
-        return
-    text = " ".join(args)
-    filepath = save_note(text)
-    await update.message.reply_text(f"📝 Note saved: {os.path.basename(filepath)}")
-
-
-async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /web <query>")
-        return
-    query = " ".join(args)
-    chat_id = update.effective_chat.id
-
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
-
     try:
-        response, _ = await run_agy_async(
-            f"Search the web and summarize: {query}",
-            conversation_id=None,
-            timeout=300,
-        )
-        save_research(response, query)
-
-        stop_typing.set()
-        typing_task.cancel()
-
-        formatted_text, parse_mode = format_for_telegram(f"🌐 Web: {query}\n{'═' * 25}\n\n{response}")
-        chunks = split_message(formatted_text)
-        for chunk in chunks:
-            await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
-    except Exception as e:
-        stop_typing.set()
-        typing_task.cancel()
-        await update.message.reply_text(f"Web search failed: {str(e)[:300]}")
-
-
-# ══════════════════════════════════════════════════════════
-#  MODEL SELECTOR
-# ══════════════════════════════════════════════════════════
-
-async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+        new_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
         return
-    from ui_buttons import build_model_keyboard
-    current = settings.get_model()
-    keyboard = build_model_keyboard(current)
-    await update.message.reply_text(
-        f"🤖 AI Model Selection\n"
-        f"═══════════════════════\n"
-        f"Current: {current}\n",
-        reply_markup=keyboard,
-    )
+    name = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    if auth.add_user(new_id, name):
+        await update.message.reply_text(f"✅ User {new_id} ({name}) added!")
+    else:
+        await update.message.reply_text(f"User {new_id} already exists.")
 
 
-# ══════════════════════════════════════════════════════════
-#  SETTINGS
-# ══════════════════════════════════════════════════════════
-
-async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not auth.is_owner(uid):
         return
-    from ui_buttons import build_settings_keyboard
-    keyboard = build_settings_keyboard(settings)
-    await update.message.reply_text(
-        "⚙️ Settings\n"
-        "═══════════",
-        reply_markup=keyboard,
-    )
-
-
-# ══════════════════════════════════════════════════════════
-#  SKILLS
-# ══════════════════════════════════════════════════════════
-
-async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
+    if not context.args:
+        await update.message.reply_text("Usage: /removeuser <telegram_id>")
         return
-    from ui_buttons import build_skills_list_keyboard
-    skill_list = skills.list_skills()
-    keyboard = build_skills_list_keyboard(skill_list)
-    count = len(skill_list)
-    await update.message.reply_text(
-        f"🔧 Installed Skills ({count})\n"
-        "════════════════════",
-        reply_markup=keyboard,
-    )
-
-
-# ══════════════════════════════════════════════════════════
-#  SERVICE STATUS
-# ══════════════════════════════════════════════════════════
-
-async def cmd_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
-    model = settings.get_model()
-    session_count = len(sessions.list_sessions(update.effective_user.id))
-    running_agents = len(agents.list_running())
-
-    await update.message.reply_text(
-        "🖥️ Bot Status\n"
-        "═══════════════\n\n"
-        f"⏱️ Uptime: {get_uptime_str()}\n"
-        f"🤖 Model: {model}\n"
-        f"📁 Sessions: {session_count}\n"
-        f"🤖 Agents: {running_agents} running\n"
-        f"🔧 Version: v{BOT_VERSION}\n"
-    )
-
-
-# ══════════════════════════════════════════════════════════
-#  SUB-AGENT COMMANDS
-# ══════════════════════════════════════════════════════════
-
-async def cmd_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /sub <task>")
-        return
-    task = " ".join(args)
-    chat_id = update.effective_chat.id
-
-    agent_info = agents.launch(task)
-    if not agent_info:
-        await update.message.reply_text(
-            f"⚠️ Max agents reached ({agents.max_agents}). "
-            "Use /agents to manage running agents."
-        )
-        return
-
-    await update.message.reply_text(
-        f"🤖 Agent #{agent_info.id} launched!\n"
-        f"Task: \"{agent_info.title}\"\n"
-        "Result will be sent when done!"
-    )
-
-    # Run the agent in the background
-    bg_task = asyncio.create_task(
-        _run_agent_task(context.bot, chat_id, agent_info.id, task)
-    )
-    agents.register_task(agent_info.id, bg_task)
-
-
-async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    from ui_buttons import build_agents_list_keyboard
-
-    running = agents.list_running()
-    done = agents.list_done()
-
-    lines = ["🤖 Sub-Agents\n══════════════\n"]
-
-    if running:
-        lines.append("🟢 Running:")
-        for a in running:
-            lines.append(f'  #{a.id} "{a.title}" — {a.elapsed_str()}')
-        lines.append("")
-
-    if done:
-        lines.append("✅ Done:")
-        for a in done[-5:]:  # Show last 5
-            lines.append(f'  #{a.id} "{a.title}" — {a.status}')
-        lines.append("")
-
-    if not running and not done:
-        lines.append("No agents. Use /sub <task> to launch one.")
-
-    keyboard = build_agents_list_keyboard(running, done)
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=keyboard,
-    )
-
-
-async def _run_agent_task(bot, chat_id: int, agent_id: str, task: str):
-    """Run a sub-agent task and notify when done."""
-    logger.info(f"[AGENT #{agent_id}] Starting: {task[:80]}")
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(bot, chat_id, stop_typing))
     try:
-        response, conv_id = await run_agy_async(task, conversation_id=None, timeout=300)
-
-        agents.complete(agent_id, response)
-        if conv_id:
-            agent = agents.get(agent_id)
-            if agent:
-                agent.conversation_id = conv_id
-
-        stop_typing.set()
-        typing_task.cancel()
-
-        # Notify user
-        from ui_buttons import build_agent_detail_keyboard
-        keyboard = build_agent_detail_keyboard(agent_id)
-
-        # Send short notification
-        preview = response[:200] + "..." if len(response) > 200 else response
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"✅ Agent #{agent_id} finished!\n"
-                 f"Task: \"{agents.get(agent_id).title}\"\n"
-                 f"Time: {agents.get(agent_id).elapsed_str()}\n\n"
-                 f"Preview:\n{preview}",
-            reply_markup=keyboard,
-        )
-
-    except Exception as e:
-        agents.fail(agent_id, str(e))
-        stop_typing.set()
-        typing_task.cancel()
-        logger.error(f"[AGENT #{agent_id}] Error: {e}")
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Agent #{agent_id} failed: {str(e)[:300]}"
-            )
-        except Exception:
-            pass
-
-
-async def process_bot_response(update: Update, context: ContextTypes.DEFAULT_TYPE, response: str, user_id: int, chat_id: int, active_session: str):
-    """Common pipeline to send text, post to chat_bus, and auto-deliver generated files."""
-    if chat_bus:
-        chat_bus.post_bot(response, user_id=user_id, session_name=active_session)
-
-    formatted_text, parse_mode = format_for_telegram(response)
-    chunks = split_message(formatted_text)
-    for i, chunk in enumerate(chunks):
-        try:
-            await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
-        except Exception as e:
-            logger.error(f"Send chunk {i + 1} failed: {e}")
-
-    file_paths = detect_file_paths(response)
-    final_conv = sessions.get_conversation_id(user_id=user_id)
-    files_sent = 0
-    for fp in file_paths[:3]:
-        logger.info(f"Auto-sending file to user {chat_id}: {fp}")
-        if chat_bus:
-            import os
-            media_type = "image" if fp.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')) else "document"
-            chat_bus.post_bot("", user_id=user_id, session_name=active_session, file_path=fp, media_type=media_type, file_name=os.path.basename(fp))
-        success = await safe_send_file(context.bot, chat_id, fp, conv_id=final_conv, user_id=user_id)
-        if success:
-            files_sent += 1
-
-    if files_sent > 0:
-        await context.bot.send_message(chat_id, f"📎 {files_sent} file(s) delivered successfully.")
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+        return
+    if auth.remove_user(target_id):
+        await update.message.reply_text(f"🗑️ User {target_id} removed and denied.")
+    else:
+        await update.message.reply_text(f"User {target_id} not found.")
 
 
 # ══════════════════════════════════════════════════════════
@@ -774,15 +520,13 @@ async def process_bot_response(update: Update, context: ContextTypes.DEFAULT_TYP
 # ══════════════════════════════════════════════════════════
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     chat_id = update.effective_chat.id
-    voice = update.message.voice
+    uid = update.effective_user.id
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
-        filepath = await save_voice(context.bot, voice)
+        filepath = await save_voice(context.bot, update.message.voice)
 
         if is_audio_capable():
             loop = asyncio.get_event_loop()
@@ -791,30 +535,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             transcript = None
 
         if transcript and not transcript.startswith("["):
-            save_transcript(transcript, os.path.basename(filepath))
+            # Show transcription first (user visibility)
             await update.message.reply_text(f'🎤 You said: "{transcript}"')
 
-            conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
-
-            # SECURITY FIX: Snapshot starting step BEFORE running agy (history dump prevention)
-            from agy_runner import get_latest_step
+            conv_id = sessions.get_conversation_id(user_id=uid)
             starting_step = get_latest_step(conv_id) if conv_id else 0
 
-            response, detected_id = await run_agy_async(transcript, conv_id)
+            response, detected_id = await run_cli_async(
+                transcript, conv_id,
+                skip_permissions=auth.is_admin(uid),
+            )
             if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id, user_id=update.effective_user.id)
+                sessions.set_conversation_id(detected_id, user_id=uid)
 
-            # Update last_seen_step to prevent history dumps
-            final_conv = detected_id or conv_id
-            if final_conv:
-                new_step = get_latest_step(final_conv)
-                sessions.set_last_seen_step(new_step, user_id=update.effective_user.id)
-
-            sessions.increment_messages(user_id=update.effective_user.id)
+            if detected_id or conv_id:
+                sessions.set_last_seen_step(get_latest_step(detected_id or conv_id), user_id=uid)
+            sessions.increment_messages(user_id=uid)
 
             stop_typing.set()
             typing_task.cancel()
-            await process_bot_response(update, context, response, update.effective_user.id, chat_id, sessions.get_active_name(update.effective_user.id))
+            await send_response(update, context, response, uid, chat_id)
         else:
             stop_typing.set()
             typing_task.cancel()
@@ -827,15 +567,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     chat_id = update.effective_chat.id
-    audio = update.message.audio
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
-        filepath = await save_audio(context.bot, audio)
+        filepath = await save_audio(context.bot, update.message.audio)
         if is_audio_capable():
             loop = asyncio.get_event_loop()
             transcript = await loop.run_in_executor(None, transcribe_audio, filepath)
@@ -844,7 +581,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stop_typing.set()
         typing_task.cancel()
         if transcript and not transcript.startswith("["):
-            save_transcript(transcript, os.path.basename(filepath))
             await update.message.reply_text(f'🎵 Transcribed:\n"{transcript}"')
         else:
             await update.message.reply_text(f"🎵 Audio saved: {os.path.basename(filepath)}")
@@ -855,31 +591,21 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     chat_id = update.effective_chat.id
-    photos = update.message.photo
+    uid = update.effective_user.id
     caption = update.message.caption or ""
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
-        filepath = await save_photo(context.bot, photos)
-        auto_describe = settings.get("auto_describe_photos", True)
+        filepath = await save_photo(context.bot, update.message.photo)
+        auto_describe = get_setting("auto_describe_photos", True)
 
         if caption:
-            prompt = (
-                f"The user sent this image: {filepath}. "
-                f"Their question: {caption}. "
-                "Look at the image and respond."
-            )
+            prompt = f"The user sent this image: {filepath}. Their question: {caption}. Look at the image and respond."
         elif auto_describe:
-            prompt = (
-                f"The user sent this image: {filepath}. "
-                "Describe what you see in detail."
-            )
+            prompt = f"The user sent this image: {filepath}. Describe what you see in detail."
         else:
-            # Just save, no analysis
             stop_typing.set()
             typing_task.cancel()
             await update.message.reply_text(
@@ -889,25 +615,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if chat_bus:
-            user_name = update.effective_user.first_name or "User"
-            chat_bus.post_user(
-                caption, user_id=update.effective_user.id, user_name=user_name,
-                session_name=sessions.get_active_name(update.effective_user.id), source="telegram",
-                file_path=filepath, media_type="image", file_name=os.path.basename(filepath)
-            )
-
-        conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
-        response, detected_id = await run_agy_async(prompt, conv_id)
+        conv_id = sessions.get_conversation_id(user_id=uid)
+        response, detected_id = await run_cli_async(
+            prompt, conv_id, skip_permissions=auth.is_admin(uid),
+        )
         if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id, user_id=update.effective_user.id)
-        sessions.increment_messages(user_id=update.effective_user.id)
+            sessions.set_conversation_id(detected_id, user_id=uid)
+        sessions.increment_messages(user_id=uid)
 
         stop_typing.set()
         typing_task.cancel()
-        
-        await process_bot_response(update, context, response, update.effective_user.id, chat_id, sessions.get_active_name(update.effective_user.id))
-
+        await send_response(update, context, response, uid, chat_id)
     except Exception as e:
         stop_typing.set()
         typing_task.cancel()
@@ -915,17 +633,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     try:
         filepath = await save_document(context.bot, update.message.document)
-        if chat_bus:
-            user_name = update.effective_user.first_name or "User"
-            chat_bus.post_user(
-                "", user_id=update.effective_user.id, user_name=user_name,
-                session_name=sessions.get_active_name(update.effective_user.id), source="telegram",
-                file_path=filepath, media_type="document", file_name=update.message.document.file_name or "unknown"
-            )
         await update.message.reply_text(
             f"📄 Document saved!\n{update.message.document.file_name or 'unknown'} "
             f"({format_file_size(os.path.getsize(filepath))})"
@@ -935,17 +644,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     try:
         filepath = await save_video(context.bot, update.message.video)
-        if chat_bus:
-            user_name = update.effective_user.first_name or "User"
-            chat_bus.post_user(
-                "", user_id=update.effective_user.id, user_name=user_name,
-                session_name=sessions.get_active_name(update.effective_user.id), source="telegram",
-                file_path=filepath, media_type="document", file_name=os.path.basename(filepath)
-            )
         await update.message.reply_text(
             f"🎬 Video saved! ({format_file_size(os.path.getsize(filepath))})"
         )
@@ -954,444 +654,423 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════
-#  MAIN TEXT HANDLER — Pure pass-through to agy
+#  MAIN TEXT HANDLER — Pure pass-through to CLI
 # ══════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Main handler — thin pipe to agy.
-
-    Takes the user's EXACT message, passes it directly to agy CLI.
-    agy does all the thinking. We just relay the response.
-    Now with real-time progress via transcript polling.
-    """
-    if not is_authorized(update):
-        return
-
     user_message = update.message.text
     chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    user_name = update.effective_user.first_name or "User"
-    active_session = sessions.get_active_name(user_id)
-    conv_id = sessions.get_conversation_id(user_id=user_id)
+    uid = update.effective_user.id
+    active_session = sessions.get_active_name(uid)
+    conv_id = sessions.get_conversation_id(user_id=uid)
 
-    logger.info(
-        f"Message in [{active_session}] (user:{user_id}): {user_message[:80]}..."
-        f" (conv: {conv_id[:12] if conv_id else 'new'})"
-    )
+    logger.info(f"Message in [{active_session}] (conv: {conv_id[:12] if conv_id else 'new'})")
 
-    # Capture user message for GUI chat view
-    if chat_bus:
-        chat_bus.post_user(
-            user_message, user_id=user_id, user_name=user_name,
-            session_name=active_session, source="telegram",
-        )
-        chat_bus.set_typing(user_id)
-
-    # Auto-title the session from the first message
-    info = sessions.get_session_info(user_id=user_id)
+    # Auto-title from first message
+    info = sessions.get_session_info(user_id=uid)
     if info and info.get("messages", 0) == 0:
-        sessions.auto_title(user_message, user_id=user_id)
+        sessions.auto_title(user_message, user_id=uid)
 
-    # Snapshot the starting step BEFORE running agy (Task 1.4 — history dump fix)
-    from agy_runner import get_latest_step
     starting_step = get_latest_step(conv_id) if conv_id else 0
 
-    # Start typing indicator
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
-        # Get timeout from settings
-        timeout = settings.get_timeout()
-
-        # Direct pass-through — agy does ALL the thinking
-        response, detected_id = await run_agy_async(
-            user_message,
-            conv_id,
-            timeout=timeout,
-            progress_callback=None,
+        timeout = get_timeout()
+        response, detected_id = await run_cli_async(
+            user_message, conv_id, timeout=timeout,
+            skip_permissions=auth.is_admin(uid),
         )
 
         if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id, user_id=user_id)
-            logger.info(f"Stored conversation ID: {detected_id[:12]}...")
+            sessions.set_conversation_id(detected_id, user_id=uid)
 
-        # Update last_seen_step to prevent history dumps (Task 1.4)
         final_conv = detected_id or conv_id
         if final_conv:
-            new_step = get_latest_step(final_conv)
-            sessions.set_last_seen_step(new_step, user_id=user_id)
-
-        sessions.increment_messages(user_id=user_id)
+            sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid)
+        sessions.increment_messages(user_id=uid)
 
     except Exception as e:
         response = f"Error: {str(e)}"
         logger.error(f"Handler error: {e}", exc_info=True)
     finally:
         stop_typing.set()
-        # Clear typing for GUI
-        if chat_bus:
-            chat_bus.clear_typing(user_id)
         typing_task.cancel()
 
-    await process_bot_response(update, context, response, user_id, chat_id, active_session)
-
-
-
+    await send_response(update, context, response, uid, chat_id)
 
 
 # ══════════════════════════════════════════════════════════
-#  CALLBACK HANDLER (Master Router)
+#  CALLBACK HANDLER (Single Router — no duplication)
 # ══════════════════════════════════════════════════════════
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route all callback queries to the appropriate handler."""
-    if not is_authorized(update):
-        await update.callback_query.answer()  # Acknowledge to prevent timeout spinner
-        return
-
     query = update.callback_query
     data = query.data
+    uid = update.effective_user.id
 
     try:
-        if data.startswith("menu_"):
-            await _handle_menu_callback(update, context)
-        elif data.startswith("sess_"):
-            await _handle_sessions_callback(update, context)
-        elif data.startswith("model_"):
-            await _handle_model_callback(update, context)
-        elif data.startswith("agt_"):
-            await _handle_agents_callback(update, context)
-        elif data.startswith("set_"):
-            await _handle_settings_callback(update, context)
-        elif data.startswith("skill_"):
-            await _handle_skills_callback(update, context)
-        elif data.startswith("err_"):
-            await _handle_error_callback(update, context)
-        elif data.startswith("svc_"):
-            await _handle_service_callback(update, context)
-        else:
-            await query.answer("Unknown action")
-    except Exception as e:
-        logger.error(f"Callback error: {e}", exc_info=True)
-        await query.answer(f"Error: {str(e)[:100]}")
+        await query.answer()
 
-
-async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.replace("menu_", "")
-
-    if action == "sessions":
-        from ui_buttons import build_sessions_list_keyboard
-        uid = update.effective_user.id
-        all_sessions = sessions.list_sessions(uid)
-        active = sessions.get_active_name(uid)
-        keyboard = build_sessions_list_keyboard(all_sessions, active)
-        lines = [f"📁 Sessions ({len(all_sessions)})\n════════════\n"]
-        for name, info in all_sessions.items():
-            marker = " ◀" if name == active else ""
-            msgs = info.get("messages", 0)
-            title = info.get("title", "")
-            title_str = f' — "{title}"' if title else ""
-            lines.append(f"  {name}{marker}{title_str} — {msgs} msgs")
-        await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
-
-    elif action == "model":
-        from ui_buttons import build_model_keyboard
-        current = settings.get_model()
-        keyboard = build_model_keyboard(current)
-        await query.edit_message_text(
-            f"🤖 AI Model Selection\n═══════════════════════\nCurrent: {current}\n",
-            reply_markup=keyboard,
-        )
-
-    elif action == "agents":
-        from ui_buttons import build_agents_list_keyboard
-        running = agents.list_running()
-        done = agents.list_done()
-        lines = ["🤖 Sub-Agents\n══════════════\n"]
-        if running:
-            lines.append("🟢 Running:")
-            for a in running:
-                lines.append(f'  #{a.id} "{a.title}" — {a.elapsed_str()}')
-        if done:
-            lines.append("\n✅ Done:")
-            for a in done[-5:]:
-                lines.append(f'  #{a.id} "{a.title}"')
-        if not running and not done:
-            lines.append("No agents.")
-        keyboard = build_agents_list_keyboard(running, done)
-        await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
-
-    elif action == "settings":
-        from ui_buttons import build_settings_keyboard
-        keyboard = build_settings_keyboard(settings)
-        await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=keyboard)
-
-    elif action == "skills":
-        from ui_buttons import build_skills_list_keyboard
-        skill_list = skills.list_skills()
-        keyboard = build_skills_list_keyboard(skill_list)
-        await query.edit_message_text(
-            f"🔧 Installed Skills ({len(skill_list)})\n════════════════════",
-            reply_markup=keyboard,
-        )
-
-    elif action == "brain":
-        stats = get_brain_stats()
-        inbox = stats["inbox"]
-        knowledge = stats["knowledge"]
-        from ui_buttons import build_back_to_menu_keyboard
-        keyboard = build_back_to_menu_keyboard()
-        await query.edit_message_text(
-            "🧠 AGI Brain\n════════════\n\n"
-            f"📥 Inbox: {inbox['images']}img {inbox['audio']}aud "
-            f"{inbox['documents']}doc {inbox['telegram']}tg\n\n"
-            f"📚 Knowledge: {knowledge['notes']}notes "
-            f"{knowledge['transcripts']}trans "
-            f"{knowledge['summaries']}sum {knowledge['research']}res\n\n"
-            f"📁 Projects: {stats['projects']}",
-            reply_markup=keyboard,
-        )
-
-    elif action == "inbox":
-        pending = get_inbox_pending()
-        from ui_buttons import build_back_to_menu_keyboard
-        keyboard = build_back_to_menu_keyboard()
-        if not pending:
-            await query.edit_message_text("📥 Inbox empty!", reply_markup=keyboard)
-        else:
-            lines = [f"📥 Inbox: {len(pending)} items\n"]
-            for item in pending[:15]:
-                size = format_file_size(item["size"])
-                lines.append(f"  [{item['category']}] {item['name']} ({size})")
-            if len(pending) > 15:
-                lines.append(f"  ... +{len(pending) - 15} more")
-            await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
-
-    elif action == "status":
-        model = settings.get_model()
-        session_count = len(sessions.list_sessions(update.effective_user.id))
-        running_agents = len(agents.list_running())
-        from ui_buttons import build_back_to_menu_keyboard
-        keyboard = build_back_to_menu_keyboard()
-        await query.edit_message_text(
-            "🖥️ Bot Status\n═══════════════\n\n"
-            f"⏱️ Uptime: {get_uptime_str()}\n"
-            f"🤖 Model: {model}\n"
-            f"📁 Sessions: {session_count}\n"
-            f"🤖 Agents: {running_agents} running\n"
-            f"🔧 Version: v{BOT_VERSION}",
-            reply_markup=keyboard,
-        )
-
-    elif action == "web":
-        from ui_buttons import build_back_to_menu_keyboard
-        keyboard = build_back_to_menu_keyboard()
-        await query.edit_message_text(
-            "🔎 Web Search\n═══════════════\n\n"
-            "Use /web <query> to search the web.",
-            reply_markup=keyboard,
-        )
-
-    elif action == "note":
-        from ui_buttons import build_back_to_menu_keyboard
-        keyboard = build_back_to_menu_keyboard()
-        await query.edit_message_text(
-            "📝 Quick Note\n═══════════════\n\n"
-            "Use /note <text> to save a note.",
-            reply_markup=keyboard,
-        )
-
-    elif action == "back":
-        from ui_buttons import build_menu_keyboard
-        keyboard = build_menu_keyboard()
-        await query.edit_message_text(
-            "🧠 AGI Brain — Control Panel\n═════════════════════════════",
-            reply_markup=keyboard,
-        )
-
-
-async def _handle_sessions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "sess_list":
-        from ui_buttons import build_sessions_list_keyboard
-        uid = update.effective_user.id
-        all_sessions = sessions.list_sessions(uid)
-        active = sessions.get_active_name(uid)
-        keyboard = build_sessions_list_keyboard(all_sessions, active)
-        lines = [f"📁 Sessions ({len(all_sessions)})\n"]
-        for name, info in all_sessions.items():
-            marker = " ◀" if name == active else ""
-            msgs = info.get("messages", 0)
-            lines.append(f"  {name}{marker} — {msgs} msgs")
-        await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
-
-    elif data.startswith("sess_switch_"):
-        name = data.replace("sess_switch_", "")
-        sessions.set_active_name(name, update.effective_user.id)
-        await query.edit_message_text(f"✅ Switched to [{name}].")
-
-    elif data.startswith("sess_delete_"):
-        name = data.replace("sess_delete_", "")
-        from ui_buttons import build_session_delete_confirm_keyboard
-        keyboard = build_session_delete_confirm_keyboard(name)
-        await query.edit_message_text(
-            f"🗑️ Delete session [{name}]?\n\nThis cannot be undone.",
-            reply_markup=keyboard,
-        )
-
-    elif data.startswith("sess_confirm_del_"):
-        name = data.replace("sess_confirm_del_", "")
-        uid = update.effective_user.id
-        sessions.delete_session(name, uid)
-        await query.edit_message_text(f"🗑️ Session [{name}] deleted.\nActive: [{sessions.get_active_name(uid)}]")
-
-    elif data == "sess_cancel_del":
-        from ui_buttons import build_sessions_list_keyboard
-        uid = update.effective_user.id
-        all_sessions = sessions.list_sessions(uid)
-        active = sessions.get_active_name(uid)
-        keyboard = build_sessions_list_keyboard(all_sessions, active)
-        await query.edit_message_text("📁 Sessions", reply_markup=keyboard)
-
-    elif data == "sess_new":
-        uid = update.effective_user.id
-        existing = sessions.list_sessions(uid)
-        i = 1
-        while True:
-            name = f"session-{i}"
-            if name not in existing:
-                break
-            i += 1
-        sessions.create_session(name, uid, source="telegram")
-        await query.edit_message_text(f"📁 New session [{name}] created!\nNext message starts fresh.")
-
-    elif data.startswith("sess_detail_"):
-        name = data.replace("sess_detail_", "")
-        info = sessions.get_session_info(name, user_id=update.effective_user.id)
-        if info:
-            from ui_buttons import build_session_detail_keyboard
-            keyboard = build_session_detail_keyboard(name)
-            title = info.get("title") or "(no title)"
+        # ── Menu ──
+        if data == "menu_back":
             await query.edit_message_text(
-                f"📁 Session: {name}\n═══════════════════\n\n"
-                f'Title: "{title}"\n'
-                f"Created: {info.get('created', 'unknown')}\n"
-                f"Messages: {info.get('messages', 0)}\n"
-                f"Last used: {info.get('last_used', 'never')}\n"
-                f"Active: {'Yes ◀' if info.get('is_active') else 'No'}",
-                reply_markup=keyboard,
+                "🧠 AGY Bot — Control Panel\n═════════════════════════════",
+                reply_markup=kb_menu(),
             )
 
+        elif data == "menu_sessions":
+            all_sessions = sessions.list_sessions(uid)
+            active = sessions.get_active_name(uid)
+            lines = [f"📁 Sessions ({len(all_sessions)})\n"]
+            for name, info in all_sessions.items():
+                marker = " ◀" if name == active else ""
+                lines.append(f"  {name}{marker} — {info.get('messages', 0)} msgs")
+            await query.edit_message_text(
+                "\n".join(lines), reply_markup=kb_sessions(all_sessions, active),
+            )
 
-async def _handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+        elif data == "menu_model":
+            current = get_model()
+            await query.edit_message_text(
+                f"🤖 AI Model Selection\n═══════════════════════\nCurrent: {current}\n",
+                reply_markup=kb_model(current),
+            )
 
-    model_id = query.data.replace("model_", "")
-    settings.set_model(model_id)
+        elif data == "menu_settings":
+            await query.edit_message_text(
+                "⚙️ Settings\n═══════════", reply_markup=kb_settings(),
+            )
 
-    # Also write to selected_model.txt for backward compat
-    model_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selected_model.txt")
-    try:
-        with open(model_file, "w", encoding="utf-8") as f:
-            f.write(model_id)
-    except Exception:
-        pass
+        elif data == "menu_inbox":
+            items = get_inbox_items()
+            if not items:
+                await query.edit_message_text("📥 Inbox empty!", reply_markup=kb_back())
+            else:
+                lines = [f"📥 Inbox: {len(items)} items\n"]
+                for item in items[:15]:
+                    lines.append(f"  [{item['category']}] {item['name']} ({format_file_size(item['size'])})")
+                if len(items) > 15:
+                    lines.append(f"  ... +{len(items) - 15} more")
+                await query.edit_message_text("\n".join(lines), reply_markup=kb_back())
 
-    await query.edit_message_text(
-        f"✅ Model switched to: {model_id}\n\n"
-        "The next message will use this engine."
-    )
+        elif data == "menu_browse":
+            import urllib.request
+            import urllib.error
+            try:
+                req = urllib.request.Request(f"{KIMI_BRIDGE_URL}/status", method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    bdata = json.loads(resp.read())
+                running = bdata.get("running", False)
+                ext = bdata.get("extension_connected", False)
+                status_text = (
+                    f"🌐 Kimi WebBridge\n═══════════════════\n\n"
+                    f"Daemon: {'🟢 Running' if running else '🔴 Stopped'}\n"
+                    f"Extension: {'🟢 Connected' if ext else '🔴 Disconnected'}\n\n"
+                    "Use /browse <url> to open pages."
+                )
+            except Exception:
+                status_text = (
+                    "🌐 Kimi WebBridge\n═══════════════════\n\n"
+                    "🔴 WebBridge not reachable.\n\n"
+                    "Make sure the daemon is running."
+                )
+            await query.edit_message_text(status_text, reply_markup=kb_back())
 
+        elif data == "menu_status":
+            session_count = len(sessions.list_sessions(uid))
+            await query.edit_message_text(
+                "🖥️ Bot Status\n═══════════════\n\n"
+                f"⏱️ Uptime: {get_uptime_str()}\n"
+                f"🤖 Model: {get_model()}\n"
+                f"📁 Sessions: {session_count}\n"
+                f"🔧 Version: v{BOT_VERSION}",
+                reply_markup=kb_back(),
+            )
 
-async def _handle_agents_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+        # ── Sessions ──
+        elif data == "sess_list":
+            all_sessions = sessions.list_sessions(uid)
+            active = sessions.get_active_name(uid)
+            await query.edit_message_text(
+                "📁 Sessions", reply_markup=kb_sessions(all_sessions, active),
+            )
 
-    if data == "agt_list":
-        from ui_buttons import build_agents_list_keyboard
-        running = agents.list_running()
-        done = agents.list_done()
-        keyboard = build_agents_list_keyboard(running, done)
-        lines = ["🤖 Sub-Agents\n"]
-        if running:
-            for a in running:
-                lines.append(f'🟢 #{a.id} "{a.title}" — {a.elapsed_str()}')
-        if done:
-            for a in done[-5:]:
-                lines.append(f'✅ #{a.id} "{a.title}"')
-        if not running and not done:
-            lines.append("No agents.")
-        await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
+        elif data.startswith("sess_switch_"):
+            name = data[12:]  # "sess_switch_" is 12 chars
+            sessions.set_active_name(name, uid)
+            await query.edit_message_text(f"✅ Switched to [{name}].")
 
-    elif data.startswith("agt_output_"):
-        agent_id = data.replace("agt_output_", "")
-        agent = agents.get(agent_id)
-        if agent and agent.result:
-            chunks = split_message(f"📄 Agent #{agent_id} Output:\n{'═' * 25}\n\n{agent.result}")
-            for chunk in chunks:
-                await safe_send(context.bot, query.message.chat_id, chunk)
+        elif data.startswith("sess_delete_"):
+            name = data[12:]
+            await query.edit_message_text(
+                f"🗑️ Delete session [{name}]?\n\nThis cannot be undone.",
+                reply_markup=kb_delete_confirm(name),
+            )
+
+        elif data.startswith("sess_confirm_del_"):
+            name = data[17:]
+            sessions.delete_session(name, uid)
+            await query.edit_message_text(
+                f"🗑️ Session [{name}] deleted.\nActive: [{sessions.get_active_name(uid)}]"
+            )
+
+        elif data == "sess_new":
+            existing = sessions.list_sessions(uid)
+            i = 1
+            while True:
+                name = f"session-{i}"
+                if name not in existing:
+                    break
+                i += 1
+            sessions.create_session(name, uid)
+            await query.edit_message_text(f"📁 New session [{name}] created!")
+
+        elif data.startswith("sess_detail_"):
+            name = data[12:]
+            info = sessions.get_session_info(user_id=uid, session_name=name)
+            if info:
+                title = info.get("title") or "(no title)"
+                await query.edit_message_text(
+                    f"📁 Session: {name}\n═══════════════════\n\n"
+                    f'Title: "{title}"\n'
+                    f"Created: {info.get('created', 'unknown')}\n"
+                    f"Messages: {info.get('messages', 0)}\n"
+                    f"Active: {'Yes ◀' if info.get('is_active') else 'No'}",
+                    reply_markup=kb_session_detail(name),
+                )
+
+        # ── Model ──
+        elif data.startswith("model_"):
+            model_id = data[6:]
+            set_model(model_id)
+            await query.edit_message_text(
+                f"✅ Model switched to: {model_id}\n\nNext message will use this model."
+            )
+
+        # ── Settings ──
+        elif data == "set_toggle_photo":
+            current = get_setting("auto_describe_photos", True)
+            set_setting("auto_describe_photos", not current)
+            await query.edit_message_text(
+                "⚙️ Settings\n═══════════", reply_markup=kb_settings(),
+            )
+
+        elif data == "set_cycle_timeout":
+            current = get_timeout()
+            cycle = [120, 300, 600, 900, 60]
+            try:
+                idx = cycle.index(current)
+                new_val = cycle[(idx + 1) % len(cycle)]
+            except ValueError:
+                new_val = 600
+            set_setting("timeout", new_val)
+            await query.edit_message_text(
+                "⚙️ Settings\n═══════════", reply_markup=kb_settings(),
+            )
+
+        # ── Error recovery ──
+        elif data == "err_retry":
+            await query.edit_message_text("🔄 Send your message again.")
+
+        elif data == "err_model":
+            current = get_model()
+            await query.edit_message_text(
+                f"🤖 Try a different model?\nCurrent: {current}",
+                reply_markup=kb_model(current),
+            )
+
         else:
-            await query.edit_message_text(f"No output available for agent #{agent_id}.")
+            await query.edit_message_text("Unknown action.")
 
-    elif data.startswith("agt_stop_"):
-        agent_id = data.replace("agt_stop_", "")
-        agents.stop(agent_id)
-        await query.edit_message_text(f"🛑 Agent #{agent_id} stopped.")
+    except Exception as e:
+        logger.error(f"Callback error: {e}", exc_info=True)
+        try:
+            await query.answer(f"Error: {str(e)[:100]}")
+        except Exception:
+            pass
 
-    elif data == "agt_clear":
-        count = agents.clear_done()
-        await query.edit_message_text(f"🗑️ Cleared {count} completed agents.")
+# ══════════════════════════════════════════════════════════
+#  KIMI WEBBRIDGE — /browse command
+# ══════════════════════════════════════════════════════════
 
-    elif data == "agt_launch":
-        await query.edit_message_text(
-            "🚀 Launch Agent\n\n"
-            "Use /sub <task> to launch a new agent.\n"
-            "Example: /sub Research quantum computing papers"
+async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Browse a URL or interact with the browser via Kimi WebBridge."""
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "🌐 Kimi WebBridge\n═══════════════════\n\n"
+            "Usage:\n"
+            "  /browse <url> — Open URL in browser\n"
+            "  /browse status — Check WebBridge health\n"
+            "  /browse screenshot — Take a screenshot\n"
+            "  /browse tabs — List open tabs\n"
+            "  /browse close — Close all browser tabs\n\n"
+            "Or just tell me \"browse google.com\" in chat!"
         )
+        return
+
+    subcmd = context.args[0].lower()
+
+    try:
+        import urllib.request
+        import urllib.error
+
+        if subcmd == "status":
+            try:
+                req = urllib.request.Request(
+                    f"{KIMI_BRIDGE_URL}/status",
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read())
+                running = data.get("running", False)
+                ext = data.get("extension_connected", False)
+                version = data.get("version", "unknown")
+                await update.message.reply_text(
+                    f"🌐 WebBridge Status\n"
+                    f"Daemon: {'🟢 Running' if running else '🔴 Stopped'}\n"
+                    f"Extension: {'🟢 Connected' if ext else '🔴 Disconnected'}\n"
+                    f"Version: {version}"
+                )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"🔴 WebBridge not reachable.\n{str(e)[:200]}"
+                )
+
+        elif subcmd == "screenshot":
+            stop_typing = asyncio.Event()
+            typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+            try:
+                payload = json.dumps({"action": "screenshot", "args": {}, "session": "telegram"}).encode()
+                req = urllib.request.Request(
+                    f"{KIMI_BRIDGE_URL}/command",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read())
+                stop_typing.set()
+                typing_task.cancel()
+                screenshot_path = result.get("data", {}).get("path", "")
+                if screenshot_path and os.path.isfile(screenshot_path):
+                    await safe_send_file(context.bot, chat_id, screenshot_path,
+                                        caption="📸 Browser screenshot", user_id=uid)
+                else:
+                    await update.message.reply_text(f"Screenshot result: {json.dumps(result, indent=2)[:500]}")
+            except Exception as e:
+                stop_typing.set()
+                typing_task.cancel()
+                await update.message.reply_text(f"Screenshot error: {str(e)[:300]}")
+
+        elif subcmd == "tabs":
+            payload = json.dumps({"action": "list_tabs", "args": {}, "session": "telegram"}).encode()
+            req = urllib.request.Request(
+                f"{KIMI_BRIDGE_URL}/command",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+            tabs = result.get("data", {}).get("tabs", [])
+            if tabs:
+                lines = [f"🌐 Open Tabs ({len(tabs)}):\n"]
+                for t in tabs[:10]:
+                    active = " ◀" if t.get("active") else ""
+                    lines.append(f"  {t.get('title', 'Untitled')[:40]}{active}")
+                    lines.append(f"    {t.get('url', '')[:60]}")
+                await update.message.reply_text("\n".join(lines))
+            else:
+                await update.message.reply_text("No open tabs.")
+
+        elif subcmd == "close":
+            payload = json.dumps({"action": "close_session", "args": {}, "session": "telegram"}).encode()
+            req = urllib.request.Request(
+                f"{KIMI_BRIDGE_URL}/command",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+            closed = result.get("data", {}).get("closed", 0)
+            await update.message.reply_text(f"🗑️ Closed {closed} tab(s).")
+
+        else:
+            # Treat as URL to navigate
+            url = subcmd if subcmd.startswith(("http://", "https://")) else f"https://{subcmd}"
+            # If there are more args, it's the full URL
+            if len(context.args) > 1:
+                url = " ".join(context.args)
+                if not url.startswith(("http://", "https://")):
+                    url = f"https://{url}"
+
+            payload = json.dumps({
+                "action": "navigate",
+                "args": {"url": url, "newTab": True},
+                "session": "telegram",
+            }).encode()
+            req = urllib.request.Request(
+                f"{KIMI_BRIDGE_URL}/command",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read())
+            if result.get("data", {}).get("success"):
+                await update.message.reply_text(f"🌐 Opened: {url}")
+            else:
+                await update.message.reply_text(f"Failed to open: {url}\n{json.dumps(result)[:300]}")
+
+    except Exception as e:
+        await update.message.reply_text(f"WebBridge error: {str(e)[:300]}")
 
 
-async def _handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from ui_buttons import handle_settings_callback
-    await handle_settings_callback(update, context)
+# ══════════════════════════════════════════════════════════
+#  OUTBOX WATCHER — Auto-deliver files CLI drops in Outbox
+# ══════════════════════════════════════════════════════════
+
+_outbox_seen: set = set()
 
 
-async def _handle_skills_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from ui_buttons import handle_skills_callback
-    await handle_skills_callback(update, context)
+async def outbox_watcher(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic job: scan Outbox for new files and auto-send to owner."""
+    global _outbox_seen
 
+    if not OWNER_CHAT_ID:
+        return
 
-async def _handle_error_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "err_retry":
-        await query.edit_message_text("🔄 Retrying... Send your message again.")
-    elif data == "err_model":
-        from ui_buttons import build_model_keyboard
-        current = settings.get_model()
-        keyboard = build_model_keyboard(current)
-        await query.edit_message_text(
-            f"🤖 Try a different model?\nCurrent: {current}",
-            reply_markup=keyboard,
-        )
-    elif data == "err_cancel":
-        await query.edit_message_text("❌ Cancelled.")
-
-
-async def _handle_service_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    # Service-related callbacks handled here if needed
+    for folder in [OUTBOX_DOCUMENTS, OUTBOX_IMAGES]:
+        if not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            fpath = os.path.join(folder, fname)
+            if not os.path.isfile(fpath):
+                continue
+            if fpath in _outbox_seen:
+                continue
+            _outbox_seen.add(fpath)
+            # Skip files modified more than 60 seconds ago (old files)
+            try:
+                age = time.time() - os.path.getmtime(fpath)
+                if age > 60:
+                    continue
+            except Exception:
+                continue
+            try:
+                await safe_send_file(
+                    context.bot, OWNER_CHAT_ID, fpath,
+                    caption=f"📤 Outbox: {fname}", user_id=OWNER_CHAT_ID,
+                )
+                logger.info(f"[OUTBOX] Auto-delivered: {fname}")
+            except Exception as e:
+                logger.error(f"[OUTBOX] Failed to deliver {fname}: {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1400,54 +1079,33 @@ async def _handle_service_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Bot error: {context.error}", exc_info=context.error)
-    # SECURITY: Don't respond to unauthorized users — reveals bot existence
     if isinstance(update, Update) and update.effective_user:
-        if not auth_manager.is_authorized(update.effective_user.id):
+        if not auth.is_authorized(update.effective_user.id):
             return
     if isinstance(update, Update) and update.message:
         try:
-            from ui_buttons import build_error_keyboard
-            keyboard = build_error_keyboard()
-            await update.message.reply_text(
-                "⚠ An error occurred.",
-                reply_markup=keyboard,
-            )
+            await update.message.reply_text("⚠ An error occurred.", reply_markup=kb_error())
         except Exception:
-            try:
-                await update.message.reply_text("⚠ An error occurred. Check bot logs.")
-            except Exception:
-                pass
+            pass
 
 
 # ══════════════════════════════════════════════════════════
-#  STARTUP NOTIFICATION
+#  STARTUP
 # ══════════════════════════════════════════════════════════
 
 async def post_init(application):
-    """Send startup notification to owner."""
     if OWNER_CHAT_ID:
         try:
-            model = settings.get_model()
-            session_count = len(sessions.list_sessions())
-            skill_count = len(skills.list_skills())
             await application.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
                 text=(
                     f"🟢 AGY Bot is online! (v{BOT_VERSION})\n"
-                    f"Model: {model}\n"
-                    f"Sessions: {session_count}\n"
-                    f"Skills: {skill_count}\n"
+                    f"Model: {get_model()}\n"
                     f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 ),
             )
-            logger.info("[STARTUP] Notification sent to owner.")
         except Exception as e:
             logger.warning(f"[STARTUP] Failed to notify owner: {e}")
-
-    # Inject global managers into bot_data so callbacks can access them
-    application.bot_data["settings_manager"] = settings
-    application.bot_data["skills_manager"] = skills
-    application.bot_data["agent_manager"] = agents
 
 
 # ══════════════════════════════════════════════════════════
@@ -1455,9 +1113,9 @@ async def post_init(application):
 # ══════════════════════════════════════════════════════════
 
 def main():
-    global sessions, settings, agents, skills, auth_manager
+    global sessions, auth
 
-    # 1. ENFORCE SINGLE INSTANCE (Kill Switch mechanism)
+    # Single instance lock (no admin needed)
     if sys.platform == "win32":
         import msvcrt
         global _lock_file_handle
@@ -1465,8 +1123,7 @@ def main():
             _lock_file_handle = open("agy_bot_instance.lock", "w")
             msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
-            print("❌ ERROR: Another instance of the bot is already running!")
-            print("Please close it before starting a new one. (Use Task Manager to kill pythonw.exe if hidden).")
+            print("❌ Another instance is already running!")
             sys.exit(1)
 
     # Fix Windows console encoding
@@ -1477,46 +1134,32 @@ def main():
         except Exception:
             pass
 
-    # Ensure AGI-Brain directory structure exists
-    ensure_brain_structure()
+    # Initialize
+    ensure_dirs()
+    sessions = SessionManager(SESSIONS_FILE)
+    auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
 
-    # Initialize managers
-    from config import STATE_FILE
-    sessions = SessionManager(STATE_FILE)
-    settings = SettingsManager(SETTINGS_FILE)
-    agents = AgentManager(AGENTS_FILE, MAX_CONCURRENT_AGENTS)
-    skills = SkillsManager(SKILLS_DIR)
-    auth_manager = AuthorizedUsersManager(USERS_FILE, OWNER_CHAT_ID)
-
-    active = sessions.active_name
-    session_count = len(sessions.list_sessions())
-    stats = get_brain_stats()
+    model = get_model()
+    session_count = len(sessions.list_sessions(OWNER_CHAT_ID))
     audio_ok = is_audio_capable()
-    model = settings.get_model()
-    skill_count = len(skills.list_skills())
 
-    print("=" * 55)
-    print(f"  [MOTHER]  AGI Brain — Telegram Bot v{BOT_VERSION}")
-    print("  Direct Pass-Through — agy does the thinking")
-    print("=" * 55)
-    print(f"  Active Session:  [{active}]")
-    print(f"  Total Sessions:  {session_count}")
-    print(f"  Owner ID:        {OWNER_CHAT_ID}")
-    print(f"  Auth Users:      {auth_manager.count()} + owner")
-    print(f"  Model:           {model}")
-    print(f"  AGI-Brain:       {AGI_BRAIN_DIR}")
-    print(f"  Audio:           {'Ready' if audio_ok else 'N/A'}")
-    print(f"  Inbox Items:     {sum(stats['inbox'].values())}")
-    print(f"  Knowledge:       {sum(stats['knowledge'].values())}")
-    print(f"  Skills:          {skill_count}")
-    print(f"  Timeout:         {settings.get_timeout()}s")
-    print("  Bot starting... Press Ctrl+C to stop.")
+    print("=" * 50)
+    print(f"  AGY Telegram Bot v{BOT_VERSION}")
+    print("  Thin pipe to CLI — it does the thinking")
+    print("=" * 50)
+    print(f"  Owner: {OWNER_CHAT_ID}")
+    print(f"  Users: {auth.count()} + owner")
+    print(f"  Model: {model}")
+    print(f"  Sessions: {session_count}")
+    print(f"  Audio: {'Ready' if audio_ok else 'N/A'}")
+    print(f"  Timeout: {get_timeout()}s")
+    print("  Starting... Press Ctrl+C to stop.")
     print()
 
     # Build bot
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # SECURITY: Global auth middleware — intercepts ALL updates before handlers
+    # Auth middleware (group -1 = runs before all handlers)
     app.add_handler(TypeHandler(Update, auth_middleware), group=-1)
 
     # Commands
@@ -1528,18 +1171,14 @@ def main():
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("switch", cmd_switch))
     app.add_handler(CommandHandler("end", cmd_end))
-    app.add_handler(CommandHandler("sub", cmd_sub))
-    app.add_handler(CommandHandler("agents", cmd_agents))
-    app.add_handler(CommandHandler("brain", cmd_brain))
-    app.add_handler(CommandHandler("inbox", cmd_inbox))
-    app.add_handler(CommandHandler("note", cmd_note))
     app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("web", cmd_web))
     app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("skills", cmd_skills))
-    app.add_handler(CommandHandler("service", cmd_service))
+    app.add_handler(CommandHandler("brain", cmd_brain))
+    app.add_handler(CommandHandler("browse", cmd_browse))
+    app.add_handler(CommandHandler("adduser", cmd_adduser))
+    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
 
-    # Callback handler — routes ALL button presses
+    # Callback handler — ONE router for ALL buttons
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Media handlers
@@ -1549,17 +1188,17 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
-    # Text handler (last)
+    # Text handler (must be last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Error handler
     app.add_error_handler(error_handler)
 
-    # Start polling
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    # Outbox watcher — auto-deliver files every 10 seconds
+    app.job_queue.run_repeating(outbox_watcher, interval=10, first=5)
+
+    # Run
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

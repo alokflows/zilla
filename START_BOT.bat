@@ -1,8 +1,8 @@
 @echo off
-title AGI Brain - Telegram Bot v4
+title AGY Bot v8
 echo.
 echo ==========================================
-echo    Starting AGI Brain - Mother Bot v4
+echo    AGY Telegram Bot v8 — Thin Pipe to CLI
 echo ==========================================
 echo.
 cd /d "%~dp0"
