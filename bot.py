@@ -61,13 +61,15 @@ from telegram.ext import (
     filters,
     ContextTypes,
     CallbackQueryHandler,
+    TypeHandler,
+    ApplicationHandlerStop,
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import (
     BOT_TOKEN,
-    ALLOWED_USER_ID,
     OWNER_CHAT_ID,
+    USERS_FILE,
     TELEGRAM_MAX_LENGTH,
     TELEGRAM_MAX_SEND_FILE,
     AGI_BRAIN_DIR,
@@ -101,7 +103,8 @@ from file_handler import (
 from settings_manager import SettingsManager
 from agent_manager import AgentManager
 from skills_manager import SkillsManager
-from telegram_formatter import format_for_telegram
+from telegram_formatter import format_for_telegram, detect_file_paths
+from user_manager import AuthorizedUsersManager
 
 # ── Logging ────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -122,6 +125,10 @@ logger = logging.getLogger(__name__)
 
 # Track bot start time for uptime
 BOT_START_TIME = time.time()
+
+# Chat bus — injected by gui_app.py for GUI message capture
+# When None, no messages are captured (headless mode)
+chat_bus = None
 
 
 # ══════════════════════════════════════════════════════════
@@ -167,10 +174,36 @@ async def safe_send(bot, chat_id: int, text: str, parse_mode: str = None):
         logger.error(f"Failed to send message: {e}")
 
 
-async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None):
-    """Send a file to the user if it exists and is within size limits."""
+async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None,
+                         conv_id: str = None, user_id: int = None):
+    """Send a file to the user if it exists, is within size limits,
+    and passes the path allowlist check."""
+    # SECURITY: Verify recipient is authorized before sending any file
+    if user_id is not None and not auth_manager.is_authorized(user_id):
+        logger.warning(f"SECURITY: Blocked file send to unauthorized user {user_id}")
+        return False
+
     if not os.path.exists(filepath):
         logger.warning(f"[FILE] Not found: {filepath}")
+        return False
+
+    # Security: validate file path against allowlist
+    normalized = os.path.normpath(filepath).lower()
+    from config import AGI_BRAIN_DIR, HOME_DIR
+    SAFE_PREFIXES = [
+        os.path.normpath(os.path.join(HOME_DIR, "Downloads")).lower(),
+        os.path.normpath(AGI_BRAIN_DIR).lower(),
+        os.path.normpath(os.path.dirname(os.path.abspath(__file__))).lower(),
+    ]
+    # If we have a conversation ID, allow files from that specific brain dir
+    if conv_id:
+        from config import BRAIN_DIR
+        conv_dir = os.path.normpath(os.path.join(BRAIN_DIR, conv_id)).lower()
+        SAFE_PREFIXES.append(conv_dir)
+
+    path_allowed = any(normalized.startswith(prefix) for prefix in SAFE_PREFIXES)
+    if not path_allowed:
+        logger.warning(f"[FILE] BLOCKED — path outside allowlist: {filepath}")
         return False
 
     size = os.path.getsize(filepath)
@@ -194,13 +227,25 @@ async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None):
 
 
 def is_authorized(update: Update) -> bool:
-    if ALLOWED_USER_ID is None:
-        return True
+    """Check if user is authorized via AuthorizedUsersManager.
+    Reloads from disk every time to catch revocations instantly."""
     user_id = update.effective_user.id
-    if user_id != ALLOWED_USER_ID:
-        logger.warning(f"Unauthorized: user {user_id}")
+    # Re-read from disk to catch real-time revocations
+    auth_manager._load_fresh()
+    if not auth_manager.is_authorized(user_id):
+        user_name = update.effective_user.first_name or "Unknown"
+        logger.warning(f"[AUTH] BLOCKED unauthorized user {user_id} ({user_name})")
         return False
     return True
+
+async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """SECURITY: Global auth gate — runs before ALL handlers at group -1.
+    Unauthorized users get dead silence; no error, no acknowledgement."""
+    if update.effective_user and not is_authorized(update):
+        # Prevent callback query spinner for unauthorized users
+        if update.callback_query:
+            await update.callback_query.answer()
+        raise ApplicationHandlerStop()
 
 
 def get_uptime_str() -> str:
@@ -218,35 +263,7 @@ def get_uptime_str() -> str:
     return " ".join(parts)
 
 
-def detect_file_paths(text: str) -> list[str]:
-    """Extract Windows file paths from response text."""
-    import re
-    # Match Windows paths (with \ or /), and allow spaces if they have a file extension at the end
-    # Or match quoted paths
-    paths = []
-    
-    # 1. Match paths inside quotes: "C:\path to\file.ext" or 'C:/path to/file.ext'
-    quoted_pattern = r'["\']([A-Z]:[\\/][^"\']+?)["\']'
-    for match in re.findall(quoted_pattern, text, flags=re.IGNORECASE):
-        paths.append(match)
-        
-    # 2. Match unquoted paths (no spaces): C:\path\file.ext
-    # We exclude backticks (`), quotes, and common punctuation that might wrap the path
-    unquoted_pattern = r'[A-Z]:[\\/](?:[^\s<>"|?*\n`]+[\\/])*[^\s<>"|?*\n`]+'
-    for match in re.findall(unquoted_pattern, text, flags=re.IGNORECASE):
-        # Strip trailing punctuation (like commas or periods) that might be attached
-        match = match.rstrip(".,;:)'\"]}")
-        if match not in paths:
-            paths.append(match)
-            
-    # Normalize slashes and filter to only existing files
-    valid_paths = []
-    for p in paths:
-        normalized = os.path.normpath(p)
-        if os.path.isfile(normalized) and normalized not in valid_paths:
-            valid_paths.append(normalized)
-            
-    return valid_paths
+
 
 
 # ══════════════════════════════════════════════════════════
@@ -257,6 +274,7 @@ sessions: SessionManager = None
 settings: SettingsManager = None
 agents: AgentManager = None
 skills: SkillsManager = None
+auth_manager: AuthorizedUsersManager = None
 
 
 # ══════════════════════════════════════════════════════════
@@ -265,12 +283,11 @@ skills: SkillsManager = None
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
-        await update.message.reply_text("Not authorized.")
-        return
+        return  # Dead silence for unauthorized users
 
-    active = sessions.active_name
-    conv_id = sessions.get_conversation_id()
-    session_count = len(sessions.list_sessions())
+    active = sessions.get_active_name(update.effective_user.id)
+    conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
+    session_count = len(sessions.list_sessions(update.effective_user.id))
     stats = get_brain_stats()
     audio_ok = is_audio_capable()
     model = settings.get_model()
@@ -334,8 +351,9 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    active = sessions.active_name
-    conv_id = sessions.get_conversation_id()
+    # SECURITY FIX: Use per-user scoped session access instead of legacy global
+    active = sessions.get_active_name(update.effective_user.id)
+    conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
     now = datetime.now().strftime("%H:%M:%S")
     model = settings.get_model()
 
@@ -370,24 +388,25 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
+    uid = update.effective_user.id
     args = context.args
     if args:
         name = "-".join(args).lower().strip()
     else:
-        existing = sessions.list_sessions()
+        existing = sessions.list_sessions(uid)
         i = 1
         while True:
             name = f"session-{i}"
             if name not in existing:
                 break
             i += 1
-    if sessions.create_session(name):
+    if sessions.create_session(name, uid, source="telegram"):
         await update.message.reply_text(
             f"📁 New session [{name}] created!\n"
             "Next message starts a fresh conversation."
         )
     else:
-        sessions.active_name = name
+        sessions.set_active_name(name, uid)
         await update.message.reply_text(
             f"Switched to [{name}]."
         )
@@ -396,9 +415,10 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
+    uid = update.effective_user.id
     from ui_buttons import build_sessions_list_keyboard
-    all_sessions = sessions.list_sessions()
-    active = sessions.active_name
+    all_sessions = sessions.list_sessions(uid)
+    active = sessions.get_active_name(uid)
     if not all_sessions:
         await update.message.reply_text("No sessions. Send a message to start!")
         return
@@ -421,28 +441,30 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
+    uid = update.effective_user.id
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /switch <name>\nUse /sessions to see list.")
         return
     name = "-".join(args).lower().strip()
-    all_sessions = sessions.list_sessions()
+    all_sessions = sessions.list_sessions(uid)
     if name not in all_sessions:
         await update.message.reply_text(
             f"[{name}] not found. Available: " + ", ".join(all_sessions.keys())
         )
         return
-    sessions.active_name = name
+    sessions.set_active_name(name, uid)
     await update.message.reply_text(f"Switched to [{name}].")
 
 
 async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    name = sessions.active_name
-    sessions.delete_session(name)
+    uid = update.effective_user.id
+    name = sessions.get_active_name(uid)
+    sessions.delete_session(name, uid)
     await update.message.reply_text(
-        f"Session [{name}] ended. Active: [{sessions.active_name}]."
+        f"Session [{name}] ended. Active: [{sessions.get_active_name(uid)}]."
     )
 
 
@@ -590,7 +612,7 @@ async def cmd_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     model = settings.get_model()
-    session_count = len(sessions.list_sessions())
+    session_count = len(sessions.list_sessions(update.effective_user.id))
     running_agents = len(agents.list_running())
 
     await update.message.reply_text(
@@ -717,6 +739,36 @@ async def _run_agent_task(bot, chat_id: int, agent_id: str, task: str):
             pass
 
 
+async def process_bot_response(update: Update, context: ContextTypes.DEFAULT_TYPE, response: str, user_id: int, chat_id: int, active_session: str):
+    """Common pipeline to send text, post to chat_bus, and auto-deliver generated files."""
+    if chat_bus:
+        chat_bus.post_bot(response, user_id=user_id, session_name=active_session)
+
+    formatted_text, parse_mode = format_for_telegram(response)
+    chunks = split_message(formatted_text)
+    for i, chunk in enumerate(chunks):
+        try:
+            await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
+        except Exception as e:
+            logger.error(f"Send chunk {i + 1} failed: {e}")
+
+    file_paths = detect_file_paths(response)
+    final_conv = sessions.get_conversation_id(user_id=user_id)
+    files_sent = 0
+    for fp in file_paths[:3]:
+        logger.info(f"Auto-sending file to user {chat_id}: {fp}")
+        if chat_bus:
+            import os
+            media_type = "image" if fp.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')) else "document"
+            chat_bus.post_bot("", user_id=user_id, session_name=active_session, file_path=fp, media_type=media_type, file_name=os.path.basename(fp))
+        success = await safe_send_file(context.bot, chat_id, fp, conv_id=final_conv, user_id=user_id)
+        if success:
+            files_sent += 1
+
+    if files_sent > 0:
+        await context.bot.send_message(chat_id, f"📎 {files_sent} file(s) delivered successfully.")
+
+
 # ══════════════════════════════════════════════════════════
 #  MEDIA HANDLERS
 # ══════════════════════════════════════════════════════════
@@ -742,17 +794,27 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_transcript(transcript, os.path.basename(filepath))
             await update.message.reply_text(f'🎤 You said: "{transcript}"')
 
-            conv_id = sessions.get_conversation_id()
+            conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
+
+            # SECURITY FIX: Snapshot starting step BEFORE running agy (history dump prevention)
+            from agy_runner import get_latest_step
+            starting_step = get_latest_step(conv_id) if conv_id else 0
+
             response, detected_id = await run_agy_async(transcript, conv_id)
             if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id)
-            sessions.increment_messages()
+                sessions.set_conversation_id(detected_id, user_id=update.effective_user.id)
+
+            # Update last_seen_step to prevent history dumps
+            final_conv = detected_id or conv_id
+            if final_conv:
+                new_step = get_latest_step(final_conv)
+                sessions.set_last_seen_step(new_step, user_id=update.effective_user.id)
+
+            sessions.increment_messages(user_id=update.effective_user.id)
 
             stop_typing.set()
             typing_task.cancel()
-            formatted_text, parse_mode = format_for_telegram(response)
-            for chunk in split_message(formatted_text):
-                await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
+            await process_bot_response(update, context, response, update.effective_user.id, chat_id, sessions.get_active_name(update.effective_user.id))
         else:
             stop_typing.set()
             typing_task.cancel()
@@ -806,14 +868,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         auto_describe = settings.get("auto_describe_photos", True)
 
         if caption:
-            # User included a caption — use it as the question
             prompt = (
                 f"The user sent this image: {filepath}. "
                 f"Their question: {caption}. "
                 "Look at the image and respond."
             )
         elif auto_describe:
-            # Auto-describe the image
             prompt = (
                 f"The user sent this image: {filepath}. "
                 "Describe what you see in detail."
@@ -829,17 +889,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        conv_id = sessions.get_conversation_id()
+        if chat_bus:
+            user_name = update.effective_user.first_name or "User"
+            chat_bus.post_user(
+                caption, user_id=update.effective_user.id, user_name=user_name,
+                session_name=sessions.get_active_name(update.effective_user.id), source="telegram",
+                file_path=filepath, media_type="image", file_name=os.path.basename(filepath)
+            )
+
+        conv_id = sessions.get_conversation_id(user_id=update.effective_user.id)
         response, detected_id = await run_agy_async(prompt, conv_id)
         if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id)
-        sessions.increment_messages()
+            sessions.set_conversation_id(detected_id, user_id=update.effective_user.id)
+        sessions.increment_messages(user_id=update.effective_user.id)
 
         stop_typing.set()
         typing_task.cancel()
-        formatted_text, parse_mode = format_for_telegram(response)
-        for chunk in split_message(formatted_text):
-            await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
+        
+        await process_bot_response(update, context, response, update.effective_user.id, chat_id, sessions.get_active_name(update.effective_user.id))
 
     except Exception as e:
         stop_typing.set()
@@ -852,6 +919,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         filepath = await save_document(context.bot, update.message.document)
+        if chat_bus:
+            user_name = update.effective_user.first_name or "User"
+            chat_bus.post_user(
+                "", user_id=update.effective_user.id, user_name=user_name,
+                session_name=sessions.get_active_name(update.effective_user.id), source="telegram",
+                file_path=filepath, media_type="document", file_name=update.message.document.file_name or "unknown"
+            )
         await update.message.reply_text(
             f"📄 Document saved!\n{update.message.document.file_name or 'unknown'} "
             f"({format_file_size(os.path.getsize(filepath))})"
@@ -865,6 +939,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         filepath = await save_video(context.bot, update.message.video)
+        if chat_bus:
+            user_name = update.effective_user.first_name or "User"
+            chat_bus.post_user(
+                "", user_id=update.effective_user.id, user_name=user_name,
+                session_name=sessions.get_active_name(update.effective_user.id), source="telegram",
+                file_path=filepath, media_type="document", file_name=os.path.basename(filepath)
+            )
         await update.message.reply_text(
             f"🎬 Video saved! ({format_file_size(os.path.getsize(filepath))})"
         )
@@ -889,17 +970,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_message = update.message.text
     chat_id = update.effective_chat.id
-    active_session = sessions.active_name
-    conv_id = sessions.get_conversation_id()
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name or "User"
+    active_session = sessions.get_active_name(user_id)
+    conv_id = sessions.get_conversation_id(user_id=user_id)
 
     logger.info(
-        f"Message in [{active_session}]: {user_message[:80]}..."
+        f"Message in [{active_session}] (user:{user_id}): {user_message[:80]}..."
         f" (conv: {conv_id[:12] if conv_id else 'new'})"
     )
 
+    # Capture user message for GUI chat view
+    if chat_bus:
+        chat_bus.post_user(
+            user_message, user_id=user_id, user_name=user_name,
+            session_name=active_session, source="telegram",
+        )
+        chat_bus.set_typing(user_id)
+
     # Auto-title the session from the first message
-    if sessions.get_session_info() and sessions.get_session_info().get("messages", 0) == 0:
-        sessions.auto_title(user_message)
+    info = sessions.get_session_info(user_id=user_id)
+    if info and info.get("messages", 0) == 0:
+        sessions.auto_title(user_message, user_id=user_id)
+
+    # Snapshot the starting step BEFORE running agy (Task 1.4 — history dump fix)
+    from agy_runner import get_latest_step
+    starting_step = get_latest_step(conv_id) if conv_id else 0
 
     # Start typing indicator
     stop_typing = asyncio.Event()
@@ -918,31 +1014,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id)
+            sessions.set_conversation_id(detected_id, user_id=user_id)
             logger.info(f"Stored conversation ID: {detected_id[:12]}...")
 
-        sessions.increment_messages()
+        # Update last_seen_step to prevent history dumps (Task 1.4)
+        final_conv = detected_id or conv_id
+        if final_conv:
+            new_step = get_latest_step(final_conv)
+            sessions.set_last_seen_step(new_step, user_id=user_id)
+
+        sessions.increment_messages(user_id=user_id)
 
     except Exception as e:
         response = f"Error: {str(e)}"
         logger.error(f"Handler error: {e}", exc_info=True)
     finally:
         stop_typing.set()
+        # Clear typing for GUI
+        if chat_bus:
+            chat_bus.clear_typing(user_id)
         typing_task.cancel()
 
-    # Send response
-    formatted_text, parse_mode = format_for_telegram(response)
-    chunks = split_message(formatted_text)
-    for i, chunk in enumerate(chunks):
-        try:
-            await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
-        except Exception as e:
-            logger.error(f"Send chunk {i + 1} failed: {e}")
-
-    # Check for file paths in the response — auto-send files
-    file_paths = detect_file_paths(response)
-    for fp in file_paths[:10]:  # Max 10 files per response (acts as a send queue)
-        await safe_send_file(context.bot, chat_id, fp)
+    await process_bot_response(update, context, response, user_id, chat_id, active_session)
 
 
 
@@ -954,6 +1047,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route all callback queries to the appropriate handler."""
+    if not is_authorized(update):
+        await update.callback_query.answer()  # Acknowledge to prevent timeout spinner
+        return
+
     query = update.callback_query
     data = query.data
 
@@ -988,8 +1085,9 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "sessions":
         from ui_buttons import build_sessions_list_keyboard
-        all_sessions = sessions.list_sessions()
-        active = sessions.active_name
+        uid = update.effective_user.id
+        all_sessions = sessions.list_sessions(uid)
+        active = sessions.get_active_name(uid)
         keyboard = build_sessions_list_keyboard(all_sessions, active)
         lines = [f"📁 Sessions ({len(all_sessions)})\n════════════\n"]
         for name, info in all_sessions.items():
@@ -1075,7 +1173,7 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif action == "status":
         model = settings.get_model()
-        session_count = len(sessions.list_sessions())
+        session_count = len(sessions.list_sessions(update.effective_user.id))
         running_agents = len(agents.list_running())
         from ui_buttons import build_back_to_menu_keyboard
         keyboard = build_back_to_menu_keyboard()
@@ -1123,8 +1221,9 @@ async def _handle_sessions_callback(update: Update, context: ContextTypes.DEFAUL
 
     if data == "sess_list":
         from ui_buttons import build_sessions_list_keyboard
-        all_sessions = sessions.list_sessions()
-        active = sessions.active_name
+        uid = update.effective_user.id
+        all_sessions = sessions.list_sessions(uid)
+        active = sessions.get_active_name(uid)
         keyboard = build_sessions_list_keyboard(all_sessions, active)
         lines = [f"📁 Sessions ({len(all_sessions)})\n"]
         for name, info in all_sessions.items():
@@ -1135,7 +1234,7 @@ async def _handle_sessions_callback(update: Update, context: ContextTypes.DEFAUL
 
     elif data.startswith("sess_switch_"):
         name = data.replace("sess_switch_", "")
-        sessions.active_name = name
+        sessions.set_active_name(name, update.effective_user.id)
         await query.edit_message_text(f"✅ Switched to [{name}].")
 
     elif data.startswith("sess_delete_"):
@@ -1149,30 +1248,33 @@ async def _handle_sessions_callback(update: Update, context: ContextTypes.DEFAUL
 
     elif data.startswith("sess_confirm_del_"):
         name = data.replace("sess_confirm_del_", "")
-        sessions.delete_session(name)
-        await query.edit_message_text(f"🗑️ Session [{name}] deleted.\nActive: [{sessions.active_name}]")
+        uid = update.effective_user.id
+        sessions.delete_session(name, uid)
+        await query.edit_message_text(f"🗑️ Session [{name}] deleted.\nActive: [{sessions.get_active_name(uid)}]")
 
     elif data == "sess_cancel_del":
         from ui_buttons import build_sessions_list_keyboard
-        all_sessions = sessions.list_sessions()
-        active = sessions.active_name
+        uid = update.effective_user.id
+        all_sessions = sessions.list_sessions(uid)
+        active = sessions.get_active_name(uid)
         keyboard = build_sessions_list_keyboard(all_sessions, active)
         await query.edit_message_text("📁 Sessions", reply_markup=keyboard)
 
     elif data == "sess_new":
-        existing = sessions.list_sessions()
+        uid = update.effective_user.id
+        existing = sessions.list_sessions(uid)
         i = 1
         while True:
             name = f"session-{i}"
             if name not in existing:
                 break
             i += 1
-        sessions.create_session(name)
+        sessions.create_session(name, uid, source="telegram")
         await query.edit_message_text(f"📁 New session [{name}] created!\nNext message starts fresh.")
 
     elif data.startswith("sess_detail_"):
         name = data.replace("sess_detail_", "")
-        info = sessions.get_session_info(name)
+        info = sessions.get_session_info(name, user_id=update.effective_user.id)
         if info:
             from ui_buttons import build_session_detail_keyboard
             keyboard = build_session_detail_keyboard(name)
@@ -1298,6 +1400,10 @@ async def _handle_service_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Bot error: {context.error}", exc_info=context.error)
+    # SECURITY: Don't respond to unauthorized users — reveals bot existence
+    if isinstance(update, Update) and update.effective_user:
+        if not auth_manager.is_authorized(update.effective_user.id):
+            return
     if isinstance(update, Update) and update.message:
         try:
             from ui_buttons import build_error_keyboard
@@ -1349,7 +1455,7 @@ async def post_init(application):
 # ══════════════════════════════════════════════════════════
 
 def main():
-    global sessions, settings, agents, skills
+    global sessions, settings, agents, skills, auth_manager
 
     # 1. ENFORCE SINGLE INSTANCE (Kill Switch mechanism)
     if sys.platform == "win32":
@@ -1380,6 +1486,7 @@ def main():
     settings = SettingsManager(SETTINGS_FILE)
     agents = AgentManager(AGENTS_FILE, MAX_CONCURRENT_AGENTS)
     skills = SkillsManager(SKILLS_DIR)
+    auth_manager = AuthorizedUsersManager(USERS_FILE, OWNER_CHAT_ID)
 
     active = sessions.active_name
     session_count = len(sessions.list_sessions())
@@ -1394,7 +1501,8 @@ def main():
     print("=" * 55)
     print(f"  Active Session:  [{active}]")
     print(f"  Total Sessions:  {session_count}")
-    print(f"  User ID:         {ALLOWED_USER_ID}")
+    print(f"  Owner ID:        {OWNER_CHAT_ID}")
+    print(f"  Auth Users:      {auth_manager.count()} + owner")
     print(f"  Model:           {model}")
     print(f"  AGI-Brain:       {AGI_BRAIN_DIR}")
     print(f"  Audio:           {'Ready' if audio_ok else 'N/A'}")
@@ -1407,6 +1515,9 @@ def main():
 
     # Build bot
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # SECURITY: Global auth middleware — intercepts ALL updates before handlers
+    app.add_handler(TypeHandler(Update, auth_middleware), group=-1)
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))

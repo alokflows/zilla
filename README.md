@@ -1,43 +1,72 @@
-# 🚀 AGY Telegram Bot (Version 1.0 - Stable)
+# 🦖 Zilla: The Personal AGI Telegram Bot (Version 2)
+### Security Lockdown and PDF Delivery 
 
-The AGY Telegram Bot acts as a powerful "thin pipe" UI connecting you directly to your local Antigravity (AGY) agent engine. It allows you to operate a fully autonomous AI assistant locally from anywhere in the world via your mobile phone.
+Welcome to **Zilla Version 2**! Zilla is your personal AI assistant that lives on your computer but can be controlled entirely from your phone via Telegram. 
 
-## ✨ What's New in Version 1.0 (The Big Update)
-
-This major release transforms the bot from a basic text-relay script into a robust, state-aware AI assistant capable of advanced multitasking, background execution, and direct file management.
-
-### 🛡️ Iron-Clad Stability
-*   **The Single-Instance "Kill Switch":** Rebuilt the startup logic with aggressive OS-level file locking (`msvcrt`). This permanently prevents multiple ghost instances of the bot from running simultaneously and causing Telegram API conflicts.
-*   **FORCE_KILL_BOT.bat:** A dedicated script has been added to forcefully sweep and terminate any background Python processes instantly, ensuring you always have a clean slate.
-
-### 🧠 Deep UI Integration
-*   **Live Settings Persistence:** The UI Settings menu now actively communicates with the local `SettingsManager`. Toggling "Auto Describe Photos" or changing the "Max Sub-Agents" count instantly persists across restarts.
-*   **Dynamic Skills Menu:** The Skills menu now actively queries the local agent environment. It instantly displays installed native skills (like Kimi WebBridge).
-
-### 📤 Automated File Delivery Queue
-*   **Telegram File Sender Skill:** A dedicated skill was injected into the AI engine. Whenever you ask the agent to "send", "give", or "upload" a file, the AI is strictly instructed to output the absolute Windows file path.
-*   **Auto-Regex Uploader:** The bot actively scans the agent's thoughts in real-time. If it detects a generated file path, the bot automatically grabs the file from your local hard drive and uploads it to your Telegram chat.
-*   **Sub-Agent Queue System:** If you ask for 5 separate reports, the AI will use parallel sub-agents to generate them. The bot's internal queue system will capture up to 10 files at once and deliver them to your phone sequentially.
-
-### 🌐 Browser Automation (Kimi WebBridge)
-*   **Native Web Integration:** Because the bot acts as a direct pipe to the Antigravity engine, it automatically inherits the Kimi WebBridge capability. 
-*   **The Hands and Legs:** The AI can now safely open a local Chrome browser window on your machine, navigate Wikipedia, scrape GitHub repositories, and execute complex web navigation tasks—all commanded remotely from your phone.
-
-### 🏗️ Future-Proof Architecture (Version 2 Roadmap)
-*   **Modular Workspaces:** We have successfully laid the architectural groundwork (`workspaces_manager.py`) for a highly modular external API system. This will soon allow seamless OAuth integration directly into Google Drive, Docs, and Calendar.
-*   **GUI Desktop Application:** The next major milestone (Version 2) will transition this console-based script into a fully-fledged Windows Graphical Application.
+Imagine you have a super-smart robot sitting at your desk. Zilla is that robot! You text Zilla on your phone, and Zilla works on your actual computer to get things done.
 
 ---
 
-## 🛠️ Setup & Security
+## ✨ What does Zilla do?
 
-**Security First:** All hardcoded credentials have been securely scrubbed from `config.py`. 
-To run the bot, you must create a local `.env` file in this directory containing your keys. (This file is ignored by git to prevent accidental credential leaks).
+Zilla is not just a chat bot. It is an agent that can actively *do* things on your PC. 
+Even if a child asked Zilla to do something, here is how simple it is:
 
-**`.env` Format:**
+### 1. 💬 Send Messages and Talk
+Just open Telegram and type a message to Zilla. You can ask questions, brainstorm ideas, or ask it to research the web. Zilla uses its massive AI brain to read your message, think about it, and type back immediately.
+
+### 2. 📸 Understand Photos & Documents
+If you snap a photo of a document (like an ID card) or a picture of your homework, just send the image to Zilla in Telegram! 
+- Zilla looks at the picture.
+- It understands what is inside it.
+- You can ask it to translate it, summarize it, or even convert it!
+
+### 3. 📄 The Magic PDF Delivery 
+If you tell Zilla: *"Take the photo of this ID card and make a nicely formatted PDF out of it."*
+Zilla will literally create a real PDF file on your computer, save it, and then **automatically send that PDF right back to you in Telegram!** You don't have to search your computer for it. It magically pops up in your chat ready to download.
+
+### 4. 🖥️ The Live Desktop Dashboard
+If you are sitting at your computer, you can launch **Zilla's Live Dashboard**. It is a beautiful control panel that shows you:
+- Your live chat history syncing in real-time. (If you send a photo on your phone, it instantly pops up on your computer screen!)
+- The active AI session.
+- System metrics like how many messages have been sent.
+
+---
+
+## 🔒 Iron-Clad Security Lockdown
+Zilla is extremely secure. We built a giant digital fortress around it:
+- **Stranger Danger:** If a random person finds your bot on Telegram and says "Hello", Zilla will treat them with **dead silence**. It won't even show a loading spinner. Zilla ONLY talks to you.
+- **Sandboxed Files:** Zilla is only allowed to send files from specific safe folders on your computer. It can never accidentally leak sensitive system files.
+- **Strict Authorization:** Even if an error happens in the code, Zilla is strictly forbidden from showing that error to anyone except the authorized owner.
+
+---
+
+## 🚀 How to Launch Zilla 
+
+Starting Zilla is as easy as turning on a TV.
+
+**Step 1:** Open your computer terminal (PowerShell or Command Prompt).
+**Step 2:** Go to the folder where Zilla lives:
+```bash
+cd C:\Users\Isha\agy-telegram-bot-dev
 ```
-TELEGRAM_BOT_TOKEN="YOUR_TOKEN_HERE"
-TELEGRAM_OWNER_ID="YOUR_USER_ID"
+**Step 3:** Turn Zilla on by typing:
+```bash
+python gui_app.py
 ```
 
-Enjoy seamless, remote control over your local AGI!
+A beautiful dashboard will appear. Just click the **"Start Bot"** button in the dashboard, and Zilla is awake and ready to serve you on Telegram!
+
+---
+
+## 🛠️ Setup for the Grown-Ups (Technical Settings)
+To make Zilla yours, you need a secret key so Zilla knows it belongs to you.
+Create a file named `.env` in the folder and put your keys inside like this:
+
+```text
+TELEGRAM_BOT_TOKEN="YOUR_SECRET_TELEGRAM_TOKEN"
+TELEGRAM_OWNER_ID="YOUR_TELEGRAM_USER_ID_NUMBER"
+```
+*(Keep this file secret!)*
+
+Enjoy your incredibly powerful, super-secure AI assistant!

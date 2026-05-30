@@ -5,6 +5,13 @@
 import os
 
 # --- Load .env manually for zero-dependency ---
+# --- Dynamic Path Resolution ---
+import sys
+HOME_DIR = os.path.expanduser("~")
+BASE_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+
+# --- Authorized Users File ---
+USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.exists(env_path):
     with open(env_path, "r") as f:
@@ -15,19 +22,20 @@ if os.path.exists(env_path):
 
 # --- Telegram Settings ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
-ALLOWED_USER_ID = None  # None = open access for dev
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_ID", "0"))
 
+
+
 # --- agy CLI Settings ---
-AGY_PATH = r"C:\Users\Isha\AppData\Local\agy\bin\agy.exe"
-AGY_WORKING_DIR = r"C:\Users\Isha"
+AGY_PATH = os.path.join(HOME_DIR, "AppData", "Local", "agy", "bin", "agy.exe")
+AGY_WORKING_DIR = HOME_DIR
 AGY_TIMEOUT = 600  # 10 minutes max per request
 
 # --- Brain Directory (where agy stores conversations) ---
-BRAIN_DIR = r"C:\Users\Isha\.gemini\antigravity-cli\brain"
+BRAIN_DIR = os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "brain")
 
 # --- AGI Brain (Knowledge Management System) ---
-AGI_BRAIN_DIR = r"C:\Users\Isha\AGI-Brain"
+AGI_BRAIN_DIR = os.path.join(HOME_DIR, "AGI-Brain")
 AGI_INBOX_DIR = os.path.join(AGI_BRAIN_DIR, "Inbox")
 AGI_INBOX_IMAGES = os.path.join(AGI_INBOX_DIR, "images")
 AGI_INBOX_AUDIO = os.path.join(AGI_INBOX_DIR, "audio")
@@ -46,21 +54,21 @@ AGI_LOGS_DIR = os.path.join(AGI_BRAIN_DIR, "Logs")
 FFMPEG_PATH = os.path.join(AGI_TOOLS_DIR, "ffmpeg", "ffmpeg.exe")
 
 # --- Session State File (DEV — separate from prod!) ---
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
+STATE_FILE = os.path.join(BASE_DIR, "sessions.json")
 
 # --- Settings File ---
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 # --- Agent State File ---
-AGENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents.json")
+AGENTS_FILE = os.path.join(BASE_DIR, "agents.json")
 
 # --- Kimi Web Bridge ---
-KIMI_BRIDGE_DIR = r"C:\Users\Isha\.kimi-webbridge"
+KIMI_BRIDGE_DIR = os.path.join(HOME_DIR, ".kimi-webbridge")
 KIMI_BRIDGE_BIN = os.path.join(KIMI_BRIDGE_DIR, "bin", "kimi-webbridge")
 KIMI_BRIDGE_URL = "http://127.0.0.1:10086"
 
 # --- Skills ---
-SKILLS_DIR = r"C:\Users\Isha\.gemini\antigravity-cli\skills"
+SKILLS_DIR = os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "skills")
 
 # --- Whisper (Audio Transcription) ---
 WHISPER_MODEL = "base"  # tiny, base, small, medium

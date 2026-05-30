@@ -475,33 +475,58 @@ def _escape_mdv2_with_formatting(text: str) -> str:
 # ══════════════════════════════════════════════════════════
 
 def detect_file_paths(text: str) -> list[str]:
+    """Extract Windows file paths from response text.
+    
+    Handles both backslash (C:\\path) and forward-slash (C:/path) formats.
+    Normalizes all paths to OS-native format before validation.
     """
-    Extract Windows absolute file paths from text.
+    import re, os
+    paths = []
 
-    Looks for paths like C:\\Users\\Isha\\project\\file.py
-    that agy mentions when it creates or modifies files.
+    # 1. Match paths inside quotes: "C:\path to\file.ext" or 'C:/path to/file.ext'
+    quoted_pattern = r'["\']([A-Z]:[\\/][^"\']+?)["\']'
+    for match in re.findall(quoted_pattern, text, flags=re.IGNORECASE):
+        paths.append(match)
 
-    Args:
-        text: Raw or cleaned agy output.
+    # 2. Match paths inside backticks: `C:\path\file.ext` or `C:/path/file.ext`
+    backtick_pattern = r'`([A-Z]:[\\/][^`]+?)`'
+    for match in re.findall(backtick_pattern, text, flags=re.IGNORECASE):
+        if match not in paths:
+            paths.append(match)
 
-    Returns:
-        De-duplicated list of absolute Windows file paths found.
-    """
-    matches = _WIN_PATH_RE.findall(text)
+    # 3. Match paths inside markdown bold: **C:\path\file.ext**
+    bold_pattern = r'\*\*([A-Z]:[\\/][^*]+?)\*\*'
+    for match in re.findall(bold_pattern, text, flags=re.IGNORECASE):
+        if match not in paths:
+            paths.append(match)
 
-    # De-duplicate while preserving order
-    seen: set[str] = set()
-    unique: list[str] = []
-    for path in matches:
-        normalized = path.replace("/", "\\")
-        if normalized not in seen:
-            seen.add(normalized)
-            unique.append(normalized)
+    # 4. Match "saved to/at" patterns: "File saved to C:\path\file.ext"
+    #    Also matches "stored", "placed", "available at" for broader coverage
+    saved_pattern = r'(?:saved|created|written|output|generated|exported|downloaded|stored|placed|available)\s+(?:to|at|in|as)\s+([A-Z]:[\\/][^\s\n\r,;]+)'
+    for match in re.findall(saved_pattern, text, flags=re.IGNORECASE):
+        clean = match.rstrip(".,;:)'\"]}*")
+        if clean not in paths:
+            paths.append(clean)
 
-    if unique:
-        logger.debug(f"[FORMATTER] Detected {len(unique)} file path(s): {unique}")
+    # 5. Match unquoted paths (no spaces): C:\path\file.ext or C:/path/file.ext
+    unquoted_pattern = r'[A-Z]:[\\/](?:[^\s<>"|?*\n`]+[\\/])*[^\s<>"|?*\n`]+'
+    for match in re.findall(unquoted_pattern, text, flags=re.IGNORECASE):
+        # Strip trailing punctuation
+        match = match.rstrip(".,;:)'\"]}*")
+        if match not in paths:
+            paths.append(match)
 
-    return unique
+    # Normalize slashes (forward→backslash on Windows) and filter to existing files
+    valid_paths = []
+    for p in paths:
+        normalized = os.path.normpath(p)
+        if os.path.isfile(normalized) and normalized not in valid_paths:
+            valid_paths.append(normalized)
+
+    if valid_paths:
+        logger.debug(f"[FORMATTER] Detected {len(valid_paths)} valid file path(s): {valid_paths}")
+
+    return valid_paths
 
 
 # ══════════════════════════════════════════════════════════
