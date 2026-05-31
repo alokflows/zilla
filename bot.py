@@ -1588,7 +1588,15 @@ def main():
     _cout("  Starting… Ctrl+C to stop.")
     _cout()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # concurrent_updates: serve many users AT THE SAME TIME instead of one-by-one.
+    # Without this, one user's long CLI task blocks everyone else (incl. the owner).
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .build()
+    )
 
     # Auth gate — runs before ALL handlers
     app.add_handler(TypeHandler(Update, auth_middleware), group=-1)
