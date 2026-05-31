@@ -6,6 +6,8 @@ Imagine you have a very clever robot friend who lives inside your phone's Telegr
 You send it a message — like *"write me a story"* or *"summarize this PDF"* — and it does the work and sends the answer right back to you. **That robot friend is Zilla.** 🦖
 
 > 📖 **Want step-by-step install + a full user manual?** Read **[MANUAL.md](MANUAL.md)** — everything explained like you're three, including how to connect a different AI.
+>
+> 📜 **What's new?** See the **[CHANGELOG](CHANGELOG.md)** (latest: **v2.2.0** — fast, multi-user, self-healing).
 
 ---
 
