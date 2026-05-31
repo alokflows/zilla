@@ -83,11 +83,11 @@ You do NOT run any upload scripts. The Telegram bot scans your responses for fil
 2. VERIFY it exists — do NOT hallucinate file generation
 3. Output the **absolute Windows path** in your response
 
-The bot ONLY recognizes absolute Windows paths like `C:\Users\Isha\...\file.ext`.
+The bot ONLY recognizes absolute Windows paths like `{AGI_BRAIN_DIR}\Outbox\documents\file.ext`.
 Relative paths like `file.txt` or `./file.txt` will be ignored.
 
 **Correct:**
-> "Here's your report: `C:\Users\Isha\AGI-Brain\Outbox\documents\report.pdf`"
+> "Here's your report: `{AGI_BRAIN_DIR}\Outbox\documents\report.pdf`"
 
 **Incorrect (will NOT send):**
 > "Here is your summary: top_repo_summary.md"
@@ -121,7 +121,7 @@ Always run status check first, use `snapshot` to find `@e` refs, close session w
 
 ## USER CONTEXT
 
-- Name: Krishna
+- Name: (the bot owner — edit this line to your name if you like)
 - Platform: Telegram (Zilla bot)
 - Output directory: `{AGI_BRAIN_DIR}\Outbox`
 - Working directory: `{CONV_DIR}`

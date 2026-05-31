@@ -130,11 +130,13 @@ Message [@BotFather](https://t.me/BotFather) on Telegram, type `/newbot`, follow
 **Step 2 — Get your Telegram ID**
 Message [@userinfobot](https://t.me/userinfobot) on Telegram. It tells you your number ID.
 
-**Step 3 — Create a file named `.env`** in this folder, and put inside:
+**Step 3 — Make your settings file.**
+Copy the template `.env.example` and name the copy `.env`, then open it and fill in your token and ID:
 ```env
 TELEGRAM_BOT_TOKEN=paste_your_token_here
 TELEGRAM_OWNER_ID=paste_your_id_here
 ```
+You can leave everything else in the file alone — it figures itself out automatically.
 
 **Step 4 — Install the helper libraries** (open a terminal in this folder):
 ```bash
@@ -157,6 +159,30 @@ Want Zilla to run in the background without a black window popping up?
 - **Run invisibly:** double-click `run_bot_hidden.vbs` — it runs silently and restarts itself if it crashes.
 - **Start automatically when you log in:** double-click `install_startup.bat` (undo with `uninstall_startup.bat`).
 - **Stop it:** double-click `Stop Zilla.vbs`.
+
+---
+
+## 🤝 Sharing With a Friend / Moving to Another Computer
+
+Good news: Zilla **does not care** about your username or where the folder lives. It figures out the right paths on whatever computer it runs on. So moving it is easy — but there are **two things your friend must do**.
+
+**1. Get the project onto their computer.** Best way:
+```bash
+git clone https://github.com/alokflows/zilla.git
+```
+> ⚠️ **Do NOT just zip your folder and send it.** Your own `.env` file holds your **secret bot token** — anyone who gets it can take over your bot. Cloning from GitHub is safe because `.env` is never uploaded. If you must zip, **delete `.env` first.**
+
+**2. Install the "brain" (the AI CLI).** Zilla is only the messenger — it needs the AI program (`agy`) installed to actually think. Your friend installs that separately. If they put it in the normal place, Zilla finds it automatically. If they put it somewhere unusual, they just set `CLI_PATH` in their `.env`.
+
+**Then your friend does the normal setup:**
+- Install Python, then `pip install -r requirements.txt`
+- Get **their own** bot token (@BotFather) and **their own** Telegram ID (@userinfobot)
+- Copy `.env.example` → `.env` and fill in those two values
+- Run `python bot.py`
+
+That's it. Their bot, their token, their computer — same code. 🎉
+
+> 💡 **Why their own token?** A bot token is like a house key for one specific bot. You each run your own copy of Zilla with your own key. Sharing the *code* is great; sharing the *key* is not.
 
 ---
 
