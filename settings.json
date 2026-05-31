@@ -1,7 +1,0 @@
-{
-  "model": "claude-sonnet-4",
-  "idle_kill_after": 600,
-  "auto_describe_photos": false,
-  "whisper_model": "base",
-  "cli_backend": "agy"
-}

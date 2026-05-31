@@ -1,13 +1,17 @@
 ' ============================================================
-'  Stop Zilla — double-click to kill the bot completely
+'  Stop Zilla — double-click to stop the bot now
 ' ============================================================
 '  Runs fully hidden (no black console flash).
-'  1) Drops a stop-flag so the auto-restart launcher won't
-'     bring the bot back to life.
-'  2) Kills the recorded PID and its whole process tree
-'     (this includes the agy.exe CLI children it spawned).
-'  3) Safety-net sweep: kills any python/pythonw still
-'     running bot.py, plus the wscript launcher itself.
+'
+'  It stops the bot until the next time you log in / reboot
+'  (the auto-start watchdog brings it back then). To remove
+'  auto-start permanently, run "uninstall_startup.bat".
+'
+'  How it stops cleanly WITHOUT the watchdog reviving it:
+'    1) Drop a "zilla.stop" flag so the restart loop quits on purpose.
+'    2) Kill the bot's recorded PID (and its agy.exe children).
+'  The hidden launcher then exits BY ITSELF via that flag — the
+'  watchdog sees a clean stop and does not restart it.
 ' ============================================================
 
 Set WshShell = CreateObject("WScript.Shell")
@@ -16,7 +20,7 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 WshShell.CurrentDirectory = scriptDir
 
-' --- 1) Tell the launcher to stop restarting ---
+' --- 1) Tell the restart loop to quit on purpose ---
 stopFlag = scriptDir & "\zilla.stop"
 Set sf = fso.CreateTextFile(stopFlag, True)
 sf.WriteLine "stop"
@@ -36,19 +40,16 @@ If fso.FileExists(pidFile) Then
     On Error GoTo 0
 End If
 
-' --- 3) Safety-net sweep (hidden): python(w) running bot.py + the launcher ---
+' --- 3) Safety net: kill any python(w) still running bot.py (PID file may be stale).
+'        NOTE: we deliberately do NOT kill the wscript launcher — it must exit on
+'        its own via the stop flag so the watchdog treats it as a clean stop. ---
 psInner = "Get-CimInstance Win32_Process | " & _
-    "Where-Object { " & _
-    "(($_.Name -eq 'pythonw.exe' -or $_.Name -eq 'python.exe') -and $_.CommandLine -like '*bot.py*') " & _
-    "-or (($_.Name -eq 'wscript.exe' -or $_.Name -eq 'cscript.exe') -and $_.CommandLine -like '*Start Zilla*') " & _
-    "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    "Where-Object { ($_.Name -eq 'pythonw.exe' -or $_.Name -eq 'python.exe') -and $_.CommandLine -like '*bot.py*' } | " & _
+    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 psCmd = "powershell -NoProfile -ExecutionPolicy Bypass -Command " & Chr(34) & psInner & Chr(34)
 WshShell.Run psCmd, 0, True
 
-' Give the kills a moment, then clean up the stop flag
 WScript.Sleep 1500
-On Error Resume Next
-If fso.FileExists(stopFlag) Then fso.DeleteFile(stopFlag)
-On Error GoTo 0
-
-MsgBox "Zilla bot has been stopped.", 64, "Zilla"
+MsgBox "Zilla has been stopped." & vbCrLf & _
+       "It will start again next time you log in." & vbCrLf & _
+       "(To stop that too, run uninstall_startup.bat.)", 64, "Zilla"

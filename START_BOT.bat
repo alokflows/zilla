@@ -7,7 +7,7 @@ echo ==========================================
 echo.
 echo  This window is for watching logs / debugging.
 echo  For normal silent use, double-click instead:
-echo     "Start Zilla (Invisible).vbs"
+echo     "run_bot_hidden.vbs"
 echo  To stop the bot at any time:
 echo     "Stop Zilla.vbs"
 echo.

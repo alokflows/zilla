@@ -15,8 +15,13 @@ venv/
 sessions.json
 authorized_users.json
 denied_users.json
+settings.json
+selected_model.txt
 zilla.pid
 zilla.stop
+
+# CLI working data created in the bot folder
+.antigravitycli/
 
 # Build artifacts
 build/

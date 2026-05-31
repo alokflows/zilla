@@ -1,22 +1,36 @@
 @echo off
-title AGY Bot — Install to Startup
+title Zilla Bot - Install Auto-Start (Persistent Watchdog)
 echo.
-echo Installing AGY Bot to Windows Startup...
+echo ==========================================================
+echo   Making Zilla start automatically and stay alive.
+echo   If Windows asks for permission, click YES.
+echo ==========================================================
 echo.
 
-set "VBS_PATH=%~dp0run_bot_hidden.vbs"
-set "SHORTCUT_PATH=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AGY Bot.lnk"
+set "VBS=%~dp0run_bot_hidden.vbs"
+set "DIR=%~dp0"
 
-:: Create shortcut using PowerShell (no admin needed)
-powershell -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT_PATH%'); $s.TargetPath = 'wscript.exe'; $s.Arguments = '\"%VBS_PATH%\"'; $s.WorkingDirectory = '%~dp0'; $s.Description = 'AGY Telegram Bot'; $s.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+ "try {" ^
+ "  $a = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('\"' + '%VBS%' + '\"') -WorkingDirectory '%DIR%';" ^
+ "  $t = New-ScheduledTaskTrigger -AtLogOn;" ^
+ "  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero);" ^
+ "  Register-ScheduledTask -TaskName 'ZillaBot' -Action $a -Trigger $t -Settings $s -Force | Out-Null;" ^
+ "  Write-Host '[SUCCESS] Watchdog installed. Zilla starts at login and restarts itself if it ever dies.';" ^
+ "} catch {" ^
+ "  Write-Host '[INFO] Scheduled task blocked - using a simple Startup shortcut instead.';" ^
+ "  $ws = New-Object -ComObject WScript.Shell;" ^
+ "  $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Zilla Bot.lnk';" ^
+ "  $sc = $ws.CreateShortcut($lnk);" ^
+ "  $sc.TargetPath = 'wscript.exe';" ^
+ "  $sc.Arguments = ('\"' + '%VBS%' + '\"');" ^
+ "  $sc.WorkingDirectory = '%DIR%';" ^
+ "  $sc.Save();" ^
+ "  Write-Host '[SUCCESS] Startup shortcut created (starts Zilla at login).';" ^
+ "}"
 
-if exist "%SHORTCUT_PATH%" (
-    echo.
-    echo [SUCCESS] AGY Bot will start automatically on login!
-    echo Shortcut: %SHORTCUT_PATH%
-) else (
-    echo.
-    echo [ERROR] Failed to create startup shortcut.
-)
+echo.
+echo Tip: to start it RIGHT NOW without rebooting, double-click run_bot_hidden.vbs
+echo      (stop the current copy first with "Stop Zilla.vbs" to avoid duplicates).
 echo.
 pause

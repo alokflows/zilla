@@ -1,12 +1,15 @@
 @echo off
-title AGY Bot — Remove from Startup
+title Zilla Bot - Remove Auto-Start
 echo.
-set "SHORTCUT_PATH=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AGY Bot.lnk"
-if exist "%SHORTCUT_PATH%" (
-    del "%SHORTCUT_PATH%"
-    echo [SUCCESS] AGY Bot removed from startup.
-) else (
-    echo AGY Bot was not in startup.
-)
+echo Removing Zilla auto-start (watchdog + any startup shortcut)...
+echo.
+
+powershell -NoProfile -Command "Unregister-ScheduledTask -TaskName 'ZillaBot' -Confirm:$false -ErrorAction SilentlyContinue"
+
+del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Zilla Bot.lnk" 2>nul
+del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AGY Bot.lnk" 2>nul
+
+echo [DONE] Zilla will no longer start automatically.
+echo        If it is running right now, double-click "Stop Zilla.vbs" to stop it.
 echo.
 pause
