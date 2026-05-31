@@ -41,6 +41,7 @@ _WIN_PATH_RE = re.compile(r"[A-Za-z]:\\(?:[^\s\\/:*?\"<>|]+\\)*[^\s\\/:*?\"<>|]+
 _HORIZONTAL_RULE_RE = re.compile(r"^[\s]*[-*_]{3,}[\s]*$", re.MULTILINE)
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _STAR_BULLET_RE = re.compile(r"^(\s*)\*\s+", re.MULTILINE)
+_DASH_BULLET_RE = re.compile(r"^(\s*)-\s+", re.MULTILINE)
 
 
 # ══════════════════════════════════════════════════════════
@@ -104,7 +105,18 @@ def _convert_horizontal_rules(text: str) -> str:
 
 
 def _normalize_bullets(text: str) -> str:
-    return _STAR_BULLET_RE.sub(r"\1• ", text)
+    code_blocks = []
+
+    def _save_code(match):
+        code_blocks.append(match.group(0))
+        return f"\x00CB{len(code_blocks) - 1}\x00"
+
+    text = _CODE_BLOCK_RE.sub(_save_code, text)
+    text = _STAR_BULLET_RE.sub(r"\1• ", text)
+    text = _DASH_BULLET_RE.sub(r"\1• ", text)
+    for idx, block in enumerate(code_blocks):
+        text = text.replace(f"\x00CB{idx}\x00", block)
+    return text
 
 
 def _collapse_blank_lines(text: str) -> str:

@@ -33,6 +33,7 @@
 #  Document → analyze (if caption) or save
 # ============================================================
 
+import winhide  # noqa: F401 — MUST be first: suppresses all child console windows
 import asyncio
 import atexit
 import sys
@@ -77,16 +78,21 @@ from users import AuthManager
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# Under pythonw.exe (hidden launcher) there is no console — sys.stdout is None.
+# Only attach the console handler when a real stdout exists; always log to file.
+_log_handlers = [
+    logging.FileHandler(
+        os.path.join(LOG_DIR, f"bot_{datetime.now().strftime('%Y%m%d')}.log"),
+        encoding="utf-8",
+    ),
+]
+if sys.stdout is not None:
+    _log_handlers.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
-            os.path.join(LOG_DIR, f"bot_{datetime.now().strftime('%Y%m%d')}.log"),
-            encoding="utf-8",
-        ),
-    ],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
 
@@ -210,13 +216,14 @@ async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None,
     # Resolve symlinks to prevent junction/symlink escape
     abs_path = os.path.realpath(filepath)
 
-    # Allowlist: only AGI-Brain and the current conversation's brain folder
+    # Allowlist: AGI-Brain (Outbox lives here) + this conversation's CLI brain folder
     safe_prefixes = [
         os.path.realpath(AGI_BRAIN_DIR),
     ]
     if conv_id:
+        # conv_id is a UUID — join directly without basename to avoid stripping
         safe_prefixes.append(
-            os.path.realpath(os.path.join(BRAIN_DIR, os.path.basename(conv_id)))
+            os.path.realpath(os.path.join(BRAIN_DIR, conv_id))
         )
 
     abs_lower = abs_path.lower()
@@ -1475,9 +1482,39 @@ async def post_init(application):
 # Module-level lock file handle (for single-instance guard)
 _lock_file_handle = None
 
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+PID_FILE = os.path.join(_BOT_DIR, "zilla.pid")
+
+
+def _cout(msg: str = ""):
+    """Print only when a real console exists (no-op under pythonw.exe)."""
+    if sys.stdout is not None:
+        try:
+            print(msg)
+        except Exception:
+            pass
+
+
+def _write_pid_file():
+    """Write our PID so the Stop script can kill us (and our CLI children) reliably."""
+    try:
+        with open(PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        logger.warning(f"[PID] Could not write pid file: {e}")
+
+
+def _remove_pid_file():
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except Exception:
+        pass
+
 
 def _release_lock():
     global _lock_file_handle
+    _remove_pid_file()
     if _lock_file_handle:
         try:
             import msvcrt
@@ -1498,16 +1535,29 @@ def main():
 
     if sys.platform == "win32":
         import msvcrt
-        lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zilla_bot_instance.lock")
+        bot_dir = os.path.dirname(os.path.abspath(__file__))
+        lock_path = os.path.join(bot_dir, "zilla_bot_instance.lock")
+        # Remove any stale lock files from old naming schemes
+        for stale in ["agy_bot_instance.lock"]:
+            stale_path = os.path.join(bot_dir, stale)
+            if os.path.exists(stale_path):
+                try:
+                    os.remove(stale_path)
+                except OSError:
+                    pass
         try:
             _lock_file_handle = open(lock_path, "w")
             msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
-            print("❌ Another instance is already running!")
+            _cout("❌ Another instance is already running.")
+            _cout("   Double-click 'Stop Zilla.bat' to kill it first.")
             sys.exit(1)
         atexit.register(_release_lock)
 
-    if sys.platform == "win32":
+    # Record our PID so 'Stop Zilla.bat' can terminate us + CLI children
+    _write_pid_file()
+
+    if sys.platform == "win32" and sys.stdout is not None:
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -1523,18 +1573,20 @@ def main():
     audio_ok = is_audio_capable()
     idle_kill = get_idle_kill_after()
 
-    print("=" * 52)
-    print(f"  Zilla Bot v{BOT_VERSION}")
-    print(f"  Thin pipe to CLI — it does the thinking.")
-    print("=" * 52)
-    print(f"  Owner: {OWNER_CHAT_ID}")
-    print(f"  Users: {auth.count()} authorized")
-    print(f"  Model: {model}")
-    print(f"  Sessions: {session_count}")
-    print(f"  Audio: {'Ready' if audio_ok else 'N/A'}")
-    print(f"  Idle reaper: {idle_kill}s (0=disabled)")
-    print("  Starting… Ctrl+C to stop.")
-    print()
+    logger.info(f"Zilla Bot v{BOT_VERSION} starting (PID {os.getpid()})")
+    _cout("=" * 52)
+    _cout(f"  Zilla Bot v{BOT_VERSION}")
+    _cout(f"  Thin pipe to CLI — it does the thinking.")
+    _cout("=" * 52)
+    _cout(f"  Owner: {OWNER_CHAT_ID}")
+    _cout(f"  Users: {auth.count()} authorized")
+    _cout(f"  Model: {model}")
+    _cout(f"  Sessions: {session_count}")
+    _cout(f"  Audio: {'Ready' if audio_ok else 'N/A'}")
+    _cout(f"  Idle reaper: {idle_kill}s (0=disabled)")
+    _cout(f"  PID: {os.getpid()} (double-click 'Stop Zilla.bat' to kill)")
+    _cout("  Starting… Ctrl+C to stop.")
+    _cout()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 

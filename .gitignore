@@ -13,7 +13,10 @@ venv/
 # State files (regenerated at runtime)
 *.lock
 sessions.json
+authorized_users.json
 denied_users.json
+zilla.pid
+zilla.stop
 
 # Build artifacts
 build/

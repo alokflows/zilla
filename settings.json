@@ -1,5 +1,5 @@
 {
-  "model": "gemini-3.1-pro",
+  "model": "claude-sonnet-4",
   "idle_kill_after": 600,
   "auto_describe_photos": false,
   "whisper_model": "base",

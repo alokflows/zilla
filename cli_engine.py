@@ -7,6 +7,7 @@
 #  MAX_TOTAL_RUNTIME catastrophic ceiling.
 # ============================================================
 
+import winhide  # noqa: F401 — MUST be first: suppresses all child console windows
 import asyncio
 import json
 import os
@@ -15,7 +16,6 @@ import time
 import logging
 import threading
 import subprocess
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
@@ -69,6 +69,10 @@ _METADATA_LINE_RE = re.compile(
 )
 _JSON_DEBUG_BLOCK_RE = re.compile(
     r"\{[\s\S]{50,}?(?:\"tool_calls\"|\"step_index\"|\"type\":\s*\"PLANNER)[\s\S]*?\}",
+    re.MULTILINE,
+)
+_CLI_WARN_RE = re.compile(
+    r'^Warning: conversation "[^"]*" not found\.\s*\n?',
     re.MULTILINE,
 )
 
@@ -128,6 +132,7 @@ def sanitize_response(text: str) -> str:
         cleaned.append(line)
     text = "\n".join(cleaned)
     text = _JSON_DEBUG_BLOCK_RE.sub("", text)
+    text = _CLI_WARN_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -358,12 +363,6 @@ def get_instructions() -> str | None:
             _cached_instructions = f.read().strip()
     except Exception:
         return None
-    try:
-        skills_summary = _get_skills_summary()
-        if skills_summary:
-            _cached_instructions += "\n\n### Available Skills:\n" + skills_summary
-    except Exception as e:
-        logger.error(f"[ENGINE] Failed to inject skills: {e}")
     return _cached_instructions
 
 
@@ -425,6 +424,48 @@ def get_selected_model() -> str | None:
 
 
 # ══════════════════════════════════════════════════════════
+#  CONVERSATION DETECTION HELPERS
+# ══════════════════════════════════════════════════════════
+
+def _get_conv_dirs_snapshot() -> set:
+    """Return names of all directories currently in BRAIN_DIR."""
+    if not os.path.isdir(BRAIN_DIR):
+        return set()
+    result = set()
+    try:
+        for name in os.listdir(BRAIN_DIR):
+            if os.path.isdir(os.path.join(BRAIN_DIR, name)):
+                result.add(name)
+    except Exception:
+        pass
+    return result
+
+
+def _find_new_conv(snapshot_before: set) -> str | None:
+    """Return the conversation ID the CLI just created (new dir not in snapshot_before)."""
+    if not os.path.isdir(BRAIN_DIR):
+        return None
+    try:
+        new_dirs = [
+            name for name in os.listdir(BRAIN_DIR)
+            if name not in snapshot_before
+            and os.path.isdir(os.path.join(BRAIN_DIR, name))
+        ]
+        if not new_dirs:
+            return None
+        if len(new_dirs) == 1:
+            return new_dirs[0]
+        def _mtime(n):
+            try:
+                return os.path.getmtime(os.path.join(BRAIN_DIR, n))
+            except Exception:
+                return 0
+        return max(new_dirs, key=_mtime)
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════
 #  CORE — Run CLI via ConPTY
 # ══════════════════════════════════════════════════════════
 
@@ -450,26 +491,24 @@ def run_cli(
     max_total_runtime = MAX_TOTAL_RUNTIME  # from env, not overridable at runtime
 
     is_new = False
+    snapshot_before: set = set()
+
     if not conversation_id:
         is_new = True
-        conversation_id = str(uuid.uuid4())
     else:
         transcript_path = os.path.join(
             BRAIN_DIR, conversation_id, ".system_generated", "logs", "transcript.jsonl"
         )
         if not os.path.exists(transcript_path):
+            # Stale conv_id (e.g. brain dir was cleared) — start fresh
             is_new = True
+            conversation_id = None
 
     if is_new:
-        log_dir = os.path.join(BRAIN_DIR, conversation_id, ".system_generated", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        transcript_path = os.path.join(log_dir, "transcript.jsonl")
-        if not os.path.exists(transcript_path):
-            open(transcript_path, "a", encoding="utf-8").close()
-        conv_dir = os.path.join(BRAIN_DIR, conversation_id, "out")
-        os.makedirs(conv_dir, exist_ok=True)
+        snapshot_before = _get_conv_dirs_snapshot()
         instructions = get_instructions()
         if instructions:
+            conv_dir = os.path.join(AGI_BRAIN_DIR, "Outbox")
             instructions = instructions.replace("{CONV_DIR}", conv_dir)
             instructions = instructions.replace("{AGI_BRAIN_DIR}", AGI_BRAIN_DIR)
             instructions = instructions.replace("{HOME_DIR}", HOME_DIR)
@@ -480,8 +519,10 @@ def run_cli(
                 f"{prompt}"
             )
 
-    # Build command
-    cmd_parts = [CLI_PATH, "--conversation", conversation_id]
+    # Build command — no --conversation for new sessions; let CLI create its own ID
+    cmd_parts = [CLI_PATH]
+    if conversation_id:
+        cmd_parts.extend(["--conversation", conversation_id])
     if skip_permissions:
         cmd_parts.append("--dangerously-skip-permissions")
     # Use a generous print-timeout so the CLI itself never fires before our idle reaper
@@ -489,8 +530,9 @@ def run_cli(
     cmd_parts.extend(["--print-timeout", f"{print_timeout_min}m", "--print", prompt])
     command = subprocess.list2cmdline(cmd_parts)
 
+    conv_label = conversation_id[:12] if conversation_id else "new"
     logger.info(
-        f"[ENGINE] {'New' if is_new else 'Continuing'} conv {conversation_id[:12]}... "
+        f"[ENGINE] {'New' if is_new else 'Continuing'} conv {conv_label}... "
         f"idle_kill={idle_kill_after}s max={max_total_runtime}s"
     )
 
@@ -571,17 +613,25 @@ def run_cli(
         except Exception:
             pass
 
-        # Kill process if we stopped it
+        # Kill process if we stopped it (winhide makes this windowless)
         if exit_reason != "normal":
             try:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pty.pid)],
                     capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except Exception:
                 pass
 
         poller.stop()
+
+        # For new sessions the CLI created its own conversation ID — discover it
+        if is_new and not conversation_id:
+            detected = _find_new_conv(snapshot_before)
+            if detected:
+                conversation_id = detected
+                logger.info(f"[ENGINE] Detected new conv: {conversation_id[:12]}...")
 
         raw_output = "".join(output_chunks)
         if len(raw_output) > 5000:
