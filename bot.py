@@ -107,9 +107,9 @@ _active_cancel: dict[int, threading.Event] = {}
 
 # Idle-reaper cycle options shown in Settings
 _IDLE_OPTIONS = [
-    (300, "5 min — Fast"),
-    (600, "10 min — Normal"),
-    (1800, "30 min — Patient"),
+    (120, "2 min — Fast"),
+    (180, "3 min — Default"),
+    (300, "5 min — Patient"),
     (0, "No reaper"),
 ]
 

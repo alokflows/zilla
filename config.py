@@ -46,7 +46,7 @@ CLI_WORKING_DIR = os.getenv("CLI_WORKING_DIR", HOME_DIR)
 # --- Idle reaper: kill CLI only after this many seconds of silence ---
 # "Silence" = no PTY bytes AND no new transcript step.
 # 0 = never kill (wait forever). Overridden at runtime via Settings panel.
-IDLE_KILL_AFTER = int(os.getenv("IDLE_KILL_AFTER", "600"))  # 10 min default
+IDLE_KILL_AFTER = int(os.getenv("IDLE_KILL_AFTER", "180"))  # 3 min default
 
 # --- Catastrophic safety net: absolute max runtime regardless of activity ---
 # Catches genuinely hung CLIs that keep producing garbage forever.

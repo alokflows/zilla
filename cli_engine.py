@@ -558,6 +558,8 @@ def run_cli(
         output_chunks = []
         start_time = time.time()
         last_activity_ts = start_time
+        last_clean_output = ""
+        detect_check_ts = 0.0
         exit_reason = "normal"
 
         while True:
@@ -587,16 +589,34 @@ def run_cli(
                 exit_reason = "normal"
                 break
 
-            # Read PTY output
+            # Read PTY output. Only *meaningful* output counts as activity:
+            # a hung CLI that just animates a spinner/cursor emits bytes forever,
+            # which would otherwise keep resetting the idle clock and never reap.
             try:
                 data = pty.read(blocking=False)
                 if data:
                     output_chunks.append(data)
-                    last_activity_ts = now
+                    clean = strip_ansi(data).strip()
+                    if clean and clean != last_clean_output:
+                        last_clean_output = clean
+                        last_activity_ts = now
             except Exception:
                 pass
 
-            # Check transcript for activity (resets idle clock)
+            # For brand-new sessions the CLI creates its own conversation dir.
+            # Detect it DURING the run (not just after) so we can track real
+            # progress — and so a new session that stalls still gets reaped.
+            if is_new and not conversation_id and now - detect_check_ts > 1.0:
+                detect_check_ts = now
+                detected = _find_new_conv(snapshot_before)
+                if detected:
+                    conversation_id = detected
+                    starting_step = get_latest_step(conversation_id)
+                    last_transcript_step = starting_step
+                    logger.info(f"[ENGINE] Detected new conv mid-run: {conversation_id[:12]}...")
+
+            # A new transcript step = the agent actually did something = real
+            # progress. This is the authoritative activity signal.
             if conversation_id:
                 current_step = get_latest_step(conversation_id)
                 if current_step > last_transcript_step:
