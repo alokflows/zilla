@@ -1,139 +1,183 @@
-# Zilla Bot
+# ⚡ Zilla — Your AI Helper Inside Telegram
 
-> **Telegram as the control panel for any AI CLI.**
+> **Talk to a super-smart AI right inside your Telegram chat — by text, by voice, or by sending photos and files.**
 
-A minimal, production-grade Telegram bot that wraps the Antigravity CLI (or any text-in/text-out CLI). The bot does one thing: relay. The CLI thinks.
+Imagine you have a very clever robot friend who lives inside your phone's Telegram app.
+You send it a message — like *"write me a story"* or *"summarize this PDF"* — and it does the work and sends the answer right back to you. **That robot friend is Zilla.** 🦖
 
 ---
 
-## Architecture
+## 🧸 Explain It Like I'm 3
+
+Think of it like a **walkie-talkie to a genius**:
+
+1. 📱 You **talk into Telegram** (type, send a voice note, or send a picture).
+2. 📨 Zilla is the **messenger**. It carries your words to the genius.
+3. 🧠 The **genius** is an AI program on a computer (called the "CLI"). It does all the thinking.
+4. 📬 Zilla carries the answer **back to you** in the chat.
+
+Zilla itself is **not** the brain. Zilla is the **mail carrier** between you and the brain. That's the whole secret. 📮
 
 ```
-You (Telegram) ↔ bot.py ↔ cli_engine.py ↔ agy.exe (CLI)
-                     ↕              ↕
-               formatter.py    transcript.jsonl
-               media.py        (authoritative response)
-               sessions.py
-               users.py
-               config.py
+  YOU                ZILLA                  THE BRAIN
+  📱  ───message───▶  📮  ───message───▶   🧠
+  📱  ◀──answer────   📮  ◀──answer────    🧠
+(Telegram)        (this bot)            (the AI program)
 ```
 
-**7 files. ~2 000 lines. That's it.**
+---
 
-The design is a strict separation of concerns:
-- `bot.py` — Telegram I/O, inline keyboards, permission gates
-- `cli_engine.py` — ConPTY subprocess, idle reaper, response extraction
-- `config.py` — all configuration, reads from `.env`
-- `sessions.py` — per-user CLI conversation mapping
-- `users.py` — three-tier auth (owner / admin / user)
-- `media.py` — voice transcription, file save/extract
-- `formatter.py` — CLI output → Telegram-safe markdown
+## ✨ What Can Zilla Do?
+
+| You send...                          | Zilla does...                                          |
+|--------------------------------------|--------------------------------------------------------|
+| 💬 A text message                    | Sends it to the AI and replies with the answer         |
+| 🎤 A voice note                      | Listens, turns it into words, then answers             |
+| 📷 A photo **with a caption**        | Looks at the photo and answers your question about it  |
+| 📄 A file (PDF, Word, etc.) **with a caption** | Reads the file and answers your question         |
+| 📷 A photo or file **with no caption** | Just saves it in a safe folder for later               |
+| 🌐 `/browse google.com`              | Opens a web page in a real browser (for admins)        |
+
+If the AI makes a file for you (like a PDF report), Zilla **automatically sends that file** to you in the chat. 🎁
 
 ---
 
-## Security Model
+## 🔐 Who Is Allowed To Use It? (3 Levels)
 
-Three roles with hard capability gates:
+Not everyone can use Zilla — only people you allow. There are **three levels of people**, like a video game:
 
-| Capability | User | Admin | Owner |
-|---|:---:|:---:|:---:|
-| Chat (text, voice, photo, doc) | ✅ | ✅ | ✅ |
-| Save media to Inbox | ✅ | ✅ | ✅ |
-| Receive generated files | ❌ | ✅ | ✅ |
-| Change AI model | ❌ | ✅ | ✅ |
-| Change bot settings | ❌ | ✅ | ✅ |
-| `/browse` (controls logged-in browser) | ❌ | ✅ | ✅ |
-| Add / remove users, set roles | ❌ | ❌ | ✅ |
+| Level         | What they can do                                                        |
+|---------------|-------------------------------------------------------------------------|
+| 👤 **User**   | Chat, send voice, send photos and files                                 |
+| 👑 **Admin**  | Everything a User can, **plus** change the AI brain, settings, browse   |
+| 🦸 **Owner**  | Everything, **plus** add or remove people and change their level        |
 
-Additional hardening:
-- File delivery uses `os.path.realpath` (symlink-safe) with an explicit allowlist — only `~/AGI-Brain` and the current conversation's output directory.
-- `%TEMP%` is not in the allowlist — no credentials or browser artifacts can be exfiltrated.
-- Auth is re-checked on every update (mtime-gated disk read — zero overhead when nothing changes).
-- Bot only subscribes to `message`, `callback_query`, `edited_message` update types.
+There is **only one Owner** — that's you, the person who set it up.
+The Owner can add friends from inside Telegram with a few button taps (no typing code!).
 
 ---
 
-## Timeout Design
+## 🛡️ Is It Safe?
 
-No wall-clock timeout. The bot waits for the CLI.
+Yes — Zilla is built to be careful:
 
-**Idle reaper:** the CLI is killed only if it produces *no output* **and** writes *no new transcript step* for `IDLE_KILL_AFTER` seconds (default 10 min, configurable). Any activity resets the clock.
-
-**Catastrophic ceiling:** `MAX_TOTAL_RUNTIME` (default 1 hour) stops genuinely stuck processes regardless of activity.
-
-**Cancel:** the user can send `/cancel` or tap the `[🛑 Cancel]` inline button that appears after 60 seconds. Whatever the CLI produced up to that point is delivered — nothing is discarded.
-
-**Progress UX:** 0–60s = native Telegram typing bubble only. After 60s, one message is sent and *edited in place* every 60s with elapsed time and a Cancel button. No message spam.
+- 🚪 **Locked door:** Only people on the allowed list can talk to it. Everyone else is ignored.
+- 📁 **Safe folders only:** When sending you a file, Zilla can *only* reach into two specific folders. It can **never** grab your passwords or private files from anywhere else on the computer.
+- 🔁 **Always checks the list:** Every single message is checked against the allowed-people list.
+- 🤫 **Keeps secrets secret:** Your bot's secret password (the token) lives in a hidden `.env` file that is **never** uploaded to the internet.
 
 ---
 
-## Document Intelligence
+## ⏱️ What If the AI Takes a Long Time?
 
-Send any file (PDF, DOCX, TXT, CSV, JSON…):
-- **No caption** → saved to Inbox, confirmed.
-- **With caption** → text extracted locally, sent to CLI with your question. e.g. caption "summarize in 3 bullets" → summary.
+Sometimes the AI has a big job and needs to think for a while. Zilla is patient but smart about it:
 
-Same pattern for photos: no caption saves, caption analyzes.
+- ⌛ **It waits** as long as the AI is still working — no rushing it.
+- 💬 For the first minute, you just see Telegram's normal "typing..." bubble.
+- 📊 After a minute, Zilla shows a little **"Working… 1m 30s"** message with a **🛑 Cancel** button, and quietly updates it. No spam!
+- 🛑 You can **stop it any time** by tapping Cancel or typing `/cancel`. Whatever the AI finished so far still gets sent to you.
+- 😴 If the AI goes totally silent for too long (10 minutes by default), Zilla gently stops it so it doesn't run forever.
 
 ---
 
-## User Management
+## 🗂️ Sessions — Like Separate Notebooks
 
-Fully interactive from Telegram. Owner opens `/menu → 👥 Users`:
+A **session** is like a separate notebook for a separate topic. 📓
 
+- Your *"homework"* notebook remembers your homework chat.
+- Your *"recipes"* notebook remembers your cooking chat.
+
+They don't mix up! You can make new notebooks, switch between them, and end them:
+
+- `/new homework` → start a fresh notebook called "homework"
+- `/sessions` → see all your notebooks
+- `/switch recipes` → jump to your "recipes" notebook
+- `/end` → close the current notebook
+
+---
+
+## 📋 All the Commands
+
+Just **type any message** to talk to the AI — no command needed! These extra commands give you control:
+
+| Command            | Who can use it | What it does                          |
+|--------------------|----------------|---------------------------------------|
+| *(just type)*      | Everyone       | Talk to the AI                        |
+| `/menu`            | Everyone       | Open the button control panel         |
+| `/cancel`          | Everyone       | Stop the AI if it's running           |
+| `/new <name>`      | Everyone       | Start a new session (notebook)        |
+| `/sessions`        | Everyone       | List your sessions                    |
+| `/switch <name>`   | Everyone       | Switch to another session             |
+| `/end`             | Everyone       | End the current session               |
+| `/brain`           | Everyone       | See saved photos/files count          |
+| `/ping`            | Everyone       | Check if Zilla is awake               |
+| `/model`           | 👑 Admin+      | Pick which AI brain to use            |
+| `/settings`        | 👑 Admin+      | Change bot settings                   |
+| `/browse <url>`    | 👑 Admin+      | Open a web page in a browser          |
+| `/adduser <id>`    | 🦸 Owner       | Add a new person                      |
+| `/removeuser <id>` | 🦸 Owner       | Remove a person                       |
+| `/listusers`       | 🦸 Owner       | See and manage all people             |
+
+---
+
+## 🚀 How To Set It Up
+
+You need **Python** installed and an AI CLI program on your Windows computer.
+
+**Step 1 — Get a Telegram bot token**
+Message [@BotFather](https://t.me/BotFather) on Telegram, type `/newbot`, follow the steps, and copy the token it gives you.
+
+**Step 2 — Get your Telegram ID**
+Message [@userinfobot](https://t.me/userinfobot) on Telegram. It tells you your number ID.
+
+**Step 3 — Create a file named `.env`** in this folder, and put inside:
+```env
+TELEGRAM_BOT_TOKEN=paste_your_token_here
+TELEGRAM_OWNER_ID=paste_your_id_here
 ```
-👥 Users (2)
-[user] Alice    [admin] Bob
-[➕ Add User]   [◀ Menu]
-```
 
-Tap a user → see details → toggle role (User ↔ Admin) or remove. Adding a user is a 3-step inline flow (ID → name → role buttons) — no commands required.
-
----
-
-## Setup
-
+**Step 4 — Install the helper libraries** (open a terminal in this folder):
 ```bash
-# 1. Clone / copy the folder
-# 2. Create .env (see .env for all options):
-TELEGRAM_BOT_TOKEN=your_token
-TELEGRAM_OWNER_ID=your_telegram_id
-
-# 3. Install dependencies
 pip install -r requirements.txt
+```
 
-# 4. Run
+**Step 5 — Start the bot:**
+```bash
 python bot.py
 ```
 
-All paths are relative to your home directory or configurable in `.env`. Copy the folder to any machine, set `.env`, run.
+Now open Telegram, find your bot, and say hello! 👋
 
 ---
 
-## Running Persistently
+## 🖥️ Keep It Running Quietly
 
-**Option A — double-click** `run_bot_hidden.vbs` — runs invisibly, auto-restarts on crash.
+Want Zilla to run in the background without a black window popping up?
 
-**Option B — auto-start on login** — run `INSTALL_STARTUP.bat` (no admin needed). Remove with `UNINSTALL_STARTUP.bat`.
+- **Run invisibly:** double-click `run_bot_hidden.vbs` — it runs silently and restarts itself if it crashes.
+- **Start automatically when you log in:** double-click `install_startup.bat` (undo with `uninstall_startup.bat`).
+- **Stop it:** double-click `Stop Zilla.vbs`.
 
 ---
 
-## Commands
+## 🧩 What's Inside (For Curious Grown-Ups)
 
-| Command | Access | Description |
-|---------|--------|-------------|
-| Just type anything | all | Goes straight to CLI |
-| `/menu` | all | Control panel (tiles adapt to your role) |
-| `/cancel` | all | Cancel the running request |
-| `/new <name>` | all | New session |
-| `/sessions` | all | List sessions |
-| `/switch <name>` | all | Switch session |
-| `/end` | all | End current session |
-| `/brain` | all | Inbox stats |
-| `/model` | admin+ | Select AI model |
-| `/settings` | admin+ | Bot settings |
-| `/browse <url>` | admin+ | Browser control via WebBridge |
-| `/adduser <id> [name]` | owner | Add user |
-| `/removeuser <id>` | owner | Remove user |
-| `/listusers` | owner | Manage users |
-| `/ping` | all | Health check |
+Zilla is built from a few small, tidy Python files — each does one job:
+
+| File                  | Its one job                                                        |
+|-----------------------|--------------------------------------------------------------------|
+| `bot.py`              | Talks to Telegram — buttons, messages, permission checks           |
+| `cli_engine.py`       | Runs the AI program and collects its answer                        |
+| `config.py`           | Holds all the settings (reads your `.env`)                         |
+| `sessions.py`         | Remembers each person's separate notebooks (sessions)              |
+| `users.py`            | Knows who is allowed and what level they are                       |
+| `media.py`            | Handles voice, photos, and files; turns speech into text           |
+| `formatter.py`        | Makes the AI's answer look neat in Telegram                        |
+| `winhide.py`          | Hides black console windows on Windows                             |
+| `bot_instructions.md` | The rulebook the AI reads so it behaves like a Telegram assistant  |
+
+**The big idea:** the bot is a *thin pipe*. It does **no thinking** — it just carries messages between you and the AI, and makes everything safe and tidy along the way. 🚰
+
+---
+
+*Made with ⚡ by Alok. Zilla relays — the AI thinks.*
