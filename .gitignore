@@ -12,6 +12,8 @@ venv/
 
 # State files (regenerated at runtime)
 *.lock
+sessions.json
+denied_users.json
 
 # Build artifacts
 build/

@@ -1,5 +1,5 @@
 # ============================================================
-#  CONFIGURATION — AGY Telegram Bot v8 (Revamp)
+#  CONFIGURATION — Zilla Bot
 # ============================================================
 #  Portable, zero-hardcoded-paths configuration.
 #  Copy the folder, set .env, and it works.
@@ -37,18 +37,28 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_ID", "0") or "0")
 
 # --- CLI Backend ---
-# Default: Antigravity CLI. Change this to swap backends.
 CLI_PATH = os.getenv(
     "CLI_PATH",
     os.path.join(HOME_DIR, "AppData", "Local", "agy", "bin", "agy.exe"),
 )
 CLI_WORKING_DIR = os.getenv("CLI_WORKING_DIR", HOME_DIR)
-CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", "600"))  # 10 min default
+
+# --- Idle reaper: kill CLI only after this many seconds of silence ---
+# "Silence" = no PTY bytes AND no new transcript step.
+# 0 = never kill (wait forever). Overridden at runtime via Settings panel.
+IDLE_KILL_AFTER = int(os.getenv("IDLE_KILL_AFTER", "600"))  # 10 min default
+
+# --- Catastrophic safety net: absolute max runtime regardless of activity ---
+# Catches genuinely hung CLIs that keep producing garbage forever.
+MAX_TOTAL_RUNTIME = int(os.getenv("MAX_TOTAL_RUNTIME", "3600"))  # 1 hour
 
 # --- Brain Directory (where CLI stores conversations) ---
-BRAIN_DIR = os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "brain")
+BRAIN_DIR = os.getenv(
+    "BRAIN_DIR",
+    os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "brain"),
+)
 
-# --- AGI Brain (simple Inbox / Outbox) ---
+# --- AGI Brain (Inbox / Outbox on disk) ---
 AGI_BRAIN_DIR = os.path.join(HOME_DIR, "AGI-Brain")
 INBOX_DIR = os.path.join(AGI_BRAIN_DIR, "Inbox")
 INBOX_IMAGES = os.path.join(INBOX_DIR, "images")
@@ -68,38 +78,35 @@ FFMPEG_PATH = os.getenv(
 SKILLS_DIR = os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "skills")
 
 # --- Kimi WebBridge ---
-KIMI_BRIDGE_URL = "http://127.0.0.1:10086"
+KIMI_BRIDGE_URL = os.getenv("KIMI_BRIDGE_URL", "http://127.0.0.1:10086")
 
 # --- State Files ---
 SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
-#
+
 # ┌─────────────────────────────────────────────────────────┐
-# │  MANUAL USER MANAGEMENT                                │
+# │  USER MANAGEMENT                                        │
 # │                                                         │
-# │  Option 1: Use Telegram (owner only)                    │
-# │    /adduser <telegram_id>                               │
-# │    /removeuser <telegram_id>                            │
+# │  From Telegram (owner only):                            │
+# │    /adduser  — interactive panel via /menu > Users      │
+# │    /listusers — list + manage from buttons              │
 # │                                                         │
-# │  Option 2: Edit authorized_users.json directly          │
-# │    Format:                                              │
-# │    {                                                    │
-# │      "TELEGRAM_USER_ID": {                              │
-# │        "name": "Friend Name",                           │
-# │        "role": "user",                                  │
+# │  Or edit authorized_users.json directly:                │
+# │    {                                                     │
+# │      "TELEGRAM_USER_ID": {                               │
+# │        "name": "Alice",                                  │
+# │        "role": "user",     ← or "admin"                 │
 # │        "added_at": "2026-01-01 00:00:00"                │
-# │      }                                                  │
-# │    }                                                    │
+# │      }                                                   │
+# │    }                                                     │
 # │                                                         │
-# │    Roles: "user" (normal), "admin" (skip permissions)   │
-# │    The OWNER (TELEGRAM_OWNER_ID in .env) is always      │
-# │    authorized — no need to add them here.               │
+# │  Roles:                                                 │
+# │    user  — chat, voice, media                           │
+# │    admin — + model/settings change, /browse, file gen   │
+# │    owner — + user management (set in .env)              │
 # │                                                         │
-# │  How to get someone's Telegram ID:                      │
-# │    1. They message @userinfobot on Telegram             │
-# │    2. Or forward their message to @userinfobot          │
-# │    3. The ID is the number (e.g. 1278335195)            │
+# │  Get a Telegram ID: message @userinfobot                │
 # └─────────────────────────────────────────────────────────┘
 
 # --- Telegram Limits ---
@@ -107,7 +114,7 @@ TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_MAX_SEND_FILE = 50 * 1024 * 1024  # 50 MB
 
 # --- Bot ---
-BOT_VERSION = "8.0"
+BOT_VERSION = "1.0"
 
 
 # ── Settings (simple JSON dict) ───────────────────────────
@@ -116,7 +123,6 @@ _settings_cache: dict | None = None
 
 
 def _load_settings() -> dict:
-    """Load settings from JSON file."""
     global _settings_cache
     if _settings_cache is not None:
         return _settings_cache
@@ -129,7 +135,6 @@ def _load_settings() -> dict:
 
 
 def _save_settings(data: dict):
-    """Save settings to JSON file."""
     global _settings_cache
     _settings_cache = data
     try:
@@ -142,34 +147,29 @@ def _save_settings(data: dict):
 
 
 def get_setting(key: str, default=None):
-    """Get a setting value."""
     return _load_settings().get(key, default)
 
 
 def set_setting(key: str, value):
-    """Set a setting value."""
     data = _load_settings()
     data[key] = value
     _save_settings(data)
 
 
 def get_model() -> str:
-    """Get the selected AI model."""
     return get_setting("model", "gemini-2.5-pro")
 
 
 def set_model(model_id: str):
-    """Set the AI model."""
     set_setting("model", model_id)
 
 
-def get_timeout() -> int:
-    """Get the CLI timeout in seconds."""
-    return get_setting("timeout", CLI_TIMEOUT)
+def get_idle_kill_after() -> int:
+    """Idle reaper threshold in seconds. 0 = never kill."""
+    return get_setting("idle_kill_after", IDLE_KILL_AFTER)
 
 
 def ensure_dirs():
-    """Create all required directories."""
     for d in [
         INBOX_DIR, INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS,
         OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES,

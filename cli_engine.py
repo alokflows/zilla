@@ -1,12 +1,10 @@
 # ============================================================
 #  CLI ENGINE — Thin Wrapper Around the AI CLI
 # ============================================================
-#  Runs the CLI (default: Antigravity) via Windows ConPTY,
-#  captures output, and extracts clean responses from the
-#  transcript.jsonl file for reliable delivery.
-#
-#  Backend-swappable: change CLI_PATH in config to use
-#  any CLI that accepts text in and produces text out.
+#  Runs the CLI via Windows ConPTY, delivers whatever it
+#  produces. No wall-clock timeout — we wait for the CLI.
+#  Only killed by: idle silence, explicit cancel, or the
+#  MAX_TOTAL_RUNTIME catastrophic ceiling.
 # ============================================================
 
 import asyncio
@@ -23,13 +21,17 @@ from typing import Callable
 
 import winpty
 
-from config import CLI_PATH, CLI_WORKING_DIR, CLI_TIMEOUT, BRAIN_DIR, SKILLS_DIR
+from config import (
+    CLI_PATH, CLI_WORKING_DIR, BRAIN_DIR, SKILLS_DIR,
+    IDLE_KILL_AFTER, MAX_TOTAL_RUNTIME,
+    get_idle_kill_after,
+)
 
 logger = logging.getLogger(__name__)
 
 executor = ThreadPoolExecutor(max_workers=4)
+_pool_semaphore = threading.Semaphore(4)  # mirrors max_workers for queue-depth tracking
 
-# ConPTY backend
 CONPTY_BACKEND = winpty.Backend.ConPTY
 COLOR_ESCAPES = winpty.AgentConfig.WINPTY_FLAG_COLOR_ESCAPES
 
@@ -76,12 +78,10 @@ def strip_ansi(text: str) -> str:
 
 
 def clean_response(text: str) -> str:
-    """Clean PTY output: strip ANSI, thinking patterns, collapse blanks."""
     text = strip_ansi(text)
     lines = text.split("\n")
     cleaned = []
     consecutive_thinking = 0
-
     for line in lines:
         stripped = line.strip()
         if not stripped and not cleaned:
@@ -93,26 +93,21 @@ def clean_response(text: str) -> str:
         else:
             consecutive_thinking = 0
         cleaned.append(line)
-
     text = "\n".join(cleaned)
     text = re.sub(r"\n{3,}", "\n\n", text)
     result = text.strip()
-
     if len(result) < 20 and len(strip_ansi(text)) > 50:
         return re.sub(r"\n{3,}", "\n\n", strip_ansi(text)).strip()
     return result
 
 
 def sanitize_response(text: str) -> str:
-    """Strip internal/debug content that should never reach the user."""
     if not text:
         return text
-
     lines = text.split("\n")
     cleaned = []
     history_streak = 0
     dir_path_streak = 0
-
     for line in lines:
         if _HISTORY_LINE_RE.match(line):
             history_streak += 1
@@ -122,19 +117,15 @@ def sanitize_response(text: str) -> str:
                 continue
         else:
             history_streak = 0
-
         if _DIR_LISTING_RE.match(line.strip()):
             dir_path_streak += 1
             if dir_path_streak > 3:
                 continue
         else:
             dir_path_streak = 0
-
         if _METADATA_LINE_RE.search(line):
             continue
-
         cleaned.append(line)
-
     text = "\n".join(cleaned)
     text = _JSON_DEBUG_BLOCK_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -146,7 +137,6 @@ def sanitize_response(text: str) -> str:
 # ══════════════════════════════════════════════════════════
 
 def get_latest_step(conversation_id: str) -> int:
-    """Get the latest step index in a conversation transcript."""
     if not conversation_id:
         return 0
     path = os.path.join(
@@ -170,7 +160,6 @@ def get_latest_step(conversation_id: str) -> int:
 
 
 def get_new_responses(conversation_id: str, starting_step: int) -> str:
-    """Get only NEW response content from transcript after starting_step."""
     if not conversation_id:
         return ""
     path = os.path.join(
@@ -194,29 +183,19 @@ def get_new_responses(conversation_id: str, starting_step: int) -> str:
                     pass
     except Exception:
         pass
-
     if not responses:
         return ""
-
     result = "\n\n".join(responses)
-
-    # Cap at 3500 for Telegram
     if len(result) > 3500:
-        result = result[:3500] + "\n\n⚠️ _(Response was truncated due to length)_"
-
-    # Sanitize directory listings
+        result = result[:3500] + "\n\n_(Response truncated)_"
     if len(_DIR_LISTING_RE.findall(result)) > 3:
         result = sanitize_response(result)
-
-    # Hard cap
     if len(result) > 10000:
-        result = result[:10000] + "\n\n⚠️ _(Response was truncated due to length)_"
-
+        result = result[:10000] + "\n\n_(Response truncated)_"
     return result
 
 
 def _extract_file_paths(conversation_id: str, starting_step: int) -> list[str]:
-    """Scan transcript tool calls for file paths created by the agent."""
     if not conversation_id:
         return []
     path = os.path.join(
@@ -224,7 +203,6 @@ def _extract_file_paths(conversation_id: str, starting_step: int) -> list[str]:
     )
     if not os.path.exists(path):
         return []
-
     file_paths = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -244,15 +222,15 @@ def _extract_file_paths(conversation_id: str, starting_step: int) -> list[str]:
                             img_name = args.get("ImageName", "")
                             if img_name:
                                 for ext in [".png", ".jpg", ".jpeg", ".webp"]:
-                                    candidate = os.path.join(BRAIN_DIR, conversation_id, f"{img_name}{ext}")
+                                    candidate = os.path.join(
+                                        BRAIN_DIR, conversation_id, f"{img_name}{ext}"
+                                    )
                                     if os.path.isfile(candidate):
                                         file_paths.append(candidate)
                 except Exception:
                     pass
     except Exception:
         pass
-
-    # Deduplicate, cap at 3
     seen = set()
     unique = []
     for fp in file_paths:
@@ -287,8 +265,6 @@ _TOOL_DISPLAY = {
 
 
 class TranscriptPoller:
-    """Polls transcript.jsonl for real-time progress updates."""
-
     def __init__(self, conversation_id: str | None, starting_step: int,
                  progress_callback: Callable[[str], None] | None, poll_interval: float = 2.0):
         self.conversation_id = conversation_id
@@ -353,13 +329,13 @@ class TranscriptPoller:
                 if display:
                     action = tc.get("args", {}).get("toolAction", "").strip('"')
                     return f"{display}: {action}" if action else display
-            return "🧠 Processing..."
+            return "🧠 Processing…"
         if data.get("type") == "PLANNER_RESPONSE":
             thinking = data.get("thinking", "")
             if thinking and len(thinking) > 10:
                 short = thinking[:80].split(".")[0].strip()
                 if short:
-                    return f"🧠 {short}..."
+                    return f"🧠 {short}…"
         return None
 
 
@@ -372,28 +348,22 @@ _cached_instructions: str | None = None
 
 
 def get_instructions() -> str | None:
-    """Read bot_instructions.md (cached) and inject skills summary."""
     global _cached_instructions
     if _cached_instructions is not None:
         return _cached_instructions
-
     if not os.path.exists(_INSTRUCTIONS_FILE):
         return None
-
     try:
         with open(_INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
             _cached_instructions = f.read().strip()
     except Exception:
         return None
-
-    # Inject skills summary
     try:
         skills_summary = _get_skills_summary()
         if skills_summary:
             _cached_instructions += "\n\n### Available Skills:\n" + skills_summary
     except Exception as e:
         logger.error(f"[ENGINE] Failed to inject skills: {e}")
-
     return _cached_instructions
 
 
@@ -404,7 +374,6 @@ def reload_instructions():
 
 
 def _get_skills_summary() -> str:
-    """Scan SKILLS_DIR for installed skills."""
     if not os.path.isdir(SKILLS_DIR):
         return ""
     lines = []
@@ -420,11 +389,9 @@ def _get_skills_summary() -> str:
 
 
 def _parse_skill_description(skill_md: str) -> str:
-    """Parse description from SKILL.md YAML frontmatter."""
     try:
         with open(skill_md, "r", encoding="utf-8") as f:
             content = f.read(2000)
-        # Simple YAML frontmatter parse
         if content.startswith("---"):
             end = content.find("---", 3)
             if end > 0:
@@ -434,7 +401,6 @@ def _parse_skill_description(skill_md: str) -> str:
                         desc = line.split(":", 1)[1].strip().strip('"').strip("'")
                         if desc and not desc.startswith("|"):
                             return desc[:100]
-                        # Multi-line description
                         idx = frontmatter.find("description:")
                         after = frontmatter[idx:]
                         desc_lines = []
@@ -443,7 +409,7 @@ def _parse_skill_description(skill_md: str) -> str:
                                 desc_lines.append(dl.strip())
                             else:
                                 break
-                        return " ".join(desc_lines)[:100] if desc_lines else name
+                        return " ".join(desc_lines)[:100] if desc_lines else "(no description)"
     except Exception:
         pass
     return "(no description)"
@@ -454,7 +420,6 @@ def _parse_skill_description(skill_md: str) -> str:
 # ══════════════════════════════════════════════════════════
 
 def get_selected_model() -> str | None:
-    """Read the selected model from config settings."""
     from config import get_model
     return get_model() or None
 
@@ -466,17 +431,23 @@ def get_selected_model() -> str | None:
 def run_cli(
     prompt: str,
     conversation_id: str = None,
-    timeout: int = None,
     progress_callback: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
     skip_permissions: bool = False,
 ) -> tuple[str, str | None]:
     """
-    Run the CLI with the user's message. Returns (response, conversation_id).
-    The bot is a thin pipe — message goes directly to CLI, we just relay.
+    Run the CLI. Returns (response, conversation_id).
+
+    Never killed by wall-clock. Killed only by:
+      - cancel_event set (user cancels)
+      - idle silence > IDLE_KILL_AFTER seconds
+      - total runtime > MAX_TOTAL_RUNTIME seconds (safety net)
+      - natural process exit
     """
-    from config import get_timeout, AGI_BRAIN_DIR, HOME_DIR
-    timeout = timeout or get_timeout()
+    from config import get_idle_kill_after, AGI_BRAIN_DIR, HOME_DIR
+
+    idle_kill_after = get_idle_kill_after()
+    max_total_runtime = MAX_TOTAL_RUNTIME  # from env, not overridable at runtime
 
     is_new = False
     if not conversation_id:
@@ -489,17 +460,14 @@ def run_cli(
         if not os.path.exists(transcript_path):
             is_new = True
 
-    # Prepend instructions for new conversations
     if is_new:
         log_dir = os.path.join(BRAIN_DIR, conversation_id, ".system_generated", "logs")
         os.makedirs(log_dir, exist_ok=True)
         transcript_path = os.path.join(log_dir, "transcript.jsonl")
         if not os.path.exists(transcript_path):
             open(transcript_path, "a", encoding="utf-8").close()
-
         conv_dir = os.path.join(BRAIN_DIR, conversation_id, "out")
         os.makedirs(conv_dir, exist_ok=True)
-
         instructions = get_instructions()
         if instructions:
             instructions = instructions.replace("{CONV_DIR}", conv_dir)
@@ -508,7 +476,7 @@ def run_cli(
             instructions = instructions.replace("{SKILLS_DIR}", SKILLS_DIR)
             prompt = (
                 f"{instructions}\n"
-                f"USER MESSAGE (answer THIS — everything above is just formatting context):\n"
+                f"USER MESSAGE (answer THIS — everything above is formatting context):\n"
                 f"{prompt}"
             )
 
@@ -516,27 +484,30 @@ def run_cli(
     cmd_parts = [CLI_PATH, "--conversation", conversation_id]
     if skip_permissions:
         cmd_parts.append("--dangerously-skip-permissions")
-    timeout_minutes = max(1, timeout // 60)
-    cmd_parts.extend(["--print-timeout", f"{timeout_minutes}m", "--print", prompt])
-
+    # Use a generous print-timeout so the CLI itself never fires before our idle reaper
+    print_timeout_min = max(1, (max_total_runtime or 3600) // 60)
+    cmd_parts.extend(["--print-timeout", f"{print_timeout_min}m", "--print", prompt])
     command = subprocess.list2cmdline(cmd_parts)
-    logger.info(f"[ENGINE] {'New' if is_new else 'Continuing'} conversation {conversation_id[:12]}...")
+
+    logger.info(
+        f"[ENGINE] {'New' if is_new else 'Continuing'} conv {conversation_id[:12]}... "
+        f"idle_kill={idle_kill_after}s max={max_total_runtime}s"
+    )
 
     starting_step = get_latest_step(conversation_id)
+    last_transcript_step = starting_step
     poller = TranscriptPoller(conversation_id, starting_step, progress_callback)
 
     try:
-        # Set up environment with model
         custom_env = os.environ.copy()
         model_id = get_selected_model()
         if model_id:
             custom_env["ANTIGRAVITY_MODEL"] = model_id
             custom_env["GEMINI_API_MODEL"] = model_id
             custom_env["MODEL"] = model_id
-            logger.info(f"[ENGINE] Using model: {model_id}")
+            logger.info(f"[ENGINE] Model: {model_id}")
 
         env_str = '\0'.join(f'{k}={v}' for k, v in custom_env.items()) + '\0\0'
-
         pty = winpty.PTY(200, 1000, backend=CONPTY_BACKEND, agent_config=COLOR_ESCAPES)
         pty.spawn(command, cwd=CLI_WORKING_DIR, env=env_str)
 
@@ -544,59 +515,80 @@ def run_cli(
 
         output_chunks = []
         start_time = time.time()
+        last_activity_ts = start_time
+        exit_reason = "normal"
 
         while True:
+            now = time.time()
+            total_elapsed = now - start_time
+            idle_elapsed = now - last_activity_ts
+
+            # User cancel
             if cancel_event and cancel_event.is_set():
-                try:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pty.pid)], capture_output=True)
-                except Exception:
-                    pass
+                exit_reason = "canceled"
                 break
 
-            elapsed = time.time() - start_time
-
-            if elapsed > timeout + 30:
-                logger.warning(f"[ENGINE] Hard timeout after {elapsed:.0f}s")
-                try:
-                    remaining = pty.read()
-                    if remaining:
-                        output_chunks.append(remaining)
-                except Exception:
-                    pass
-                try:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pty.pid)], capture_output=True)
-                except Exception:
-                    pass
+            # Hard ceiling (catastrophic safety net)
+            if max_total_runtime > 0 and total_elapsed > max_total_runtime:
+                exit_reason = "max_runtime"
+                logger.warning(f"[ENGINE] Max runtime {max_total_runtime}s hit")
                 break
 
+            # Idle reaper — only fires on silence
+            if idle_kill_after > 0 and idle_elapsed > idle_kill_after:
+                exit_reason = "idle"
+                logger.warning(f"[ENGINE] Idle reaper fired after {idle_elapsed:.0f}s silence")
+                break
+
+            # Natural exit
             if not pty.isalive():
-                try:
-                    remaining = pty.read()
-                    if remaining:
-                        output_chunks.append(remaining)
-                except Exception:
-                    pass
-                logger.info(f"[ENGINE] Process exited after {elapsed:.1f}s")
+                exit_reason = "normal"
                 break
 
+            # Read PTY output
             try:
                 data = pty.read(blocking=False)
                 if data:
                     output_chunks.append(data)
+                    last_activity_ts = now
             except Exception:
                 pass
 
+            # Check transcript for activity (resets idle clock)
+            if conversation_id:
+                current_step = get_latest_step(conversation_id)
+                if current_step > last_transcript_step:
+                    last_transcript_step = current_step
+                    last_activity_ts = now
+
             time.sleep(0.15)
+
+        # Drain remaining output
+        try:
+            remaining = pty.read()
+            if remaining:
+                output_chunks.append(remaining)
+        except Exception:
+            pass
+
+        # Kill process if we stopped it
+        if exit_reason != "normal":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pty.pid)],
+                    capture_output=True,
+                )
+            except Exception:
+                pass
 
         poller.stop()
 
         raw_output = "".join(output_chunks)
         if len(raw_output) > 5000:
             raw_output = raw_output[:5000]
-
         response = clean_response(raw_output)
 
-        # Get REAL response from transcript (reliable path)
+        # Always try transcript first (authoritative, clean)
         if conversation_id:
             real_response = get_new_responses(conversation_id, starting_step)
             tool_file_paths = _extract_file_paths(conversation_id, starting_step)
@@ -610,15 +602,30 @@ def run_cli(
                     if path_lines:
                         real_response = (real_response + "\n" + path_lines).strip()
                 response = real_response
-            elif not is_new:
-                logger.warning(f"[ENGINE] Continuing conv but transcript empty. Refusing raw fallback.")
-                response = "⚠️ Response could not be extracted. Please try again."
+            # If transcript is empty, fall through to PTY output — never discard
 
         if not response:
-            response = "The CLI returned an empty response. Try rephrasing your question."
+            response = "No response from CLI. Try rephrasing."
 
         response = sanitize_response(response)
-        logger.info(f"[ENGINE] Response: {len(response)} chars")
+
+        # Prefix for non-normal exits — user sees what happened
+        total_elapsed_int = int(time.time() - start_time)
+        m, s = divmod(total_elapsed_int, 60)
+        elapsed_str = f"{m}m {s}s" if m else f"{s}s"
+
+        if exit_reason == "canceled":
+            header = f"🛑 Canceled after {elapsed_str}."
+            response = f"{header}\n\n{response}" if response else header
+        elif exit_reason == "idle":
+            idle_m = idle_kill_after // 60
+            header = f"⏱️ No activity for {idle_m}m — delivered what was ready."
+            response = f"{header}\n\n{response}" if response else f"⏱️ No response after {idle_m}m of silence."
+        elif exit_reason == "max_runtime":
+            header = f"⚠️ Stopped after {elapsed_str} (safety ceiling)."
+            response = f"{header}\n\n{response}" if response else header
+
+        logger.info(f"[ENGINE] Done ({exit_reason}, {elapsed_str}): {len(response)} chars")
         return response, conversation_id
 
     except Exception as e:
@@ -630,15 +637,16 @@ def run_cli(
 async def run_cli_async(
     prompt: str,
     conversation_id: str = None,
-    timeout: int = None,
     progress_callback: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
     skip_permissions: bool = False,
 ) -> tuple[str, str | None]:
     """Async wrapper — runs blocking PTY call in thread pool."""
     loop = asyncio.get_event_loop()
-    cancel_event = threading.Event()
+    if cancel_event is None:
+        cancel_event = threading.Event()
     task = loop.run_in_executor(
-        executor, run_cli, prompt, conversation_id, timeout,
+        executor, run_cli, prompt, conversation_id,
         progress_callback, cancel_event, skip_permissions,
     )
     try:

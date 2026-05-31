@@ -23,21 +23,20 @@ class SessionManager:
         self.state = self._load()
 
     def _load(self) -> dict:
-        try:
-            with open(self.state_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # Ensure required keys exist
-            if "sessions" not in data:
-                data["sessions"] = {}
-            if "active_per_user" not in data:
-                data["active_per_user"] = {}
-            # Backwards compat: old format used 'original_name' instead of 'name'
-            for key, session in data["sessions"].items():
-                if "original_name" in session and "name" not in session:
-                    session["name"] = session.pop("original_name")
-            return data
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {"sessions": {}, "active_per_user": {}}
+        with self._lock:
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if "sessions" not in data:
+                    data["sessions"] = {}
+                if "active_per_user" not in data:
+                    data["active_per_user"] = {}
+                for key, session in data["sessions"].items():
+                    if "original_name" in session and "name" not in session:
+                        session["name"] = session.pop("original_name")
+                return data
+            except (FileNotFoundError, json.JSONDecodeError):
+                return {"sessions": {}, "active_per_user": {}}
 
     def _save(self):
         with self._lock:
