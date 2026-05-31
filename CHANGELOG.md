@@ -4,7 +4,16 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## ⚡ v2.2.0 — Fast, multi-user, self-healing *(latest)*
+## 🛡️ v2.3.0 — No-admin background runner *(latest)*
+
+- **New background method that needs no admin rights and no `.vbs`** (the old `.vbs` launchers failed on locked-down/corporate PCs).
+- A tiny hidden Python **supervisor** (`run_background.pyw`, launched via `pythonw` = no window) runs the bot and **restarts it within ~10s** if it crashes.
+- **`START_BACKGROUND.bat`** turns it on (hidden, self-healing, auto-start at login via a Startup-folder shortcut). **`STOP_BACKGROUND.bat`** turns it off.
+- Removed the old `.vbs` launchers and the admin-only Task Scheduler installer.
+
+---
+
+## ⚡ v2.2.0 — Fast, multi-user, self-healing
 
 The "make it actually fast and shareable" release.
 

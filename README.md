@@ -158,11 +158,11 @@ Now open Telegram, find your bot, and say hello! 👋
 
 ## 🖥️ Keep It Running Quietly
 
-Want Zilla to run in the background without a black window popping up?
+Want Zilla to run in the background without a black window popping up? **No admin rights needed.**
 
-- **Run invisibly:** double-click `run_bot_hidden.vbs` — it runs silently and restarts itself if it crashes.
-- **Start automatically when you log in:** double-click `install_startup.bat` (undo with `uninstall_startup.bat`).
-- **Stop it:** double-click `Stop Zilla.vbs`.
+- **Run hidden + self-healing:** double-click **`START_BACKGROUND.bat`** — no window at all, restarts within ~10s if it crashes, and auto-starts at every login.
+- **Stop it:** double-click **`STOP_BACKGROUND.bat`**.
+- **Debug (visible window):** double-click `START_BOT.bat`.
 
 ---
 

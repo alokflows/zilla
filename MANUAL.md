@@ -110,26 +110,24 @@ To stop it: click the black window and press **Ctrl + C**.
 
 ---
 
-## 5. Run it quietly in the background (persistent "parasite" mode)
+## 5. Run it quietly in the background (no window, self-healing)
 
-Once it works, you don't need the black window. Zilla can run silently and **revive itself** if it ever dies.
+Once it works, you don't need the black window. Zilla can run **completely hidden** and **revive itself** if it ever dies. This needs **no admin rights**.
 
-**Turn on persistent mode (do this once):**
-1. Double-click **`install_startup.bat`**. If Windows asks for permission, click **Yes**.
-   - This creates a **watchdog** that starts Zilla every time you log in, and restarts it if it gets killed.
-2. To start it **right now** without rebooting: first double-click **`Stop Zilla.vbs`** (to clear any copy already running), then double-click **`run_bot_hidden.vbs`**.
+**Turn it on — double-click `START_BACKGROUND.bat`.** That's it. It:
+- starts Zilla with **no window at all** (nothing for anyone to accidentally close),
+- **restarts the bot within ~10 seconds** if it ever crashes (a tiny hidden supervisor watches it),
+- **auto-starts every time you log in** (via a shortcut in your own Startup folder — no admin needed).
 
-**How tough is it?** Two layers keep it alive:
-- 🪲 If the **bot crashes**, the hidden launcher restarts it in about **7 seconds**.
-- 🛡️ If the **launcher itself** is killed (or you reboot), the **watchdog** brings the whole thing back (at login, or within ~1 minute).
+**How do you know it's alive?** Every time Zilla starts, it sends **you** a Telegram message: *"⚡ Zilla is online"*. So after any crash you'll get that ping within seconds. 📲
 
-**How do you know it's alive again?** Every time Zilla starts, it sends **you** a Telegram message: *"⚡ Zilla is online"*. So after any crash, you'll get that ping within seconds. 📲
+**To stop it:** double-click **`STOP_BACKGROUND.bat`** (stops it now and turns off auto-start). Turn it back on anytime with `START_BACKGROUND.bat`.
 
-**To stop it:**
-- For now (until next login): double-click **`Stop Zilla.vbs`**.
-- Forever (turn off auto-start): double-click **`uninstall_startup.bat`**.
+> ⚠️ Don't run it two ways at once. If it's already running in the background, don't also launch `START_BOT.bat` — stop it first.
 
-> 🐛 **Debug mode:** to watch what's happening in a visible window, double-click **`START_BOT.bat`** instead. Close the window or press Ctrl+C to stop that one.
+> 🐛 **Debug mode:** to watch what's happening in a visible window, double-click **`START_BOT.bat`**. Close the window or press Ctrl+C to stop that one.
+
+> 💻 **What about a full reboot / shutdown?** Without admin rights Windows can't run apps *before* you log in. So after a restart, Zilla comes back **the moment you log in** — which is the most a non-admin app can do.
 
 ---
 
