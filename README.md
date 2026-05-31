@@ -5,6 +5,8 @@
 Imagine you have a very clever robot friend who lives inside your phone's Telegram app.
 You send it a message — like *"write me a story"* or *"summarize this PDF"* — and it does the work and sends the answer right back to you. **That robot friend is Zilla.** 🦖
 
+> 📖 **Want step-by-step install + a full user manual?** Read **[MANUAL.md](MANUAL.md)** — everything explained like you're three, including how to connect a different AI.
+
 ---
 
 ## 🧸 Explain It Like I'm 3
