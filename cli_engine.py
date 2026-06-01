@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
 _pool_semaphore = threading.Semaphore(4)  # mirrors max_workers for queue-depth tracking
 
+# New-conversation creation is detected by snapshot-diffing BRAIN_DIR (shared by
+# ALL users). If two users start a fresh session at once, each diff could pick up
+# the OTHER user's brand-new dir and bind the wrong conversation. The per-user
+# lock in bot.py can't help (it's cross-user), so serialize just the short
+# creation+detection window globally: only one new conversation is ever "in
+# flight", so each diff sees exactly its own new dir.
+_new_conv_lock = threading.Lock()
+_NEW_CONV_DETECT_TIMEOUT = 30.0  # release anyway if a new dir never appears
+
 CONPTY_BACKEND = winpty.Backend.ConPTY
 COLOR_ESCAPES = winpty.AgentConfig.WINPTY_FLAG_COLOR_ESCAPES
 
@@ -172,27 +181,51 @@ def get_new_responses(conversation_id: str, starting_step: int) -> str:
     )
     if not os.path.exists(path):
         return ""
-    responses = []
+    # Parse every transcript entry at or after this turn's floor. We track two
+    # things: the planner responses (candidate answers) and the boundary — the
+    # step of the LAST USER_INPUT, which is the exact point where the CURRENT
+    # message begins. Everything before that boundary is "the previous thing"
+    # and must never be returned.
+    #
+    # Two independent guards keep turns separate:
+    #   1. starting_step — captured before the CLI ran (= prev turn's last step
+    #      + 1). Per-user serialization in bot.py guarantees nothing else writes
+    #      this conversation meanwhile, so this floor is exact.
+    #   2. the USER_INPUT boundary — the structural marker the CLI itself writes
+    #      for the current request. Even if (1) were ever off, the answer is
+    #      always the planner response that follows the user's own message.
+    planner = []        # (step, content) candidate answers, floored by starting_step
+    boundary = -1       # step of the most recent USER_INPUT at/after the floor
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     data = json.loads(line)
                     step = data.get("step_index", -1)
-                    if step >= starting_step:
-                        if data.get("type") == "PLANNER_RESPONSE" and data.get("content"):
-                            content = data["content"].strip()
-                            if len(content) > 5:
-                                responses.append(content)
+                    if step < starting_step:
+                        continue
+                    dtype = data.get("type")
+                    if dtype == "USER_INPUT":
+                        boundary = max(boundary, step)
+                    elif dtype == "PLANNER_RESPONSE" and data.get("content"):
+                        content = data["content"].strip()
+                        if len(content) > 5:
+                            planner.append((step, content))
                 except Exception:
                     pass
     except Exception:
         pass
-    if not responses:
+    if not planner:
         return ""
-    result = "\n\n".join(responses)
-    if len(result) > 3500:
-        result = result[:3500] + "\n\n_(Response truncated)_"
+    # Keep only answers AFTER the current message's USER_INPUT. If no boundary
+    # was found in range (older CLI layout / no re-logged input), the
+    # starting_step floor already scopes us to this turn, so fall back to all.
+    after_boundary = [c for (step, c) in planner if step > boundary]
+    candidates = after_boundary if after_boundary else [c for _, c in planner]
+    # The agent's FINAL planner response is the answer. Earlier ones in the turn
+    # are intermediate reasoning between tool calls; returning the last avoids
+    # dumping the whole train of thought.
+    result = candidates[-1]
     if len(_DIR_LISTING_RE.findall(result)) > 3:
         result = sanitize_response(result)
     if len(result) > 10000:
@@ -208,13 +241,29 @@ def _extract_file_paths(conversation_id: str, starting_step: int) -> list[str]:
     )
     if not os.path.exists(path):
         return []
+    # Same boundary logic as get_new_responses: only deliver files produced
+    # after the CURRENT message's USER_INPUT, so we never re-send a file from a
+    # previous turn. First pass finds the boundary, second pass collects files.
+    boundary = starting_step
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    step = data.get("step_index", -1)
+                    if step >= starting_step and data.get("type") == "USER_INPUT":
+                        boundary = max(boundary, step)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     file_paths = []
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     data = json.loads(line)
-                    if data.get("step_index", -1) < starting_step:
+                    if data.get("step_index", -1) < boundary:
                         continue
                     for tc in data.get("tool_calls", []):
                         tool_name = tc.get("name", "")
@@ -492,6 +541,16 @@ def run_cli(
 
     is_new = False
     snapshot_before: set = set()
+    _holding_new_conv_lock = False
+
+    def _release_new_conv_lock():
+        nonlocal _holding_new_conv_lock
+        if _holding_new_conv_lock:
+            _holding_new_conv_lock = False
+            try:
+                _new_conv_lock.release()
+            except Exception:
+                pass
 
     if not conversation_id:
         is_new = True
@@ -505,6 +564,11 @@ def run_cli(
             conversation_id = None
 
     if is_new:
+        # Hold the global lock across snapshot → spawn → detection so no other
+        # user can create a competing dir while we're diffing. Bounded acquire:
+        # if a previous holder is wedged we proceed unprotected rather than block
+        # an executor worker forever (no worse than pre-fix behaviour).
+        _holding_new_conv_lock = _new_conv_lock.acquire(timeout=_NEW_CONV_DETECT_TIMEOUT)
         snapshot_before = _get_conv_dirs_snapshot()
         instructions = get_instructions()
         if instructions:
@@ -614,6 +678,11 @@ def run_cli(
                     starting_step = get_latest_step(conversation_id)
                     last_transcript_step = starting_step
                     logger.info(f"[ENGINE] Detected new conv mid-run: {conversation_id[:12]}...")
+                    _release_new_conv_lock()  # our dir exists now — others may proceed
+                elif _holding_new_conv_lock and total_elapsed > _NEW_CONV_DETECT_TIMEOUT:
+                    # No dir after the timeout — stop blocking everyone else.
+                    logger.warning("[ENGINE] New-conv not detected in time; releasing lock")
+                    _release_new_conv_lock()
 
             # A new transcript step = the agent actually did something = real
             # progress. This is the authoritative activity signal.
@@ -652,10 +721,13 @@ def run_cli(
             if detected:
                 conversation_id = detected
                 logger.info(f"[ENGINE] Detected new conv: {conversation_id[:12]}...")
+        _release_new_conv_lock()  # detection window over (success or not)
 
         raw_output = "".join(output_chunks)
+        # The --print answer is at the END of the stream; keep the tail (not the
+        # head, which is just startup banners) for the PTY fallback below.
         if len(raw_output) > 5000:
-            raw_output = raw_output[:5000]
+            raw_output = raw_output[-5000:]
         response = clean_response(raw_output)
 
         # Always try transcript first (authoritative, clean)
@@ -702,6 +774,9 @@ def run_cli(
         poller.stop()
         logger.error(f"[ENGINE] Error: {e}", exc_info=True)
         return f"Error running CLI: {str(e)}", conversation_id
+    finally:
+        # Belt-and-suspenders: never leak the global lock on any exit path.
+        _release_new_conv_lock()
 
 
 async def run_cli_async(

@@ -105,6 +105,39 @@ auth: AuthManager = None
 # Per-chat cancel events — set to cancel the active CLI request for that chat
 _active_cancel: dict[int, threading.Event] = {}
 
+# Per-user CLI serialization. The agy CLI keeps ONE conversation per user, and
+# running two invocations against the same conversation at once corrupts its
+# transcript and makes each handler scoop up the other turn's steps (responses
+# bleed into the wrong reply). With concurrent_updates(True) the event loop can
+# enter several handlers for one user at once, so we gate every CLI run behind a
+# per-user asyncio.Lock — a user's messages run one at a time, different users
+# stay fully concurrent. Created lazily on the single-threaded event loop, so
+# get-or-create needs no lock of its own.
+_user_cli_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_user_lock(uid: int) -> asyncio.Lock:
+    lock = _user_cli_locks.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_cli_locks[uid] = lock
+    return lock
+
+
+async def _acquire_turn(uid: int, update: Update) -> asyncio.Lock:
+    """Return this user's CLI lock, ready to enter with `async with`. If a
+    previous message is still running, send one calm heads-up so the new message
+    doesn't feel ignored while it waits its turn."""
+    lock = _get_user_lock(uid)
+    if lock.locked():
+        try:
+            await update.effective_message.reply_text(
+                "⏳ One sec — finishing your previous message first, then I'll get to this."
+            )
+        except Exception:
+            pass
+    return lock
+
 # Idle-reaper cycle options shown in Settings
 _IDLE_OPTIONS = [
     (120, "2 min — Fast"),
@@ -818,7 +851,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     stop_typing = asyncio.Event()
     cancel_event = threading.Event()
-    _active_cancel[chat_id] = cancel_event
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
@@ -832,21 +864,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if transcript and not transcript.startswith("["):
             await update.message.reply_text(f'🎤 "{transcript}"')
-            conv_id = sessions.get_conversation_id(user_id=uid)
-            info = sessions.get_session_info(user_id=uid)
-            if info and info.get("messages", 0) == 0:
-                sessions.auto_title(transcript, user_id=uid)
-            response, detected_id = await run_cli_async(
-                transcript, conv_id,
-                cancel_event=cancel_event,
-                skip_permissions=auth.can(uid, "admin"),
-            )
-            if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id, user_id=uid)
-            final_conv = detected_id or conv_id
-            if final_conv:
-                sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid)
-            sessions.increment_messages(user_id=uid)
+            async with await _acquire_turn(uid, update):
+                _active_cancel[chat_id] = cancel_event
+                sname = sessions.get_active_name(uid)
+                conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+                info = sessions.get_session_info(user_id=uid, session_name=sname)
+                if info and info.get("messages", 0) == 0:
+                    sessions.auto_title(transcript, user_id=uid, session_name=sname)
+                response, detected_id = await run_cli_async(
+                    transcript, conv_id,
+                    cancel_event=cancel_event,
+                    skip_permissions=auth.can(uid, "admin"),
+                )
+                if detected_id and detected_id != conv_id:
+                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+                final_conv = detected_id or conv_id
+                if final_conv:
+                    sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
+                sessions.increment_messages(user_id=uid, session_name=sname)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -861,7 +896,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Voice error: {e}", exc_info=True)
         await update.message.reply_text(f"Voice error: {str(e)[:200]}")
     finally:
-        _active_cancel.pop(chat_id, None)
+        if _active_cancel.get(chat_id) is cancel_event:
+            _active_cancel.pop(chat_id, None)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -893,7 +929,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or ""
     stop_typing = asyncio.Event()
     cancel_event = threading.Event()
-    _active_cancel[chat_id] = cancel_event
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
@@ -914,18 +949,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        conv_id = sessions.get_conversation_id(user_id=uid)
-        response, detected_id = await run_cli_async(
-            prompt, conv_id,
-            cancel_event=cancel_event,
-            skip_permissions=auth.can(uid, "admin"),
-        )
-        if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id, user_id=uid)
-        final_conv = detected_id or conv_id
-        if final_conv:
-            sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid)
-        sessions.increment_messages(user_id=uid)
+        async with await _acquire_turn(uid, update):
+            _active_cancel[chat_id] = cancel_event
+            sname = sessions.get_active_name(uid)
+            conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+            response, detected_id = await run_cli_async(
+                prompt, conv_id,
+                cancel_event=cancel_event,
+                skip_permissions=auth.can(uid, "admin"),
+            )
+            if detected_id and detected_id != conv_id:
+                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+            final_conv = detected_id or conv_id
+            if final_conv:
+                sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
+            sessions.increment_messages(user_id=uid, session_name=sname)
         stop_typing.set()
         typing_task.cancel()
         await send_response(update, context, response, uid, chat_id)
@@ -935,7 +973,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Photo error: {e}", exc_info=True)
         await update.message.reply_text(f"Photo error: {str(e)[:200]}")
     finally:
-        _active_cancel.pop(chat_id, None)
+        if _active_cancel.get(chat_id) is cancel_event:
+            _active_cancel.pop(chat_id, None)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,7 +998,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Caption present — extract text and send to CLI
         stop_typing = asyncio.Event()
         cancel_event = threading.Event()
-        _active_cancel[chat_id] = cancel_event
         typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
         try:
@@ -978,18 +1016,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Read the file and respond."
                 )
 
-            conv_id = sessions.get_conversation_id(user_id=uid)
-            response, detected_id = await run_cli_async(
-                prompt, conv_id,
-                cancel_event=cancel_event,
-                skip_permissions=auth.can(uid, "admin"),
-            )
-            if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id, user_id=uid)
-            final_conv = detected_id or conv_id
-            if final_conv:
-                sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid)
-            sessions.increment_messages(user_id=uid)
+            async with await _acquire_turn(uid, update):
+                _active_cancel[chat_id] = cancel_event
+                sname = sessions.get_active_name(uid)
+                conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+                response, detected_id = await run_cli_async(
+                    prompt, conv_id,
+                    cancel_event=cancel_event,
+                    skip_permissions=auth.can(uid, "admin"),
+                )
+                if detected_id and detected_id != conv_id:
+                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+                final_conv = detected_id or conv_id
+                if final_conv:
+                    sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
+                sessions.increment_messages(user_id=uid, session_name=sname)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -999,7 +1040,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Document analysis error: {e}", exc_info=True)
             await update.message.reply_text(f"Analysis error: {str(e)[:200]}")
         finally:
-            _active_cancel.pop(chat_id, None)
+            if _active_cancel.get(chat_id) is cancel_event:
+                _active_cancel.pop(chat_id, None)
 
     except Exception as e:
         logger.error(f"Document save error: {e}", exc_info=True)
@@ -1077,34 +1119,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_message = update.message.text
-    active_session = sessions.get_active_name(uid)
-    conv_id = sessions.get_conversation_id(user_id=uid)
-
-    logger.info(f"Message in [{active_session}] (conv: {conv_id[:12] if conv_id else 'new'})")
-
-    info = sessions.get_session_info(user_id=uid)
-    if info and info.get("messages", 0) == 0:
-        sessions.auto_title(user_message, user_id=uid)
+    logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 
     stop_typing = asyncio.Event()
     cancel_event = threading.Event()
-    _active_cancel[chat_id] = cancel_event
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
-        response, detected_id = await run_cli_async(
-            user_message, conv_id,
-            cancel_event=cancel_event,
-            skip_permissions=auth.can(uid, "admin"),
-        )
+        async with await _acquire_turn(uid, update):
+            # Pin the session to whatever is active the moment WE start running.
+            # The user may /switch while this message was queued or running;
+            # commands bypass this lock, so capture the target once and write
+            # every result back to that same session — never the now-active one.
+            _active_cancel[chat_id] = cancel_event
+            sname = sessions.get_active_name(uid)
+            conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
 
-        if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id, user_id=uid)
+            info = sessions.get_session_info(user_id=uid, session_name=sname)
+            if info and info.get("messages", 0) == 0:
+                sessions.auto_title(user_message, user_id=uid, session_name=sname)
 
-        final_conv = detected_id or conv_id
-        if final_conv:
-            sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid)
-        sessions.increment_messages(user_id=uid)
+            response, detected_id = await run_cli_async(
+                user_message, conv_id,
+                cancel_event=cancel_event,
+                skip_permissions=auth.can(uid, "admin"),
+            )
+
+            if detected_id and detected_id != conv_id:
+                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+
+            final_conv = detected_id or conv_id
+            if final_conv:
+                sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
+            sessions.increment_messages(user_id=uid, session_name=sname)
 
     except Exception as e:
         response = f"Error: {str(e)}"
@@ -1112,7 +1159,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         stop_typing.set()
         typing_task.cancel()
-        _active_cancel.pop(chat_id, None)
+        if _active_cancel.get(chat_id) is cancel_event:
+            _active_cancel.pop(chat_id, None)
 
     await send_response(update, context, response, uid, chat_id)
 

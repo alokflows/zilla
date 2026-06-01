@@ -100,8 +100,8 @@ class SessionManager:
         _, session = self._find(name, user_id)
         return session.get("last_seen_step", 0) if session else 0
 
-    def set_last_seen_step(self, step: int, user_id: int):
-        name = self.get_active_name(user_id)
+    def set_last_seen_step(self, step: int, user_id: int, session_name: str = None):
+        name = session_name or self.get_active_name(user_id)
         key, session = self._find(name, user_id)
         if session:
             session["last_seen_step"] = step
@@ -109,8 +109,8 @@ class SessionManager:
 
     # ── Message Count ─────────────────────────────────────
 
-    def increment_messages(self, user_id: int):
-        name = self.get_active_name(user_id)
+    def increment_messages(self, user_id: int, session_name: str = None):
+        name = session_name or self.get_active_name(user_id)
         key, session = self._find(name, user_id)
         if session:
             session["messages"] = session.get("messages", 0) + 1
@@ -119,8 +119,8 @@ class SessionManager:
 
     # ── Auto-Title ────────────────────────────────────────
 
-    def auto_title(self, first_message: str, user_id: int):
-        name = self.get_active_name(user_id)
+    def auto_title(self, first_message: str, user_id: int, session_name: str = None):
+        name = session_name or self.get_active_name(user_id)
         _, session = self._find(name, user_id)
         if not session or session.get("title"):
             return
