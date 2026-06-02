@@ -44,7 +44,10 @@ import time
 import json
 from datetime import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -70,7 +73,7 @@ from cli_engine import run_cli_async, get_latest_step
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
-    get_inbox_stats, get_inbox_items, format_file_size, extract_text,
+    get_inbox_stats, get_inbox_items, get_inbox_counts, format_file_size, extract_text,
 )
 from formatter import format_for_telegram, detect_file_paths
 from users import AuthManager
@@ -323,6 +326,13 @@ async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  KEYBOARDS
 # ══════════════════════════════════════════════════════════
 
+def _can_change_model(uid: int) -> bool:
+    """Owner always; admins only if the owner has enabled it."""
+    if not auth:
+        return False
+    return auth.can_change_model(uid, get_setting("admins_can_change_model", True))
+
+
 def kb_menu(uid: int = 0):
     rows = [
         [InlineKeyboardButton("📁 Sessions", callback_data="menu_sessions"),
@@ -330,7 +340,8 @@ def kb_menu(uid: int = 0):
         [InlineKeyboardButton("🖥️ Status", callback_data="menu_status")],
     ]
     if auth and auth.can(uid, "admin"):
-        rows[0].append(InlineKeyboardButton("🤖 Model", callback_data="menu_model"))
+        if _can_change_model(uid):
+            rows[0].append(InlineKeyboardButton("🤖 Model", callback_data="menu_model"))
         rows.insert(1, [
             InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
             InlineKeyboardButton("🌐 Browse", callback_data="menu_browse"),
@@ -406,6 +417,12 @@ def kb_settings(uid: int = 0):
             f"⏱️ Idle reaper: {_idle_label(idle_kill)}",
             callback_data="set_cycle_idle",
         )])
+    if auth and auth.is_owner(uid):
+        admins_model = get_setting("admins_can_change_model", True)
+        rows.append([InlineKeyboardButton(
+            f"🤖 Admins can change model: {'ON' if admins_model else 'OFF'}",
+            callback_data="set_toggle_admin_model",
+        )])
     rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
     return InlineKeyboardMarkup(rows)
 
@@ -438,14 +455,61 @@ def kb_users(users: dict):
     return InlineKeyboardMarkup(buttons)
 
 
-def kb_user_detail(target_id: int, role: str):
-    toggle_label = "👑 Make Admin" if role == "user" else "👤 Make User"
-    toggle_role = "admin" if role == "user" else "user"
+def kb_user_detail(target_id: int, role: str = "admin"):
+    # Everyone added is an admin — no role toggle anymore.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(toggle_label, callback_data=f"user_set_role_{toggle_role}_{target_id}")],
         [InlineKeyboardButton("🗑️ Remove", callback_data=f"user_remove_{target_id}"),
          InlineKeyboardButton("◀ Back", callback_data="user_list")],
     ])
+
+
+# ── Inbox (drill-down: categories → paginated list → send) ───
+INBOX_PAGE = 10
+INBOX_CAT_META = [
+    ("images", "📷 Images"),
+    ("audio", "🎵 Audio"),
+    ("video", "🎬 Video"),
+    ("documents", "📄 Documents"),
+]
+
+
+def kb_inbox_categories(counts: dict):
+    rows = []
+    for cat, label in INBOX_CAT_META:
+        n = counts.get(cat, 0)
+        if n:
+            rows.append([InlineKeyboardButton(
+                f"{label} ({n})", callback_data=f"ibx_cat_{cat}_0",
+            )])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_inbox_list(category: str, items: list, offset: int):
+    """One row per file in this page: [ name (size) | 📤 ]; both send it."""
+    rows = []
+    page = items[offset:offset + INBOX_PAGE]
+    for i, item in enumerate(page):
+        idx = offset + i
+        name = item["name"]
+        label = name if len(name) <= 28 else name[:25] + "…"
+        send_cb = f"ibx_send_{category}_{idx}"
+        rows.append([
+            InlineKeyboardButton(
+                f"{label} ({format_file_size(item['size'])})", callback_data=send_cb),
+            InlineKeyboardButton("📤", callback_data=send_cb),
+        ])
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(
+            "⬅️ Prev", callback_data=f"ibx_cat_{category}_{max(0, offset - INBOX_PAGE)}"))
+    if offset + INBOX_PAGE < len(items):
+        nav.append(InlineKeyboardButton(
+            "More ➡️", callback_data=f"ibx_cat_{category}_{offset + INBOX_PAGE}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_inbox")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ══════════════════════════════════════════════════════════
@@ -519,16 +583,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if auth.can(uid, "admin"):
         lines += [
             "⚙️ ADMIN:",
-            "  /model — select AI model",
+            "  /model — select AI model (owner may disable)",
             "  /settings — bot settings",
             "  /browse <url> — browser control\n",
         ]
     if auth.is_owner(uid):
         lines += [
             "👥 OWNER:",
-            "  /adduser <id> [name] — add user",
-            "  /removeuser <id> — remove user",
-            "  /listusers — manage users\n",
+            "  /adduser <id> [name] — add an admin",
+            "  /removeuser <id> — remove an admin",
+            "  /listusers — manage admins\n",
         ]
     await update.message.reply_text("\n".join(lines))
 
@@ -639,12 +703,19 @@ async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not auth.can(uid, "admin"):
-        await update.message.reply_text("Model selection requires admin access.")
+    if not _can_change_model(uid):
+        if auth.can(uid, "admin"):
+            await update.message.reply_text("Model changes are disabled by the owner.")
+        else:
+            await update.message.reply_text("Model selection requires admin access.")
         return
     current = get_model()
     await update.message.reply_text(
-        f"🤖 Model Selection\n════════════════\nCurrent: {current}",
+        f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n"
+        f"ℹ️ These are the common Gemini options. agy fetches the full list from "
+        f"your Antigravity account — use ✏️ Custom to enter any exact name shown "
+        f"in agy's own \"Switch Model\" screen (e.g. a Claude model, if your "
+        f"account has it).",
         reply_markup=kb_model(current),
     )
 
@@ -1094,17 +1165,21 @@ async def _handle_adduser_flow(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif step == "awaiting_name":
         name = "" if text.lower() == "/skip" else text
-        flow["target_name"] = name
-        flow["step"] = "awaiting_role"
-        context.user_data["adduser_flow"] = flow
-        await update.message.reply_text(
-            f"Name: {name or '(blank)'}\n\nChoose role:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👤 User", callback_data="user_add_role_user"),
-                 InlineKeyboardButton("👑 Admin", callback_data="user_add_role_admin")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="user_add_cancel")],
-            ]),
-        )
+        target_id = flow.get("target_id")
+        context.user_data.pop("adduser_flow", None)
+        # Everyone added is an admin (full access, owner-trusted).
+        if target_id and auth.add_user(target_id, name, "admin"):
+            await update.message.reply_text(
+                f"✅ Added {name or target_id} as [admin].\n"
+                f"They have full access (chat, sessions, media, files). "
+                f"Only you (owner) can manage users.",
+                reply_markup=kb_users(auth.list_users()),
+            )
+        else:
+            await update.message.reply_text(
+                f"User {target_id} already exists or could not be added.",
+                reply_markup=kb_users(auth.list_users()),
+            )
 
     else:
         # Unexpected — reset
@@ -1220,12 +1295,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif data == "menu_model":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
+            if not _can_change_model(uid):
+                await query.answer("Model changes are disabled by the owner.", show_alert=True)
                 return
             current = get_model()
             await query.edit_message_text(
-                f"🤖 Model Selection\n════════════════\nCurrent: {current}",
+                f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n"
+                f"ℹ️ Common Gemini options below. agy fetches the full list from "
+                f"your Antigravity account — use ✏️ Custom for any exact name shown "
+                f"in agy's own Switch Model screen (e.g. a Claude model, if your "
+                f"account has it).",
                 reply_markup=kb_model(current),
             )
 
@@ -1236,16 +1315,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
 
         elif data == "menu_inbox":
-            items = get_inbox_items()
-            if not items:
+            counts = get_inbox_counts()
+            total = sum(counts.values())
+            if not total:
                 await query.edit_message_text("📥 Inbox empty.", reply_markup=kb_back())
             else:
-                lines = [f"📥 Inbox: {len(items)} items\n"]
-                for item in items[:15]:
-                    lines.append(f"  [{item['category']}] {item['name']} ({format_file_size(item['size'])})")
-                if len(items) > 15:
-                    lines.append(f"  …+{len(items) - 15} more")
-                await query.edit_message_text("\n".join(lines), reply_markup=kb_back())
+                await query.edit_message_text(
+                    f"📥 Inbox — {total} item(s)\nPick a category:",
+                    reply_markup=kb_inbox_categories(counts),
+                )
+
+        elif data.startswith("ibx_cat_"):
+            # ibx_cat_{category}_{offset}
+            rest = data.removeprefix("ibx_cat_")
+            cat, _, off_str = rest.rpartition("_")
+            offset = int(off_str) if off_str.isdigit() else 0
+            items = get_inbox_items(cat)
+            if not items:
+                await query.edit_message_text(
+                    "📥 Nothing here anymore.",
+                    reply_markup=kb_inbox_categories(get_inbox_counts()),
+                )
+            else:
+                label = dict(INBOX_CAT_META).get(cat, cat)
+                shown = min(offset + INBOX_PAGE, len(items))
+                await query.edit_message_text(
+                    f"{label} — {len(items)} file(s)\nShowing {offset + 1}–{shown}. "
+                    f"Tap a file or 📤 to send it here.",
+                    reply_markup=kb_inbox_list(cat, items, offset),
+                )
+
+        elif data.startswith("ibx_send_"):
+            # ibx_send_{category}_{index}
+            rest = data.removeprefix("ibx_send_")
+            cat, _, idx_str = rest.rpartition("_")
+            idx = int(idx_str) if idx_str.isdigit() else -1
+            items = get_inbox_items(cat)
+            if 0 <= idx < len(items):
+                item = items[idx]
+                ok = await safe_send_file(
+                    context.bot, chat_id, item["path"],
+                    caption=item["name"], user_id=uid,
+                )
+                await query.answer("📤 Sent" if ok else "⚠️ Could not send", show_alert=not ok)
+            else:
+                await query.answer("File no longer available.", show_alert=True)
 
         elif data == "menu_browse":
             if not auth.can(uid, "admin"):
@@ -1331,8 +1445,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Model ──
         elif data == "model_custom":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
+            if not _can_change_model(uid):
+                await query.answer("Model changes are disabled by the owner.", show_alert=True)
                 return
             context.user_data["awaiting_custom_model"] = True
             await query.edit_message_text(
@@ -1343,8 +1457,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif data.startswith("model_"):
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
+            if not _can_change_model(uid):
+                await query.answer("Model changes are disabled by the owner.", show_alert=True)
                 return
             chosen = data.removeprefix("model_")
             # set_model writes agy's real settings.json and returns the value as
@@ -1379,6 +1493,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 new_val = 600
             set_setting("idle_kill_after", new_val)
+            await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+        elif data == "set_toggle_admin_model":
+            if not auth.is_owner(uid):
+                await query.answer("Owner only.", show_alert=True)
+                return
+            current = get_setting("admins_can_change_model", True)
+            set_setting("admins_can_change_model", not current)
             await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
 
         # ── Cancel active request ──
@@ -1427,26 +1549,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_user_detail(target_id, role),
             )
 
-        elif data.startswith("user_set_role_"):
-            if not auth.is_owner(uid):
-                return
-            # format: user_set_role_{role}_{id}
-            rest = data.removeprefix("user_set_role_")
-            parts = rest.split("_", 1)
-            if len(parts) == 2:
-                new_role, target_str = parts
-                target_id = int(target_str)
-                if auth.set_role(target_id, new_role):
-                    users = auth.list_users()
-                    info = users.get(target_id, {})
-                    name = info.get("name") or f"User {target_id}"
-                    await query.edit_message_text(
-                        f"✅ {name} is now [{new_role}].",
-                        reply_markup=kb_user_detail(target_id, new_role),
-                    )
-                else:
-                    await query.edit_message_text("Failed to set role.")
-
         elif data.startswith("user_remove_"):
             if not auth.is_owner(uid):
                 return
@@ -1494,26 +1596,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_users(users),
             )
 
-        elif data.startswith("user_add_role_"):
-            if not auth.is_owner(uid):
-                return
-            role = data.removeprefix("user_add_role_")
-            flow = context.user_data.get("adduser_flow", {})
-            target_id = flow.get("target_id")
-            target_name = flow.get("target_name", "")
-            if not target_id:
-                await query.edit_message_text("Flow expired. Use /menu > Users to start again.")
-                return
-            if auth.add_user(target_id, target_name, role):
-                context.user_data.pop("adduser_flow", None)
-                await query.edit_message_text(
-                    f"✅ Added {target_name or target_id} as [{role}].",
-                    reply_markup=kb_users(auth.list_users()),
-                )
-            else:
-                context.user_data.pop("adduser_flow", None)
-                await query.edit_message_text(f"User {target_id} already exists.")
-
         # ── Error recovery ──
         elif data == "err_retry":
             await query.edit_message_text(
@@ -1522,6 +1604,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif data == "err_model":
+            if not _can_change_model(uid):
+                await query.answer("Model changes are disabled by the owner.", show_alert=True)
+                return
             current = get_model()
             await query.edit_message_text(
                 f"🤖 Try a different model?\nCurrent: {current}",
@@ -1564,6 +1649,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 
 async def post_init(application):
+    # Register the native Telegram slash-command menu (the "/" autocomplete).
+    await _register_commands(application)
+
     if OWNER_CHAT_ID:
         try:
             await application.bot.send_message(
@@ -1576,6 +1664,44 @@ async def post_init(application):
             )
         except Exception as e:
             logger.warning(f"[STARTUP] Owner notify failed: {e}")
+
+
+# Base commands every admin/owner sees in the "/" menu.
+_BASE_COMMANDS = [
+    ("menu", "Open the control panel"),
+    ("model", "Select the AI model"),
+    ("settings", "Bot settings"),
+    ("sessions", "List your sessions"),
+    ("new", "Start a new session"),
+    ("switch", "Switch session"),
+    ("end", "End the current session"),
+    ("brain", "Inbox stats"),
+    ("browse", "Browser control (/browse <url>)"),
+    ("ping", "Status check"),
+    ("cancel", "Stop a running request"),
+    ("help", "Show all commands"),
+]
+# Extra commands only the owner needs.
+_OWNER_COMMANDS = [
+    ("adduser", "Add an admin"),
+    ("removeuser", "Remove an admin"),
+    ("listusers", "Manage admins"),
+]
+
+
+async def _register_commands(application):
+    """Push the slash-command list to Telegram (best effort; never blocks)."""
+    try:
+        base = [BotCommand(c, d) for c, d in _BASE_COMMANDS]
+        await application.bot.set_my_commands(base, scope=BotCommandScopeDefault())
+        if OWNER_CHAT_ID:
+            owner_cmds = [BotCommand(c, d) for c, d in (_BASE_COMMANDS + _OWNER_COMMANDS)]
+            await application.bot.set_my_commands(
+                owner_cmds, scope=BotCommandScopeChat(chat_id=OWNER_CHAT_ID),
+            )
+        logger.info("[STARTUP] Slash-command menu registered")
+    except Exception as e:
+        logger.warning(f"[STARTUP] set_my_commands failed: {e}")
 
 
 # ══════════════════════════════════════════════════════════

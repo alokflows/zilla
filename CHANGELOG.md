@@ -4,7 +4,31 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🤖 v2.4.0 — Model switching that's actually real + session delete *(latest)*
+## 🔐 v2.5.0 — Trust-based roles, owner-gated model, slash-command menu, Inbox redesign *(latest)*
+
+### 🧱 Why the security model changed
+I tested it directly: **agy executes tools — file writes, shell commands — in headless mode no matter what** (`--dangerously-skip-permissions`, the `toolPermission` setting, and `--sandbox` all fail to block it). There's no way to safely sandbox an untrusted user inside agy. So the bot now uses a **trust-based model** instead of pretending to restrict.
+
+### 👤 Two roles only: owner + admin
+- The untrusted **"user" tier is gone**. Everyone the owner adds is an **admin** with full access (chat, sessions, media, files, agy). Old `"user"` entries auto-migrate to admin.
+- **Only the owner manages people** (adds/removes admins). Adding someone is now one step — ID → name → done (no role prompt).
+- A fix surfaced by tests: capability checks now correctly deny anyone who isn't the owner or a stored admin.
+
+### 🎚️ Owner controls whether admins can change the model
+- New **owner-only** Settings toggle: **"Admins can change model: ON/OFF"** (default ON). When OFF, admins lose the 🤖 Model button and `/model` replies that it's owner-disabled. The owner can always change it.
+
+### ⌨️ Native slash-command menu
+- Typing **`/`** now shows the full command list with descriptions (no more guessing). The owner additionally sees `adduser` / `removeuser` / `listusers`.
+
+### 🤖 Honest model list
+- Clarified on the model screen: the buttons are common **Gemini** options; agy fetches its **full model list from your Antigravity account**, so use **✏️ Custom** to enter any exact name from agy's own "Switch Model" screen (including a Claude model, if your account has it). We don't show fake buttons that would silently fall back.
+
+### 📥 Inbox redesign
+- Inbox no longer dumps a wall of text. It shows **category buttons** — 📷 Images, 🎵 Audio, 🎬 Video, 📄 Documents (video split out by extension) — each opening a **paginated list (10 per page, "More ➡️")**. Every file has a **📤 send button** that delivers it straight to your Telegram chat.
+
+---
+
+## 🤖 v2.4.0 — Model switching that's actually real + session delete
 
 ### 🐛 The model switcher was lying
 - **Changing the model never did anything.** The bot stored your pick in its *own* `settings.json` and exported three guessed environment variables (`ANTIGRAVITY_MODEL`, `GEMINI_API_MODEL`, `MODEL`) — **agy reads none of them**, and has no `--model` flag at all. So every "✅ Model changed" was false.

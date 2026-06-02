@@ -215,29 +215,67 @@ def _extract_docx(filepath: str) -> str | None:
 
 # ── Inbox Stats ───────────────────────────────────────────
 
-def get_inbox_stats() -> dict:
-    """Count files in inbox directories."""
-    stats = {}
-    for name, path in [("images", INBOX_IMAGES), ("audio", INBOX_AUDIO), ("documents", INBOX_DOCUMENTS)]:
-        try:
-            stats[name] = len([f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]) if os.path.isdir(path) else 0
-        except Exception:
-            stats[name] = 0
-    return stats
+# Video files are downloaded into the documents folder; we split them out into
+# their own category by extension so the Inbox can show 📷/🎵/🎬/📄 separately.
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".wmv"}
+
+# The four inbox categories, in display order.
+INBOX_CATEGORIES = ("images", "audio", "video", "documents")
 
 
-def get_inbox_items() -> list[dict]:
-    """List inbox items with metadata."""
+def _classify(folder_category: str, fname: str) -> str:
+    """Derive the display category for a file (splits video out of documents)."""
+    if folder_category == "documents" and os.path.splitext(fname)[1].lower() in VIDEO_EXTS:
+        return "video"
+    return folder_category
+
+
+def get_inbox_items(category: str | None = None) -> list[dict]:
+    """
+    List inbox items with metadata, newest first. Each item:
+      {name, category, size, path, mtime}
+    If `category` is given, only items in that category are returned.
+    """
     items = []
-    for category, folder in [("images", INBOX_IMAGES), ("audio", INBOX_AUDIO), ("documents", INBOX_DOCUMENTS)]:
+    for folder_category, folder in [
+        ("images", INBOX_IMAGES), ("audio", INBOX_AUDIO), ("documents", INBOX_DOCUMENTS),
+    ]:
         if not os.path.isdir(folder):
             continue
         for fname in os.listdir(folder):
             fpath = os.path.join(folder, fname)
-            if os.path.isfile(fpath):
-                items.append({"name": fname, "category": category, "size": os.path.getsize(fpath), "path": fpath})
-    items.sort(key=lambda x: x["name"], reverse=True)
+            if not os.path.isfile(fpath):
+                continue
+            cat = _classify(folder_category, fname)
+            if category and cat != category:
+                continue
+            try:
+                mtime = os.path.getmtime(fpath)
+                size = os.path.getsize(fpath)
+            except OSError:
+                continue
+            items.append({"name": fname, "category": cat, "size": size,
+                          "path": fpath, "mtime": mtime})
+    items.sort(key=lambda x: x["mtime"], reverse=True)
     return items
+
+
+def get_inbox_counts() -> dict:
+    """Count files per display category: {images, audio, video, documents}."""
+    counts = {c: 0 for c in INBOX_CATEGORIES}
+    for item in get_inbox_items():
+        counts[item["category"]] = counts.get(item["category"], 0) + 1
+    return counts
+
+
+def get_inbox_stats() -> dict:
+    """Back-compat counts (images/audio/documents include video under documents)."""
+    counts = get_inbox_counts()
+    return {
+        "images": counts["images"],
+        "audio": counts["audio"],
+        "documents": counts["documents"] + counts["video"],
+    }
 
 
 def format_file_size(size_bytes: int) -> str:

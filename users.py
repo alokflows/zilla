@@ -1,10 +1,16 @@
 # ============================================================
-#  USERS — Multi-User Authorization (Three-tier)
+#  USERS — Authorization (two-tier: owner + admin)
 # ============================================================
 #  Roles:
-#    user  — chat, voice, photo, document
-#    admin — + model/settings change, /browse, file delivery
-#    owner — + full user management (set via TELEGRAM_OWNER_ID in .env)
+#    admin — full use: chat, media, model*, settings, browse, files, agy
+#    owner — everything admins can do, PLUS user management, and the
+#            owner decides (via a setting) whether admins may change the model
+#    (*model change for admins is gated by the owner — see can_change_model)
+#
+#  There is intentionally no untrusted "user" tier: agy executes tools in
+#  headless mode regardless of any permission flag, so anyone who can reach
+#  agy effectively runs code on this machine. Only people the owner trusts
+#  (and adds) get in, and they are all admins.
 # ============================================================
 
 import json
@@ -15,11 +21,11 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# Capability → minimum role required
+# Capability → roles allowed. Every authorized non-owner is an admin.
 _CAPS = {
-    "chat":     {"user", "admin", "owner"},
-    "admin":    {"admin", "owner"},   # model, settings, browse, file_gen, skip_permissions
-    "users":    {"owner"},
+    "chat":     {"admin", "owner"},
+    "admin":    {"admin", "owner"},   # settings, browse, file_gen, agy execution
+    "users":    {"owner"},            # add/remove admins — owner only
 }
 
 
@@ -40,6 +46,11 @@ class AuthManager:
                 with open(self.users_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self._users = {int(k): v for k, v in data.items()}
+                # Migrate: the old "user" tier no longer exists — every stored
+                # (owner-added) account is an admin now.
+                for info in self._users.values():
+                    if info.get("role") != "admin":
+                        info["role"] = "admin"
                 try:
                     self._mtime_users = os.path.getmtime(self.users_file)
                 except OSError:
@@ -103,15 +114,30 @@ class AuthManager:
         """Check if user has the given capability."""
         if user_id == self.owner_id:
             return True
+        # Not owner and not a stored account → no capabilities at all.
+        if user_id not in self._users or user_id in self._denied:
+            return False
         allowed_roles = _CAPS.get(capability, set())
-        role = self._users.get(user_id, {}).get("role", "user")
+        # Any authorized (stored) account is an admin.
+        role = self._users[user_id].get("role", "admin")
         return role in allowed_roles
+
+    def can_change_model(self, user_id: int, admins_allowed: bool) -> bool:
+        """
+        Owner may always change the model. Admins may only if the owner has
+        enabled it (admins_allowed). Unauthorized users never can.
+        """
+        if user_id == self.owner_id:
+            return True
+        if not self.can(user_id, "admin"):
+            return False
+        return bool(admins_allowed)
 
     # ── CRUD ──────────────────────────────────────────────
 
-    def add_user(self, user_id: int, name: str = "", role: str = "user") -> bool:
-        if role not in ("user", "admin"):
-            role = "user"
+    def add_user(self, user_id: int, name: str = "", role: str = "admin") -> bool:
+        # Only admins exist now (besides the owner).
+        role = "admin"
         with self._lock:
             if user_id in self._users:
                 return False

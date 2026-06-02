@@ -193,6 +193,102 @@ def test_session_persists_to_disk():
 
 
 # ════════════════════════════════════════════════════════════
+#  AUTH — two-role model (owner + admin) + owner-gated model
+# ════════════════════════════════════════════════════════════
+
+from users import AuthManager  # noqa: E402
+
+
+def _auth(owner=1000):
+    path = os.path.join(_tmpdir, f"users_{os.urandom(4).hex()}.json")
+    return AuthManager(path, owner_id=owner)
+
+
+def test_auth_authorized_user_is_admin():
+    a = _auth()
+    a.add_user(2000, "Bob")              # no role arg → admin
+    check("auth: added account is admin role",
+          a.list_users()[2000]["role"] == "admin")
+    check("auth: admin has chat cap", a.can(2000, "chat"))
+    check("auth: admin has admin cap", a.can(2000, "admin"))
+    check("auth: admin lacks users cap", not a.can(2000, "users"))
+
+
+def test_auth_owner_has_everything():
+    a = _auth(owner=1000)
+    check("auth: owner has users cap", a.can(1000, "users"))
+    check("auth: owner has admin cap", a.can(1000, "admin"))
+
+
+def test_auth_old_user_role_migrates():
+    # Write a legacy file with a "user" role, then load it.
+    path = os.path.join(_tmpdir, "legacy_users.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"3000": {"name": "Old", "role": "user"}}, f)
+    a = AuthManager(path, owner_id=1000)
+    check("auth: legacy 'user' role migrates to admin",
+          a.list_users()[3000]["role"] == "admin" and a.can(3000, "admin"))
+
+
+def test_can_change_model():
+    a = _auth(owner=1000)
+    a.add_user(2000, "Bob")
+    check("model-gate: owner True when admins allowed", a.can_change_model(1000, True))
+    check("model-gate: owner True even when admins disallowed", a.can_change_model(1000, False))
+    check("model-gate: admin True when allowed", a.can_change_model(2000, True))
+    check("model-gate: admin False when disallowed", not a.can_change_model(2000, False))
+    check("model-gate: stranger False", not a.can_change_model(9999, True))
+
+
+# ════════════════════════════════════════════════════════════
+#  INBOX — classification, filtering, counts
+# ════════════════════════════════════════════════════════════
+
+import media  # noqa: E402
+
+
+def _setup_inbox():
+    base = os.path.join(_tmpdir, f"inbox_{os.urandom(4).hex()}")
+    img = os.path.join(base, "images"); aud = os.path.join(base, "audio"); doc = os.path.join(base, "documents")
+    for d in (img, aud, doc):
+        os.makedirs(d, exist_ok=True)
+    open(os.path.join(img, "p1.jpg"), "w").close()
+    open(os.path.join(aud, "v1.ogg"), "w").close()
+    open(os.path.join(doc, "report.pdf"), "w").close()
+    open(os.path.join(doc, "clip.mp4"), "w").close()   # video, lives in documents folder
+    open(os.path.join(doc, "movie.MKV"), "w").close()  # video, uppercase ext
+    media.INBOX_IMAGES, media.INBOX_AUDIO, media.INBOX_DOCUMENTS = img, aud, doc
+    return img, aud, doc
+
+
+def test_inbox_classifies_video_by_extension():
+    _setup_inbox()
+    vids = {i["name"] for i in media.get_inbox_items("video")}
+    docs = {i["name"] for i in media.get_inbox_items("documents")}
+    check("inbox: videos split out of documents by ext",
+          vids == {"clip.mp4", "movie.MKV"}, str(vids))
+    check("inbox: documents excludes videos", docs == {"report.pdf"}, str(docs))
+
+
+def test_inbox_counts():
+    _setup_inbox()
+    counts = media.get_inbox_counts()
+    check("inbox: counts per category",
+          counts == {"images": 1, "audio": 1, "video": 2, "documents": 1}, str(counts))
+    # Back-compat stats fold video into documents.
+    stats = media.get_inbox_stats()
+    check("inbox: legacy stats fold video into documents",
+          stats == {"images": 1, "audio": 1, "documents": 3}, str(stats))
+
+
+def test_inbox_filter_returns_only_category():
+    _setup_inbox()
+    aud = media.get_inbox_items("audio")
+    check("inbox: filter returns only that category",
+          len(aud) == 1 and aud[0]["category"] == "audio")
+
+
+# ════════════════════════════════════════════════════════════
 
 def main():
     tests = [
@@ -207,6 +303,13 @@ def main():
         test_session_delete,
         test_session_delete_does_not_touch_other_users,
         test_session_persists_to_disk,
+        test_auth_authorized_user_is_admin,
+        test_auth_owner_has_everything,
+        test_auth_old_user_role_migrates,
+        test_can_change_model,
+        test_inbox_classifies_video_by_extension,
+        test_inbox_counts,
+        test_inbox_filter_returns_only_category,
     ]
     print("Running zilla fix tests...\n")
     for t in tests:
