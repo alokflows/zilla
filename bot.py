@@ -33,7 +33,10 @@
 #  Document → analyze (if caption) or save
 # ============================================================
 
-import winhide  # noqa: F401 — MUST be first: suppresses all child console windows
+from platform_compat import (
+    apply_window_hiding, acquire_instance_lock, release_instance_lock, IS_WINDOWS,
+)
+apply_window_hiding()  # MUST be early: hides child console windows on Windows (no-op elsewhere)
 import asyncio
 import atexit
 import sys
@@ -67,6 +70,7 @@ from config import (
     get_model, set_model, get_idle_kill_after, get_setting, set_setting,
     OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES, BRAIN_DIR,
     AGY_MODELS, AGY_EFFORTS, model_display, SCHEDULES_FILE,
+    model_catalog, get_backend, set_backend,
 )
 from sessions import SessionManager
 from cli_engine import run_cli_async, get_latest_step, detect_limit
@@ -336,6 +340,16 @@ def _can_change_model(uid: int) -> bool:
     return auth.can_change_model(uid, get_setting("admins_can_change_model", True))
 
 
+def _model_note() -> str:
+    """Backend-specific hint shown under the model picker."""
+    if get_backend() == "claude":
+        return ("ℹ️ Backend: Claude Code. Pick Opus/Sonnet/Haiku, or ✏️ Custom for "
+                "an exact model name. (Switch backend in /settings.)")
+    return ("ℹ️ Backend: agy. Common Gemini options below; agy fetches the full "
+            "list from your Antigravity account — use ✏️ Custom for any exact name "
+            "from agy's own Switch Model screen.")
+
+
 def kb_menu(uid: int = 0):
     rows = [
         [InlineKeyboardButton("📁 Sessions", callback_data="menu_sessions"),
@@ -382,17 +396,17 @@ def kb_session_delete(name: str):
 
 
 def kb_model(current: str):
-    """One row per model, three effort buttons each; ✓ marks the live value."""
-    buttons = []
-    for tag, base in AGY_MODELS:
-        row = []
-        for effort in AGY_EFFORTS:
-            full = model_display(base, effort)
-            mark = "✓ " if full == current else ""
-            short = effort[:3]  # Low / Med / Hig
-            row.append(InlineKeyboardButton(
-                f"{mark}{tag}·{short}", callback_data=f"model_{full}",
-            ))
+    """Model picker for the ACTIVE backend (agy=Gemini×effort, claude=Opus/Sonnet/Haiku).
+    ✓ marks the live value. Catalog comes from config.model_catalog()."""
+    catalog = model_catalog()        # list of (label, value)
+    buttons, row = [], []
+    per_row = 3 if len(catalog) > 4 else 1
+    for label, value in catalog:
+        mark = "✓ " if value == current else ""
+        row.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"model_{value}"))
+        if len(row) == per_row:
+            buttons.append(row); row = []
+    if row:
         buttons.append(row)
     buttons.append([InlineKeyboardButton("✏️ Custom…", callback_data="model_custom")])
     buttons.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
@@ -431,6 +445,10 @@ def kb_settings(uid: int = 0):
         rows.append([InlineKeyboardButton(
             f"🤖 Admins can change model: {'ON' if admins_model else 'OFF'}",
             callback_data="set_toggle_admin_model",
+        )])
+        rows.append([InlineKeyboardButton(
+            f"🧠 Backend: {get_backend()}  (tap to switch)",
+            callback_data="set_toggle_backend",
         )])
     rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
     return InlineKeyboardMarkup(rows)
@@ -784,11 +802,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     current = get_model()
     await update.message.reply_text(
-        f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n"
-        f"ℹ️ These are the common Gemini options. agy fetches the full list from "
-        f"your Antigravity account — use ✏️ Custom to enter any exact name shown "
-        f"in agy's own \"Switch Model\" screen (e.g. a Claude model, if your "
-        f"account has it).",
+        f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n{_model_note()}",
         reply_markup=kb_model(current),
     )
 
@@ -1399,9 +1413,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stored = set_model(chosen)
         ok = stored == chosen
         head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
+        src = "Claude Code" if get_backend() == "claude" else "agy's settings.json"
         await update.message.reply_text(
-            f"{head}\nagy will now use: {stored}\n"
-            f"(read back from agy's own settings.json)"
+            f"{head}\n{get_backend()} will now use: {stored}\n(via {src})"
         )
         return
 
@@ -1497,11 +1511,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             current = get_model()
             await query.edit_message_text(
-                f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n"
-                f"ℹ️ Common Gemini options below. agy fetches the full list from "
-                f"your Antigravity account — use ✏️ Custom for any exact name shown "
-                f"in agy's own Switch Model screen (e.g. a Claude model, if your "
-                f"account has it).",
+                f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n{_model_note()}",
                 reply_markup=kb_model(current),
             )
 
@@ -1654,16 +1664,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("Model changes are disabled by the owner.", show_alert=True)
                 return
             chosen = data.removeprefix("model_")
-            # set_model writes agy's real settings.json and returns the value as
-            # actually persisted on disk — what the CLI will load on next run.
+            # set_model persists for the active backend and returns the stored
+            # value (agy: read back from its settings.json; claude: the alias).
             stored = set_model(chosen)
             ok = stored == chosen
             head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
+            src = "Claude Code" if get_backend() == "claude" else "agy's settings.json"
             await query.edit_message_text(
                 f"{head}\n════════════════\n"
-                f"agy will now use: <b>{stored}</b>\n"
-                f"(read back from agy's own settings.json)\n\n"
-                f"Takes effect on your next message.",
+                f"<b>{get_backend()}</b> will now use: <b>{stored}</b>\n"
+                f"(via {src})\n\nTakes effect on your next message.",
                 parse_mode="HTML",
                 reply_markup=kb_model(stored),
             )
@@ -1703,6 +1713,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current = get_setting("schedule_catchup", True)
             set_setting("schedule_catchup", not current)
             await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+        elif data == "set_toggle_backend":
+            if not auth.is_owner(uid):
+                await query.answer("Owner only.", show_alert=True)
+                return
+            new_backend = "claude" if get_backend() == "agy" else "agy"
+            set_backend(new_backend)
+            await query.edit_message_text(
+                f"🧠 Backend switched to: {new_backend}\n"
+                f"Takes effect on your next message. Model: {get_model()}",
+                reply_markup=kb_settings(uid),
+            )
 
         # ── Schedules ──
         elif data == "sched_confirm":
@@ -1994,47 +2016,34 @@ def _remove_pid_file():
         pass
 
 
+_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zilla_bot_instance.lock")
+
+
 def _release_lock():
     global _lock_file_handle
     _remove_pid_file()
     if _lock_file_handle:
-        try:
-            import msvcrt
-            msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_UNLCK, 1)
-            _lock_file_handle.close()
-        except Exception:
-            pass
-        lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zilla_bot_instance.lock")
-        try:
-            os.remove(lock_path)
-        except Exception:
-            pass
+        release_instance_lock(_lock_file_handle, _LOCK_PATH)
         _lock_file_handle = None
 
 
 def main():
     global sessions, auth, schedules_mgr, _lock_file_handle
 
-    if sys.platform == "win32":
-        import msvcrt
-        bot_dir = os.path.dirname(os.path.abspath(__file__))
-        lock_path = os.path.join(bot_dir, "zilla_bot_instance.lock")
-        # Remove any stale lock files from old naming schemes
-        for stale in ["agy_bot_instance.lock"]:
-            stale_path = os.path.join(bot_dir, stale)
-            if os.path.exists(stale_path):
-                try:
-                    os.remove(stale_path)
-                except OSError:
-                    pass
-        try:
-            _lock_file_handle = open(lock_path, "w")
-            msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
-            _cout("❌ Another instance is already running.")
-            _cout("   Double-click 'Stop Zilla.bat' to kill it first.")
-            sys.exit(1)
-        atexit.register(_release_lock)
+    # Single-instance guard — cross-platform (msvcrt on Windows, fcntl on Unix).
+    bot_dir = os.path.dirname(os.path.abspath(__file__))
+    for stale in ["agy_bot_instance.lock"]:  # clean old naming schemes
+        sp = os.path.join(bot_dir, stale)
+        if os.path.exists(sp):
+            try:
+                os.remove(sp)
+            except OSError:
+                pass
+    _lock_file_handle = acquire_instance_lock(_LOCK_PATH)
+    if _lock_file_handle is None:
+        _cout("❌ Another instance is already running. Stop it first.")
+        sys.exit(1)
+    atexit.register(_release_lock)
 
     # Record our PID so 'Stop Zilla.bat' can terminate us + CLI children
     _write_pid_file()

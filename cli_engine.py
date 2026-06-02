@@ -7,7 +7,9 @@
 #  MAX_TOTAL_RUNTIME catastrophic ceiling.
 # ============================================================
 
-import winhide  # noqa: F401 — MUST be first: suppresses all child console windows
+from platform_compat import apply_window_hiding, PtyProcess
+apply_window_hiding()  # MUST be early: suppresses child console windows on Windows (no-op elsewhere)
+
 import asyncio
 import json
 import os
@@ -19,12 +21,10 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
-import winpty
-
 from config import (
     CLI_PATH, CLI_WORKING_DIR, BRAIN_DIR, SKILLS_DIR,
     IDLE_KILL_AFTER, MAX_TOTAL_RUNTIME,
-    get_idle_kill_after,
+    get_idle_kill_after, get_backend, get_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,9 +40,6 @@ _pool_semaphore = threading.Semaphore(4)  # mirrors max_workers for queue-depth 
 # flight", so each diff sees exactly its own new dir.
 _new_conv_lock = threading.Lock()
 _NEW_CONV_DETECT_TIMEOUT = 30.0  # release anyway if a new dir never appears
-
-CONPTY_BACKEND = winpty.Backend.ConPTY
-COLOR_ESCAPES = winpty.AgentConfig.WINPTY_FLAG_COLOR_ESCAPES
 
 
 # ══════════════════════════════════════════════════════════
@@ -647,9 +644,8 @@ def run_cli(
         # CLI will load, for traceability.
         logger.info(f"[ENGINE] Model (from agy settings): {get_selected_model()}")
 
-        env_str = '\0'.join(f'{k}={v}' for k, v in custom_env.items()) + '\0\0'
-        pty = winpty.PTY(200, 1000, backend=CONPTY_BACKEND, agent_config=COLOR_ESCAPES)
-        pty.spawn(command, cwd=CLI_WORKING_DIR, env=env_str)
+        pty = PtyProcess(200, 1000)
+        pty.spawn(cmd_parts, cwd=CLI_WORKING_DIR, env=custom_env)
 
         poller.start()
 
@@ -736,16 +732,9 @@ def run_cli(
         except Exception:
             pass
 
-        # Kill process if we stopped it (winhide makes this windowless)
+        # Kill process if we stopped it (windowless on Windows; process-group on Unix)
         if exit_reason != "normal":
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pty.pid)],
-                    capture_output=True,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except Exception:
-                pass
+            pty.terminate()
 
         poller.stop()
 
@@ -813,6 +802,19 @@ def run_cli(
         _release_new_conv_lock()
 
 
+def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip_permissions):
+    """Pick the backend and run one turn (blocking; called in the thread pool)."""
+    if get_backend() == "claude":
+        from backends import run_claude
+        return run_claude(
+            prompt, conversation_id,
+            progress_callback=progress_callback, cancel_event=cancel_event,
+            skip_permissions=skip_permissions, model=get_model(),
+        )
+    # default: agy (PTY + transcript)
+    return run_cli(prompt, conversation_id, progress_callback, cancel_event, skip_permissions)
+
+
 async def run_cli_async(
     prompt: str,
     conversation_id: str = None,
@@ -820,12 +822,12 @@ async def run_cli_async(
     cancel_event: threading.Event | None = None,
     skip_permissions: bool = False,
 ) -> tuple[str, str | None]:
-    """Async wrapper — runs blocking PTY call in thread pool."""
+    """Async wrapper — runs the active backend's blocking call in the thread pool."""
     loop = asyncio.get_event_loop()
     if cancel_event is None:
         cancel_event = threading.Event()
     task = loop.run_in_executor(
-        executor, run_cli, prompt, conversation_id,
+        executor, _run_blocking, prompt, conversation_id,
         progress_callback, cancel_event, skip_permissions,
     )
     try:

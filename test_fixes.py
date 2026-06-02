@@ -431,6 +431,70 @@ def test_detect_limit():
 
 
 # ════════════════════════════════════════════════════════════
+#  BACKENDS + CROSS-PLATFORM
+# ════════════════════════════════════════════════════════════
+
+import backends  # noqa: E402
+import platform_compat as pc  # noqa: E402
+
+
+def test_claude_json_parsing():
+    sample = ('{"type":"result","subtype":"success","is_error":false,'
+              '"result":"PONG","session_id":"abc-123"}')
+    resp, sid = backends._parse_claude_json(sample, None)
+    check("claude: parses result", resp == "PONG", repr(resp))
+    check("claude: parses session_id", sid == "abc-123", repr(sid))
+    # error payload
+    err = '{"type":"result","is_error":true,"result":"rate limit hit","session_id":"x"}'
+    r2, s2 = backends._parse_claude_json(err, None)
+    check("claude: error payload surfaces text", "rate limit" in r2.lower(), repr(r2))
+    # non-JSON fallback keeps prior conv id and returns text
+    r3, s3 = backends._parse_claude_json("just text, not json", "prev-id")
+    check("claude: non-json fallback", "just text" in r3 and s3 == "prev-id")
+    # empty
+    r4, _ = backends._parse_claude_json("", None)
+    check("claude: empty -> message", "No response" in r4)
+
+
+def test_model_catalog_per_backend():
+    orig = config.get_backend
+    try:
+        config.get_backend = lambda: "claude"
+        cat = config.model_catalog()
+        vals = [v for _, v in cat]
+        check("catalog: claude has opus/sonnet/haiku",
+              vals == ["opus", "sonnet", "haiku"], str(vals))
+        config.get_backend = lambda: "agy"
+        check("catalog: agy has 15 gemini combos", len(config.model_catalog()) == 15)
+    finally:
+        config.get_backend = orig
+
+
+def test_platform_compat_lock():
+    check("pc: running on Windows in this test env", pc.IS_WINDOWS is True)
+    lockp = os.path.join(_tmpdir, f"lock_{os.urandom(3).hex()}.lock")
+    h1 = pc.acquire_instance_lock(lockp)
+    check("pc: first lock acquired", h1 is not None)
+    h2 = pc.acquire_instance_lock(lockp)
+    check("pc: second lock refused (single instance)", h2 is None)
+    pc.acquire_instance_lock  # noqa
+    pc.release_instance_lock(h1, lockp)
+    h3 = pc.acquire_instance_lock(lockp)
+    check("pc: lock reacquired after release", h3 is not None)
+    pc.release_instance_lock(h3, lockp)
+
+
+def test_platform_compat_imports_clean():
+    # PtyProcess class exists and window-hiding is a safe no-op to call.
+    check("pc: PtyProcess present", hasattr(pc, "PtyProcess"))
+    try:
+        pc.apply_window_hiding()
+        check("pc: apply_window_hiding callable", True)
+    except Exception as e:
+        check("pc: apply_window_hiding callable", False, repr(e))
+
+
+# ════════════════════════════════════════════════════════════
 
 def main():
     tests = [
@@ -462,6 +526,10 @@ def main():
         test_parse_schedule_forms,
         test_parse_schedule_command_forms,
         test_detect_limit,
+        test_claude_json_parsing,
+        test_model_catalog_per_backend,
+        test_platform_compat_lock,
+        test_platform_compat_imports_clean,
     ]
     print("Running zilla fix tests...\n")
     for t in tests:

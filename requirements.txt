@@ -1,4 +1,5 @@
 python-telegram-bot==22.7
 SpeechRecognition==3.16.1
 pydub==0.25.1
-pywinpty
+# Windows needs winpty (ConPTY) for the agy backend; Unix uses the stdlib `pty`.
+pywinpty; sys_platform == "win32"

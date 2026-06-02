@@ -1,0 +1,6 @@
+# Shell scripts MUST use LF so they run on macOS/Linux (CRLF breaks the shebang).
+*.sh        text eol=lf
+*.command   text eol=lf
+# Cross-platform Python entrypoints launched on Unix — keep LF to be safe.
+run_background.py text eol=lf
+install.py        text eol=lf

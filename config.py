@@ -36,12 +36,57 @@ if os.path.exists(_env_path):
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OWNER_CHAT_ID = int(os.getenv("TELEGRAM_OWNER_ID", "0") or "0")
 
-# --- CLI Backend ---
-CLI_PATH = os.getenv(
-    "CLI_PATH",
-    os.path.join(HOME_DIR, "AppData", "Local", "agy", "bin", "agy.exe"),
+# --- Backend selection -------------------------------------
+# Which AI CLI powers the bot:
+#   agy    — the antigravity CLI (Gemini models)   [default]
+#   claude — Claude Code (Opus / Sonnet / Haiku)
+#
+# >>> TO SWITCH BACKEND: set BACKEND=claude (or agy) in your .env, or change
+#     it from Telegram → /settings, then restart the bot. <<<
+BACKEND = os.getenv("BACKEND", "agy").strip().lower()
+
+
+def get_backend() -> str:
+    """Active backend: 'agy' or 'claude' (live from settings, falling back to .env)."""
+    return (get_setting("backend", None) or BACKEND or "agy").strip().lower()
+
+
+def set_backend(name: str):
+    set_setting("backend", name.strip().lower())
+
+
+import shutil as _shutil  # noqa: E402
+
+
+def _find_exe(name: str, *candidates: str) -> str:
+    """First of: PATH lookup, then any candidate that exists, else the
+    platform-appropriate default (so .env can still override)."""
+    found = _shutil.which(name)
+    if found:
+        return found
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return candidates[0] if candidates else name
+
+
+_IS_WIN = sys.platform == "win32"
+
+# --- agy CLI (default backend) ---
+CLI_PATH = os.getenv("CLI_PATH") or _find_exe(
+    "agy",
+    os.path.join(HOME_DIR, "AppData", "Local", "agy", "bin", "agy.exe") if _IS_WIN
+    else os.path.join(HOME_DIR, ".local", "bin", "agy"),
 )
 CLI_WORKING_DIR = os.getenv("CLI_WORKING_DIR", HOME_DIR)
+
+# --- Claude Code CLI (alternate backend) ---
+# >>> To point at a different claude binary, set CLAUDE_PATH in .env. <<<
+CLAUDE_PATH = os.getenv("CLAUDE_PATH") or _find_exe(
+    "claude",
+    os.path.join(HOME_DIR, ".local", "bin", "claude.exe") if _IS_WIN
+    else os.path.join(HOME_DIR, ".local", "bin", "claude"),
+)
 
 # --- Idle reaper: kill CLI only after this many seconds of silence ---
 # "Silence" = no PTY bytes AND no new transcript step.
@@ -78,10 +123,11 @@ OUTBOX_DIR = os.path.join(AGI_BRAIN_DIR, "Outbox")
 OUTBOX_DOCUMENTS = os.path.join(OUTBOX_DIR, "documents")
 OUTBOX_IMAGES = os.path.join(OUTBOX_DIR, "images")
 
-# --- Portable ffmpeg ---
-FFMPEG_PATH = os.getenv(
-    "FFMPEG_PATH",
-    os.path.join(AGI_BRAIN_DIR, "Tools", "ffmpeg", "ffmpeg.exe"),
+# --- ffmpeg (voice-note transcription) ---
+# Windows: bundled copy under AGI-Brain\Tools. Unix: system ffmpeg (brew/apt).
+FFMPEG_PATH = os.getenv("FFMPEG_PATH") or _find_exe(
+    "ffmpeg",
+    os.path.join(AGI_BRAIN_DIR, "Tools", "ffmpeg", "ffmpeg.exe") if _IS_WIN else "ffmpeg",
 )
 
 # --- Skills ---
@@ -125,7 +171,7 @@ TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_MAX_SEND_FILE = 50 * 1024 * 1024  # 50 MB
 
 # --- Bot ---
-BOT_VERSION = "3.0.0"
+BOT_VERSION = "4.0.0"
 
 
 # ── Settings (simple JSON dict) ───────────────────────────
@@ -220,12 +266,38 @@ def _read_agy_settings() -> dict:
     return _agy_cache
 
 
+# Claude Code models (aliases accepted by `claude --model`).
+CLAUDE_MODELS = [
+    ("Opus", "opus"),
+    ("Sonnet", "sonnet"),
+    ("Haiku", "haiku"),
+]
+_CLAUDE_MODEL_FALLBACK = "sonnet"
+
+
 def get_model() -> str:
-    """The model agy will actually use — read (cached) from agy's own settings."""
+    """Active model for the CURRENT backend.
+    - agy:    read (cached) from agy's own settings.json.
+    - claude: stored in the bot's settings ('claude_model'), passed via --model.
+    """
+    if get_backend() == "claude":
+        return get_setting("claude_model", _CLAUDE_MODEL_FALLBACK)
     return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
 
 
-def set_model(model_name: str) -> str:
+def model_catalog() -> list[tuple[str, str]]:
+    """(button_label, value) pairs for the current backend's model picker."""
+    if get_backend() == "claude":
+        return [(label, val) for label, val in CLAUDE_MODELS]
+    # agy: 5 Gemini families × Low/Med/High thinking levels
+    out = []
+    for tag, base in AGY_MODELS:
+        for eff in AGY_EFFORTS:
+            out.append((f"{tag}·{eff[:3]}", model_display(base, eff)))
+    return out
+
+
+def _agy_set_model(model_name: str) -> str:
     """
     Write the model into agy's real settings file (atomically, preserving every
     other key) and return the value as it is now stored — so callers can show
@@ -247,7 +319,15 @@ def set_model(model_name: str) -> str:
     global _agy_cache_mtime
     _agy_cache_mtime = -1.0  # force re-read on the next get_model()
     # Read back from disk: this is the source of truth the CLI will load.
-    return get_model()
+    return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
+
+
+def set_model(model_name: str) -> str:
+    """Set the active model for the CURRENT backend; return the stored value."""
+    if get_backend() == "claude":
+        set_setting("claude_model", model_name)
+        return model_name
+    return _agy_set_model(model_name)
 
 
 def get_idle_kill_after() -> int:

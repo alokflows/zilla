@@ -4,7 +4,35 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## ⏰ v2.6.0 — Schedules, model-limit recovery, faster & leaner *(latest)*
+## 🌍 v4.0.0 — Cross-platform + pluggable backends + one-click installer *(latest)*
+
+The "install anywhere, run on any AI" release.
+
+### 🧠 Pluggable backends — agy **or** Claude Code
+- The bot now runs on **either** the antigravity `agy` CLI (Gemini) **or** **Claude Code** (Opus/Sonnet/Haiku).
+- Switch live from **/settings → 🧠 Backend**, or set `BACKEND=claude` in `.env`.
+- Claude Code uses `claude -p --output-format json` (clean answer + session id, memory via `--resume`) — verified end-to-end. The model picker adapts per backend; ✏️ Custom still works.
+- `backends.py` is heavily commented on how to switch/add a backend.
+
+### 🌍 Cross-platform (Windows / macOS / Linux)
+- New `platform_compat.py` isolates every OS-specific bit: single-instance lock (`msvcrt`↔`fcntl`), window-hiding (Windows-only), and a PTY abstraction (winpty on Windows, stdlib `pty` on Unix). Everything else is platform-agnostic.
+- Windows is fully tested; macOS/Linux paths are implemented and validated by the installer's `--doctor` self-check on the target machine.
+
+### 🚀 One-click installer
+- **`install.bat`** (Windows), **`install.command`** (macOS), **`install.sh`** (Linux) → run `install.py`: installs dependencies, asks backend + bot token + your Telegram ID + autostart, reminds you to log into your CLI, writes `.env`, sets up per-OS auto-start, and starts the bot.
+- **`python install.py --doctor`** checks Python, deps, your CLI + login, token, and ID.
+- Cross-platform background supervisor (`run_background.py`) + `start.sh`/`stop.sh` for Unix.
+
+### 📖 Docs
+- Full **README** rewrite: beginner-proof, OS-by-OS, both backends, switching, sharing to a friend's PC, troubleshooting, security.
+
+### Notes
+- `pywinpty` is now Windows-only in `requirements.txt` (Unix uses the stdlib `pty`).
+- v3.0.0 is tagged as the pre-refactor restore point.
+
+---
+
+## ⏰ v2.6.0 — Schedules, model-limit recovery, faster & leaner
 
 ### ⏰ Scheduling engine (the big one)
 - Register unlimited recurring jobs that run automatically and DM you the result. Kinds: **once**, **every N minutes/hours**, **daily at HH:MM**, **weekly on chosen days**.
