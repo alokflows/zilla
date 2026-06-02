@@ -218,9 +218,26 @@ def start_bot():
         bad(f"Couldn't start automatically: {e}")
 
 
+def _arg(name: str):
+    """Read --name=value or --name value from argv (for non-interactive/AI setup)."""
+    for i, a in enumerate(sys.argv):
+        if a == name and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
 def main():
     if "--doctor" in sys.argv:
         sys.exit(doctor())
+
+    # Non-interactive flags (used by the AI setup file and any script):
+    #   --token <T> --owner <ID> [--backend agy|claude] [--no-autostart] [--no-start]
+    arg_token = _arg("--token")
+    arg_owner = _arg("--owner")
+    arg_backend = (_arg("--backend") or "").strip().lower()
+    non_interactive = bool(arg_token and arg_owner)
 
     hr(); print("  Zilla installer"); hr()
     if sys.version_info < (3, 10):
@@ -231,12 +248,16 @@ def main():
     pip_install()
 
     env = read_env()
-    print()
-    print("  Which AI backend should power the bot?")
-    print("    1) agy     — antigravity CLI (Gemini)")
-    print("    2) claude  — Claude Code (Opus/Sonnet/Haiku)")
-    choice = ask("  Enter 1 or 2", "1" if (env.get("BACKEND", "agy") == "agy") else "2")
-    backend = "claude" if choice.strip() == "2" else "agy"
+
+    if non_interactive:
+        backend = arg_backend if arg_backend in ("agy", "claude") else env.get("BACKEND", "agy")
+    else:
+        print()
+        print("  Which AI backend should power the bot?")
+        print("    1) agy     — antigravity CLI (Gemini)")
+        print("    2) claude  — Claude Code (Opus/Sonnet/Haiku)")
+        choice = ask("  Enter 1 or 2", "1" if (env.get("BACKEND", "agy") == "agy") else "2")
+        backend = "claude" if choice.strip() == "2" else "agy"
 
     cli = "claude" if backend == "claude" else "agy"
     cli_path = find_cli(cli)
@@ -248,10 +269,14 @@ def main():
         bad(f"{cli} is not installed / not on PATH.")
         info(f"Install {cli}, run it once to log in, then re-run this installer.")
 
-    print()
-    token = ask("  Paste your bot token from @BotFather", env.get("TELEGRAM_BOT_TOKEN", ""))
-    owner = ask("  Paste your Telegram numeric ID from @userinfobot", env.get("TELEGRAM_OWNER_ID", ""))
-    auto = ask("  Start automatically every time you log in? (y/n)", "y").lower().startswith("y")
+    if non_interactive:
+        token, owner = arg_token, arg_owner
+        auto = "--no-autostart" not in sys.argv
+    else:
+        print()
+        token = ask("  Paste your bot token from @BotFather", env.get("TELEGRAM_BOT_TOKEN", ""))
+        owner = ask("  Paste your Telegram numeric ID from @userinfobot", env.get("TELEGRAM_OWNER_ID", ""))
+        auto = ask("  Start automatically every time you log in? (y/n)", "y").lower().startswith("y")
 
     vals = {"TELEGRAM_BOT_TOKEN": token, "TELEGRAM_OWNER_ID": owner, "BACKEND": backend}
     if cli_path:
@@ -260,7 +285,8 @@ def main():
 
     if auto:
         setup_autostart()
-    start_bot()
+    if "--no-start" not in sys.argv:
+        start_bot()
 
     hr()
     print("  Done! In Telegram, message your bot and send /menu.")
