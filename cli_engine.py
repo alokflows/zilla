@@ -606,12 +606,10 @@ def run_cli(
 
     try:
         custom_env = os.environ.copy()
-        model_id = get_selected_model()
-        if model_id:
-            custom_env["ANTIGRAVITY_MODEL"] = model_id
-            custom_env["GEMINI_API_MODEL"] = model_id
-            custom_env["MODEL"] = model_id
-            logger.info(f"[ENGINE] Model: {model_id}")
+        # The model is NOT passed via env or flag — agy reads it from its own
+        # settings.json (config.set_model writes it there). We only log what the
+        # CLI will load, for traceability.
+        logger.info(f"[ENGINE] Model (from agy settings): {get_selected_model()}")
 
         env_str = '\0'.join(f'{k}={v}' for k, v in custom_env.items()) + '\0\0'
         pty = winpty.PTY(200, 1000, backend=CONPTY_BACKEND, agent_config=COLOR_ESCAPES)

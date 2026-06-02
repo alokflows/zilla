@@ -63,6 +63,7 @@ from config import (
     AGI_BRAIN_DIR, HOME_DIR, ensure_dirs, KIMI_BRIDGE_URL,
     get_model, set_model, get_idle_kill_after, get_setting, set_setting,
     OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES, BRAIN_DIR,
+    AGY_MODELS, AGY_EFFORTS, model_display,
 )
 from sessions import SessionManager
 from cli_engine import run_cli_async, get_latest_step
@@ -344,10 +345,14 @@ def kb_sessions(all_sessions: dict, active: str):
     for name, info in all_sessions.items():
         marker = " ◀" if name == active else ""
         msgs = info.get("messages", 0)
-        buttons.append([InlineKeyboardButton(
-            f"{name}{marker} ({msgs} msgs)",
-            callback_data=f"sess_switch_{name}",
-        )])
+        # Switch on the left, delete (🗑) on the right of the same row.
+        buttons.append([
+            InlineKeyboardButton(
+                f"{name}{marker} ({msgs} msgs)",
+                callback_data=f"sess_switch_{name}",
+            ),
+            InlineKeyboardButton("🗑", callback_data=f"sess_delete_{name}"),
+        ])
     buttons.append([
         InlineKeyboardButton("➕ New", callback_data="sess_new"),
         InlineKeyboardButton("◀ Menu", callback_data="menu_back"),
@@ -363,20 +368,19 @@ def kb_session_delete(name: str):
 
 
 def kb_model(current: str):
-    models = [
-        ("Gemini 2.5 Pro", "gemini-2.5-pro"),
-        ("Gemini 2.5 Flash", "gemini-2.5-flash"),
-        ("Gemini 2.0 Flash", "gemini-2.0-flash"),
-        ("Gemini 3.1 Pro", "gemini-3.1-pro"),
-        ("Claude Sonnet 4", "claude-sonnet-4"),
-        ("Claude Opus 4", "claude-opus-4"),
-    ]
+    """One row per model, three effort buttons each; ✓ marks the live value."""
     buttons = []
-    for display, model_id in models:
-        marker = " ✓" if model_id == current else ""
-        buttons.append([InlineKeyboardButton(
-            f"{display}{marker}", callback_data=f"model_{model_id}",
-        )])
+    for tag, base in AGY_MODELS:
+        row = []
+        for effort in AGY_EFFORTS:
+            full = model_display(base, effort)
+            mark = "✓ " if full == current else ""
+            short = effort[:3]  # Low / Med / Hig
+            row.append(InlineKeyboardButton(
+                f"{mark}{tag}·{short}", callback_data=f"model_{full}",
+            ))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("✏️ Custom…", callback_data="model_custom")])
     buttons.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
 
@@ -553,6 +557,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if context.user_data.pop("awaiting_custom_model", None):
+        await update.message.reply_text("Custom model entry cancelled.")
+        return
     cancel_ev = _active_cancel.get(chat_id)
     if cancel_ev and not cancel_ev.is_set():
         cancel_ev.set()
@@ -1118,6 +1125,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_adduser_flow(update, context, context.user_data["adduser_flow"])
         return
 
+    # Custom-model capture intercept (admin only — the button is admin-gated)
+    if context.user_data.get("awaiting_custom_model"):
+        context.user_data.pop("awaiting_custom_model", None)
+        chosen = (update.message.text or "").strip()
+        if not chosen or chosen.startswith("/"):
+            await update.message.reply_text("Custom model cancelled.")
+            return
+        stored = set_model(chosen)
+        ok = stored == chosen
+        head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
+        await update.message.reply_text(
+            f"{head}\nagy will now use: {stored}\n"
+            f"(read back from agy's own settings.json)"
+        )
+        return
+
     user_message = update.message.text
     logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 
@@ -1268,7 +1291,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("sess_switch_"):
             name = data.removeprefix("sess_switch_")
             sessions.set_active_name(name, uid)
-            await query.edit_message_text(f"✅ Switched to [{name}].")
+            active = sessions.get_active_name(uid)
+            await query.edit_message_text(
+                f"✅ Switched to [{name}].",
+                reply_markup=kb_sessions(sessions.list_sessions(uid), active),
+            )
 
         elif data.startswith("sess_delete_"):
             name = data.removeprefix("sess_delete_")
@@ -1279,9 +1306,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("sess_confirm_del_"):
             name = data.removeprefix("sess_confirm_del_")
-            sessions.delete_session(name, uid)
+            removed = sessions.delete_session(name, uid)
+            active = sessions.get_active_name(uid)
+            head = f"🗑️ [{name}] deleted." if removed else f"[{name}] not found."
             await query.edit_message_text(
-                f"🗑️ [{name}] deleted.\nActive: [{sessions.get_active_name(uid)}]"
+                f"{head}\nActive: [{active}]",
+                reply_markup=kb_sessions(sessions.list_sessions(uid), active),
             )
 
         elif data == "sess_new":
@@ -1293,17 +1323,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
                 i += 1
             sessions.create_session(name, uid)
-            await query.edit_message_text(f"📁 Session [{name}] created.")
+            active = sessions.get_active_name(uid)
+            await query.edit_message_text(
+                f"📁 Session [{name}] created — next message starts fresh.",
+                reply_markup=kb_sessions(sessions.list_sessions(uid), active),
+            )
 
         # ── Model ──
+        elif data == "model_custom":
+            if not auth.can(uid, "admin"):
+                await query.answer("Admin access required.", show_alert=True)
+                return
+            context.user_data["awaiting_custom_model"] = True
+            await query.edit_message_text(
+                "✏️ Send the exact model string as it appears in agy's own "
+                "\"Switch Model\" screen,\ne.g. <code>Gemini 3.1 Pro (High)</code>\n\n"
+                "Send /cancel to abort.",
+                parse_mode="HTML",
+            )
+
         elif data.startswith("model_"):
             if not auth.can(uid, "admin"):
                 await query.answer("Admin access required.", show_alert=True)
                 return
-            model_id = data.removeprefix("model_")
-            set_model(model_id)
+            chosen = data.removeprefix("model_")
+            # set_model writes agy's real settings.json and returns the value as
+            # actually persisted on disk — what the CLI will load on next run.
+            stored = set_model(chosen)
+            ok = stored == chosen
+            head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
             await query.edit_message_text(
-                f"✅ Model: {model_id}\n\nNext message will use this model."
+                f"{head}\n════════════════\n"
+                f"agy will now use: <b>{stored}</b>\n"
+                f"(read back from agy's own settings.json)\n\n"
+                f"Takes effect on your next message.",
+                parse_mode="HTML",
+                reply_markup=kb_model(stored),
             )
 
         # ── Settings ──

@@ -4,7 +4,26 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🛡️ v2.3.0 — No-admin background runner *(latest)*
+## 🤖 v2.4.0 — Model switching that's actually real + session delete *(latest)*
+
+### 🐛 The model switcher was lying
+- **Changing the model never did anything.** The bot stored your pick in its *own* `settings.json` and exported three guessed environment variables (`ANTIGRAVITY_MODEL`, `GEMINI_API_MODEL`, `MODEL`) — **agy reads none of them**, and has no `--model` flag at all. So every "✅ Model changed" was false.
+- **Now it writes the file agy actually reads:** `~/.gemini/antigravity-cli/settings.json` → `"model"`, using agy's own display format (`Gemini 3.1 Pro (High)`), preserving all other keys.
+- **No more guessing — it reads back the truth.** After you pick a model the bot re-reads agy's file and shows the value that's *actually on disk*, so the confirmation can't lie.
+- **Real model list** (built from agy's own internal model keys) with **Low / Medium / High** thinking levels: Gemini 3.1 Pro, 3 Flash, 2.5 Pro, 2.5 Flash, 3.1 Flash Lite.
+- **✏️ Custom…** option — paste the exact string from agy's own "Switch Model" screen if you want something not listed.
+
+### 🗑️ Session delete button
+- Every session in the list now has a **🗑 delete** button (with a confirm step). Previously the delete code existed but **no button ever triggered it** — you could only `/end` the active one.
+- Switching, creating and deleting now refresh the list in place.
+
+### ✅ Tested
+- New `test_fixes.py` — 25 deterministic checks: model round-trips to agy's real file, other keys preserved, fallback on missing file, catalog format, and full session CRUD (create-is-fresh, switch isolation, per-user isolation, delete, disk persistence).
+- Live end-to-end run confirmed: setting a model writes agy's file, agy loads it, a real turn runs and replies.
+
+---
+
+## 🛡️ v2.3.0 — No-admin background runner
 
 - **New background method that needs no admin rights and no `.vbs`** (the old `.vbs` launchers failed on locked-down/corporate PCs).
 - A tiny hidden Python **supervisor** (`run_background.pyw`, launched via `pythonw` = no window) runs the bot and **restarts it within ~10s** if it crashes.

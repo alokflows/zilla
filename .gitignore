@@ -22,6 +22,7 @@ zilla.stop
 
 # CLI working data created in the bot folder
 .antigravitycli/
+cache/
 
 # Build artifacts
 build/

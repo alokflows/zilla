@@ -58,6 +58,16 @@ BRAIN_DIR = os.getenv(
     os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "brain"),
 )
 
+# --- agy's OWN settings file (where the model REALLY lives) ---
+# The agy CLI reads its active model from here, under the "model" key, as a
+# display string like "Gemini 3.1 Pro (High)". This is the ONLY thing that
+# actually changes the model — there is no --model flag and no env var the CLI
+# honours. The bot must read/write THIS file, not its own settings.json.
+AGY_SETTINGS_FILE = os.getenv(
+    "AGY_SETTINGS_FILE",
+    os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "settings.json"),
+)
+
 # --- AGI Brain (Inbox / Outbox on disk) ---
 AGI_BRAIN_DIR = os.path.join(HOME_DIR, "AGI-Brain")
 INBOX_DIR = os.path.join(AGI_BRAIN_DIR, "Inbox")
@@ -114,7 +124,7 @@ TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_MAX_SEND_FILE = 50 * 1024 * 1024  # 50 MB
 
 # --- Bot ---
-BOT_VERSION = "2.2"
+BOT_VERSION = "2.4"
 
 
 # ── Settings (simple JSON dict) ───────────────────────────
@@ -156,12 +166,71 @@ def set_setting(key: str, value):
     _save_settings(data)
 
 
+# ── Model: read/write agy's REAL settings file ────────────
+#
+# agy stores the active model in AGY_SETTINGS_FILE under "model" as a display
+# string ("Gemini 3.1 Pro (High)"). We read/write THAT file so a model change
+# actually takes effect. We never touch the other keys agy keeps there
+# (toolPermission, trustedWorkspaces, ...).
+
+_AGY_MODEL_FALLBACK = "Gemini 3.1 Pro (High)"
+
+# Real agy models. Base names are exactly the display strings agy builds from
+# its own internal model keys (Gemini31Pro, Gemini3Flash, Gemini25Pro,
+# Gemini25Flash, Gemini31FlashLite). The effort suffix uses agy's "%s (%s)"
+# format with its Low/Medium/High thinking levels. The full display string
+# (e.g. "Gemini 3.1 Pro (High)") is written verbatim into agy's settings.json.
+# Edit here if agy adds or renames a model.
+AGY_MODELS = [
+    ("3.1 Pro", "Gemini 3.1 Pro"),
+    ("3 Flash", "Gemini 3 Flash"),
+    ("2.5 Pro", "Gemini 2.5 Pro"),
+    ("2.5 Flash", "Gemini 2.5 Flash"),
+    ("3.1 Lite", "Gemini 3.1 Flash Lite"),
+]
+AGY_EFFORTS = ["Low", "Medium", "High"]
+
+
+def model_display(base: str, effort: str) -> str:
+    """The exact string agy stores: 'Gemini 3.1 Pro (High)'."""
+    return f"{base} ({effort})"
+
+
+def _read_agy_settings() -> dict:
+    try:
+        with open(AGY_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
 def get_model() -> str:
-    return get_setting("model", "gemini-2.5-pro")
+    """The model agy will actually use — read live from agy's own settings."""
+    return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
 
 
-def set_model(model_id: str):
-    set_setting("model", model_id)
+def set_model(model_name: str) -> str:
+    """
+    Write the model into agy's real settings file (atomically, preserving every
+    other key) and return the value as it is now stored — so callers can show
+    the user the *actual* persisted value, not a hopeful echo.
+    """
+    data = _read_agy_settings()
+    data["model"] = model_name
+    try:
+        os.makedirs(os.path.dirname(AGY_SETTINGS_FILE), exist_ok=True)
+        tmp = f"{AGY_SETTINGS_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, AGY_SETTINGS_FILE)
+    except OSError as e:
+        logger.error(f"[CONFIG] Failed to write agy model: {e}")
+        return get_model()
+    # Read back from disk: this is the source of truth the CLI will load.
+    return get_model()
 
 
 def get_idle_kill_after() -> int:
