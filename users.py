@@ -163,17 +163,6 @@ class AuthManager:
         logger.info(f"[USERS] Removed and denied {user_id}")
         return True
 
-    def set_role(self, user_id: int, role: str) -> bool:
-        if role not in ("user", "admin"):
-            return False
-        with self._lock:
-            if user_id not in self._users:
-                return False
-            self._users[user_id]["role"] = role
-            self._save()
-        logger.info(f"[USERS] Role of {user_id} → {role}")
-        return True
-
     def list_users(self) -> dict[int, dict]:
         return dict(self._users)
 

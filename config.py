@@ -94,6 +94,7 @@ KIMI_BRIDGE_URL = os.getenv("KIMI_BRIDGE_URL", "http://127.0.0.1:10086")
 SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
+SCHEDULES_FILE = os.path.join(BASE_DIR, "schedules.json")
 
 # ┌─────────────────────────────────────────────────────────┐
 # │  USER MANAGEMENT                                        │
@@ -124,7 +125,7 @@ TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_MAX_SEND_FILE = 50 * 1024 * 1024  # 50 MB
 
 # --- Bot ---
-BOT_VERSION = "2.5"
+BOT_VERSION = "2.6"
 
 
 # ── Settings (simple JSON dict) ───────────────────────────
@@ -196,17 +197,31 @@ def model_display(base: str, effort: str) -> str:
     return f"{base} ({effort})"
 
 
+# mtime-gated cache so get_model() doesn't hit disk on every call.
+_agy_cache: dict | None = None
+_agy_cache_mtime: float = -1.0
+
+
 def _read_agy_settings() -> dict:
+    global _agy_cache, _agy_cache_mtime
+    try:
+        mtime = os.path.getmtime(AGY_SETTINGS_FILE)
+    except OSError:
+        mtime = -1.0
+    if _agy_cache is not None and mtime == _agy_cache_mtime:
+        return _agy_cache
     try:
         with open(AGY_SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            _agy_cache = data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+        _agy_cache = {}
+    _agy_cache_mtime = mtime
+    return _agy_cache
 
 
 def get_model() -> str:
-    """The model agy will actually use — read live from agy's own settings."""
+    """The model agy will actually use — read (cached) from agy's own settings."""
     return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
 
 
@@ -229,6 +244,8 @@ def set_model(model_name: str) -> str:
     except OSError as e:
         logger.error(f"[CONFIG] Failed to write agy model: {e}")
         return get_model()
+    global _agy_cache_mtime
+    _agy_cache_mtime = -1.0  # force re-read on the next get_model()
     # Read back from disk: this is the source of truth the CLI will load.
     return get_model()
 

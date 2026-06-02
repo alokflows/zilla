@@ -66,10 +66,10 @@ from config import (
     AGI_BRAIN_DIR, HOME_DIR, ensure_dirs, KIMI_BRIDGE_URL,
     get_model, set_model, get_idle_kill_after, get_setting, set_setting,
     OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES, BRAIN_DIR,
-    AGY_MODELS, AGY_EFFORTS, model_display,
+    AGY_MODELS, AGY_EFFORTS, model_display, SCHEDULES_FILE,
 )
 from sessions import SessionManager
-from cli_engine import run_cli_async, get_latest_step
+from cli_engine import run_cli_async, get_latest_step, detect_limit
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
@@ -77,6 +77,8 @@ from media import (
 )
 from formatter import format_for_telegram, detect_file_paths
 from users import AuthManager
+from schedules import ScheduleManager, describe as describe_schedule
+from schedule_parse import parse_schedule, parse_schedule_command
 
 # ── Logging ────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -105,6 +107,7 @@ BOT_START_TIME = time.time()
 # ── Global State ───────────────────────────────────────────
 sessions: SessionManager = None
 auth: AuthManager = None
+schedules_mgr: ScheduleManager = None
 
 # Per-chat cancel events — set to cancel the active CLI request for that chat
 _active_cancel: dict[int, threading.Event] = {}
@@ -417,6 +420,12 @@ def kb_settings(uid: int = 0):
             f"⏱️ Idle reaper: {_idle_label(idle_kill)}",
             callback_data="set_cycle_idle",
         )])
+    if auth and auth.can(uid, "admin"):
+        catchup = get_setting("schedule_catchup", True)
+        rows.append([InlineKeyboardButton(
+            f"⏰ Catch up missed schedules: {'ON' if catchup else 'OFF'}",
+            callback_data="set_toggle_catchup",
+        )])
     if auth and auth.is_owner(uid):
         admins_model = get_setting("admins_can_change_model", True)
         rows.append([InlineKeyboardButton(
@@ -512,6 +521,51 @@ def kb_inbox_list(category: str, items: list, offset: int):
     return InlineKeyboardMarkup(rows)
 
 
+# ── Schedules ─────────────────────────────────────────────
+
+def _fmt_next(ts) -> str:
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(ts).strftime("%a %d %b %H:%M")
+
+
+def kb_schedules(items: list):
+    """Row per schedule: [▶ toggle/title · next] then [▶️ run | 🗑] underneath."""
+    rows = []
+    for s in items:
+        state = "✅" if s.get("enabled") else "⏸"
+        title = s.get("title", "")[:24]
+        rows.append([InlineKeyboardButton(
+            f"{state} {title} · {_fmt_next(s.get('next_run'))}",
+            callback_data=f"sched_toggle_{s['id']}",
+        )])
+        rows.append([
+            InlineKeyboardButton("▶️ Run now", callback_data=f"sched_run_{s['id']}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"sched_del_{s['id']}"),
+        ])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _schedule_panel_text(items: list) -> str:
+    if not items:
+        return ("⏰ Schedules\n═══════════\n\n"
+                "No schedules yet.\n\n"
+                "Add one with:\n"
+                "  /schedule daily 09:00 <task>\n"
+                "  /schedule every 5h <task>\n"
+                "  /schedule once 2026-06-10 18:30 <task>\n"
+                "  /schedule mon,wed,fri 09:00 <task>\n\n"
+                "Or just say it: “every day at 9am summarise my inbox”.")
+    lines = [f"⏰ Schedules ({len(items)})\n═══════════"]
+    for s in items:
+        state = "✅" if s.get("enabled") else "⏸"
+        lines.append(f"{state} {s.get('title','')[:40]}")
+        lines.append(f"    {describe_schedule(s['kind'], s['spec'])} · next {_fmt_next(s.get('next_run'))}")
+    lines.append("\nTap a row to pause/resume.")
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════
 #  RESPONSE PIPELINE
 # ══════════════════════════════════════════════════════════
@@ -521,6 +575,25 @@ async def send_response(update, context, response: str, user_id: int, chat_id: i
     chunks = split_message(formatted_text)
     for chunk in chunks:
         await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
+
+    # Model rate-limited? Tell the user which model is blocked and let them
+    # switch right here (only if they're allowed to change the model).
+    reason = detect_limit(response)
+    if reason and _can_change_model(user_id):
+        current = get_model()
+        await safe_send(
+            context.bot, chat_id,
+            f"⚠️ <b>{current}</b> looks blocked ({reason}).\n"
+            f"Pick another model below, then resend your message:",
+            parse_mode="HTML",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text="🤖 Switch model:",
+                reply_markup=kb_model(current),
+            )
+        except Exception:
+            pass
 
     # Auto-deliver files mentioned in response (admin+ only)
     if auth.can(user_id, "admin"):
@@ -739,6 +812,125 @@ async def cmd_brain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ══════════════════════════════════════════════════════════
+#  SCHEDULES
+# ══════════════════════════════════════════════════════════
+
+def _kb_confirm_schedule():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Create", callback_data="sched_confirm"),
+         InlineKeyboardButton("❌ Cancel", callback_data="sched_cancel")],
+    ])
+
+
+async def _offer_schedule(update, context, parsed: dict):
+    """Stash a parsed schedule and ask the user to confirm creating it."""
+    context.user_data["pending_schedule"] = parsed
+    await update.effective_message.reply_text(
+        "📅 Create this schedule?\n"
+        f"  • {describe_schedule(parsed['kind'], parsed['spec'])}\n"
+        f"  • Task: {parsed['title']}",
+        reply_markup=_kb_confirm_schedule(),
+    )
+
+
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not auth.can(uid, "admin"):
+        await update.message.reply_text("Schedules require admin access.")
+        return
+    if context.args:
+        parsed = parse_schedule_command(" ".join(context.args))
+        if parsed:
+            await _offer_schedule(update, context, parsed)
+        else:
+            await update.message.reply_text(
+                "Couldn't read that schedule. Examples:\n"
+                "  /schedule daily 09:00 summarise my inbox\n"
+                "  /schedule every 5h check the news\n"
+                "  /schedule once 2026-06-10 18:30 wish happy birthday\n"
+                "  /schedule mon,wed,fri 09:00 stand-up notes"
+            )
+        return
+    items = schedules_mgr.list(uid)
+    await update.message.reply_text(
+        _schedule_panel_text(items),
+        reply_markup=kb_schedules(items) if items else kb_back(),
+    )
+
+
+def _make_schedule(uid: int, chat_id: int, parsed: dict):
+    return schedules_mgr.add(
+        user_id=uid, chat_id=chat_id, prompt=parsed["prompt"],
+        kind=parsed["kind"], spec=parsed["spec"], title=parsed["title"],
+    )
+
+
+# ── Scheduler runtime (custom asyncio loop; no APScheduler dependency) ──
+
+_SCHED_TICK = 20  # seconds between due-checks
+
+
+async def _run_scheduled(application, s: dict):
+    """Run one schedule's prompt through agy and DM the result."""
+    uid = s["user_id"]
+    chat_id = s["chat_id"]
+    bot = application.bot
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        pass
+    try:
+        async with _get_user_lock(uid):
+            conv_id = None
+            sname = s.get("session_name")
+            if sname:
+                conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+            response, detected = await run_cli_async(
+                s["prompt"], conv_id, skip_permissions=auth.can(uid, "admin"),
+            )
+            if sname and detected and detected != conv_id:
+                sessions.set_conversation_id(detected, user_id=uid, session_name=sname)
+    except Exception as e:
+        response = f"Error: {e}"
+        logger.error(f"[SCHED] run {s['id']} failed: {e}", exc_info=True)
+
+    header = f"⏰ Scheduled — {s.get('title','')}\n"
+    try:
+        formatted, parse_mode = format_for_telegram(response or "(no output)")
+        for chunk in split_message(header + formatted):
+            await safe_send(bot, chat_id, chunk, parse_mode=parse_mode)
+        reason = detect_limit(response or "")
+        if reason and _can_change_model(uid):
+            await safe_send(bot, chat_id,
+                            f"⚠️ <b>{get_model()}</b> looks blocked ({reason}). Switch model:",
+                            parse_mode="HTML")
+            await bot.send_message(chat_id=chat_id, text="🤖 Switch model:",
+                                   reply_markup=kb_model(get_model()))
+    except Exception as e:
+        logger.error(f"[SCHED] deliver {s['id']} failed: {e}")
+
+
+async def scheduler_loop(application):
+    """Background loop: catch up missed jobs at boot, then run due jobs."""
+    import time as _t
+    try:
+        schedules_mgr.reconcile_startup(
+            now=_t.time(), catchup=get_setting("schedule_catchup", True))
+    except Exception as e:
+        logger.error(f"[SCHED] reconcile failed: {e}")
+    logger.info("[SCHED] scheduler loop started")
+    while True:
+        try:
+            for s in schedules_mgr.due():
+                logger.info(f"[SCHED] running {s['id']} ({s.get('title','')[:30]})")
+                await _run_scheduled(application, s)
+                schedules_mgr.touch_run(s["id"])
+        except Exception as e:
+            logger.error(f"[SCHED] loop error: {e}", exc_info=True)
+        await asyncio.sleep(_SCHED_TICK)
+
+
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not auth.is_owner(uid):
@@ -799,6 +991,36 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  BROWSE COMMAND (admin+)
 # ══════════════════════════════════════════════════════════
 
+# ── WebBridge HTTP (runs OFF the event loop so it never freezes the bot) ──
+
+def _bridge_status_blocking(timeout: int = 5) -> dict:
+    import urllib.request
+    with urllib.request.urlopen(
+        urllib.request.Request(f"{KIMI_BRIDGE_URL}/status"), timeout=timeout
+    ) as resp:
+        return json.loads(resp.read())
+
+
+def _bridge_command_blocking(action: str, args: dict | None, timeout: int) -> dict:
+    import urllib.request
+    payload = json.dumps(
+        {"action": action, "args": args or {}, "session": "telegram"}).encode()
+    req = urllib.request.Request(
+        f"{KIMI_BRIDGE_URL}/command", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+async def bridge_status(timeout: int = 5) -> dict:
+    return await asyncio.to_thread(_bridge_status_blocking, timeout)
+
+
+async def bridge_command(action: str, args: dict | None = None, timeout: int = 15) -> dict:
+    return await asyncio.to_thread(_bridge_command_blocking, action, args, timeout)
+
+
 async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not auth.can(uid, "admin"):
@@ -820,15 +1042,9 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     subcmd = context.args[0].lower()
     try:
-        import urllib.request
-        import urllib.error
-
         if subcmd == "status":
             try:
-                with urllib.request.urlopen(
-                    urllib.request.Request(f"{KIMI_BRIDGE_URL}/status"), timeout=5
-                ) as resp:
-                    data = json.loads(resp.read())
+                data = await bridge_status()
                 running = data.get("running", False)
                 ext = data.get("extension_connected", False)
                 await update.message.reply_text(
@@ -844,13 +1060,7 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
             try:
-                payload = json.dumps({"action": "screenshot", "args": {}, "session": "telegram"}).encode()
-                req = urllib.request.Request(
-                    f"{KIMI_BRIDGE_URL}/command", data=payload,
-                    headers={"Content-Type": "application/json"}, method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    result = json.loads(resp.read())
+                result = await bridge_command("screenshot", {}, timeout=30)
                 stop_typing.set()
                 typing_task.cancel()
                 screenshot_path = result.get("data", {}).get("path", "")
@@ -865,13 +1075,7 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Screenshot error: {str(e)[:300]}")
 
         elif subcmd == "tabs":
-            payload = json.dumps({"action": "list_tabs", "args": {}, "session": "telegram"}).encode()
-            req = urllib.request.Request(
-                f"{KIMI_BRIDGE_URL}/command", data=payload,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read())
+            result = await bridge_command("list_tabs", {}, timeout=10)
             tabs = result.get("data", {}).get("tabs", [])
             if tabs:
                 lines = [f"🌐 Open Tabs ({len(tabs)}):\n"]
@@ -884,13 +1088,7 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("No open tabs.")
 
         elif subcmd == "close":
-            payload = json.dumps({"action": "close_session", "args": {}, "session": "telegram"}).encode()
-            req = urllib.request.Request(
-                f"{KIMI_BRIDGE_URL}/command", data=payload,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read())
+            result = await bridge_command("close_session", {}, timeout=10)
             closed = result.get("data", {}).get("closed", 0)
             await update.message.reply_text(f"🗑️ Closed {closed} tab(s).")
 
@@ -900,17 +1098,8 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 url = " ".join(context.args)
                 if not url.startswith(("http://", "https://")):
                     url = f"https://{url}"
-            payload = json.dumps({
-                "action": "navigate",
-                "args": {"url": url, "newTab": True},
-                "session": "telegram",
-            }).encode()
-            req = urllib.request.Request(
-                f"{KIMI_BRIDGE_URL}/command", data=payload,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                result = json.loads(resp.read())
+            result = await bridge_command(
+                "navigate", {"url": url, "newTab": True}, timeout=15)
             if result.get("data", {}).get("success"):
                 await update.message.reply_text(f"🌐 Opened: {url}")
             else:
@@ -1217,6 +1406,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_message = update.message.text
+
+    # Natural-language schedule? Offer to create it instead of running it now.
+    if auth.can(uid, "admin"):
+        parsed = parse_schedule(user_message or "")
+        if parsed:
+            await _offer_schedule(update, context, parsed)
+            return
+
     logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 
     stop_typing = asyncio.Event()
@@ -1366,11 +1563,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("Admin access required.", show_alert=True)
                 return
             try:
-                import urllib.request
-                with urllib.request.urlopen(
-                    urllib.request.Request(f"{KIMI_BRIDGE_URL}/status"), timeout=5
-                ) as resp:
-                    bdata = json.loads(resp.read())
+                bdata = await bridge_status()
                 running = bdata.get("running", False)
                 ext = bdata.get("extension_connected", False)
                 status_text = (
@@ -1503,6 +1696,70 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_setting("admins_can_change_model", not current)
             await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
 
+        elif data == "set_toggle_catchup":
+            if not auth.can(uid, "admin"):
+                await query.answer("Admin access required.", show_alert=True)
+                return
+            current = get_setting("schedule_catchup", True)
+            set_setting("schedule_catchup", not current)
+            await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+        # ── Schedules ──
+        elif data == "sched_confirm":
+            parsed = context.user_data.pop("pending_schedule", None)
+            if not parsed or not auth.can(uid, "admin"):
+                await query.edit_message_text("Nothing to create.")
+            else:
+                s = _make_schedule(uid, chat_id, parsed)
+                if s:
+                    await query.edit_message_text(
+                        f"✅ Scheduled: {s['title']}\n"
+                        f"{describe_schedule(s['kind'], s['spec'])} · next {_fmt_next(s['next_run'])}",
+                    )
+                else:
+                    await query.edit_message_text("Couldn't create that schedule (time already past?).")
+
+        elif data == "sched_cancel":
+            context.user_data.pop("pending_schedule", None)
+            await query.edit_message_text("Cancelled — no schedule created.")
+
+        elif data == "sched_list":
+            items = schedules_mgr.list(uid)
+            await query.edit_message_text(
+                _schedule_panel_text(items),
+                reply_markup=kb_schedules(items) if items else kb_back(),
+            )
+
+        elif data.startswith("sched_toggle_"):
+            sid = data.removeprefix("sched_toggle_")
+            s = schedules_mgr.get(sid)
+            if s and s.get("user_id") == uid:
+                schedules_mgr.set_enabled(sid, uid, not s.get("enabled"))
+            items = schedules_mgr.list(uid)
+            await query.edit_message_text(
+                _schedule_panel_text(items),
+                reply_markup=kb_schedules(items) if items else kb_back(),
+            )
+
+        elif data.startswith("sched_del_"):
+            sid = data.removeprefix("sched_del_")
+            schedules_mgr.remove(sid, uid)
+            items = schedules_mgr.list(uid)
+            await query.answer("🗑 Deleted")
+            await query.edit_message_text(
+                _schedule_panel_text(items),
+                reply_markup=kb_schedules(items) if items else kb_back(),
+            )
+
+        elif data.startswith("sched_run_"):
+            sid = data.removeprefix("sched_run_")
+            s = schedules_mgr.get(sid)
+            if s and s.get("user_id") == uid:
+                await query.answer("▶️ Running now…")
+                asyncio.create_task(_run_scheduled(context.application, s))
+            else:
+                await query.answer("Not found.", show_alert=True)
+
         # ── Cancel active request ──
         elif data == "cancel_active":
             cancel_ev = _active_cancel.get(chat_id)
@@ -1588,14 +1845,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=None,
             )
 
-        elif data == "user_add_cancel":
-            context.user_data.pop("adduser_flow", None)
-            users = auth.list_users()
-            await query.edit_message_text(
-                f"👥 Users ({len(users)})",
-                reply_markup=kb_users(users),
-            )
-
         # ── Error recovery ──
         elif data == "err_retry":
             await query.edit_message_text(
@@ -1652,6 +1901,9 @@ async def post_init(application):
     # Register the native Telegram slash-command menu (the "/" autocomplete).
     await _register_commands(application)
 
+    # Start the background scheduler (custom asyncio loop).
+    application.create_task(scheduler_loop(application))
+
     if OWNER_CHAT_ID:
         try:
             await application.bot.send_message(
@@ -1669,6 +1921,7 @@ async def post_init(application):
 # Base commands every admin/owner sees in the "/" menu.
 _BASE_COMMANDS = [
     ("menu", "Open the control panel"),
+    ("schedule", "Add / manage scheduled jobs"),
     ("model", "Select the AI model"),
     ("settings", "Bot settings"),
     ("sessions", "List your sessions"),
@@ -1760,7 +2013,7 @@ def _release_lock():
 
 
 def main():
-    global sessions, auth, _lock_file_handle
+    global sessions, auth, schedules_mgr, _lock_file_handle
 
     if sys.platform == "win32":
         import msvcrt
@@ -1796,6 +2049,7 @@ def main():
     ensure_dirs()
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
+    schedules_mgr = ScheduleManager(SCHEDULES_FILE)
 
     model = get_model()
     session_count = len(sessions.list_sessions(OWNER_CHAT_ID))
@@ -1843,6 +2097,8 @@ def main():
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("brain", cmd_brain))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("schedules", cmd_schedule))
     app.add_handler(CommandHandler("browse", cmd_browse))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))

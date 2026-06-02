@@ -472,6 +472,42 @@ def get_selected_model() -> str | None:
     return get_model() or None
 
 
+# Signals that the current model is rate-limited / unavailable. Matched
+# case-insensitively against the CLI response so the bot can offer a switch.
+_LIMIT_SIGNALS = [
+    ("rate limit", "rate limit"),
+    ("rate-limit", "rate limit"),
+    ("ratelimited", "rate limit"),
+    ("resource exhausted", "quota exhausted"),
+    ("resource_exhausted", "quota exhausted"),
+    ("quota", "quota"),
+    ("429", "too many requests"),
+    ("too many requests", "too many requests"),
+    ("limit reached", "limit reached"),
+    ("usage limit", "usage limit"),
+    ("out of credits", "out of credits"),
+    ("insufficient credits", "out of credits"),
+    ("ai credits", "credits"),
+    ("overloaded", "model overloaded"),
+    ("model is overloaded", "model overloaded"),
+    ("try again later", "temporarily unavailable"),
+    ("temporarily unavailable", "temporarily unavailable"),
+    ("not logged into antigravity", "not logged in to Antigravity"),
+]
+
+
+def detect_limit(text: str) -> str | None:
+    """Return a short reason if the text looks like a model rate-limit/quota
+    error, else None. Pure + testable."""
+    if not text:
+        return None
+    low = text.lower()
+    for needle, reason in _LIMIT_SIGNALS:
+        if needle in low:
+            return reason
+    return None
+
+
 # ══════════════════════════════════════════════════════════
 #  CONVERSATION DETECTION HELPERS
 # ══════════════════════════════════════════════════════════

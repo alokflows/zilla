@@ -206,7 +206,7 @@ def _auth(owner=1000):
 
 def test_auth_authorized_user_is_admin():
     a = _auth()
-    a.add_user(2000, "Bob")              # no role arg → admin
+    a.add_user(2000, "Bob")              # no role arg -> admin
     check("auth: added account is admin role",
           a.list_users()[2000]["role"] == "admin")
     check("auth: admin has chat cap", a.can(2000, "chat"))
@@ -289,6 +289,148 @@ def test_inbox_filter_returns_only_category():
 
 
 # ════════════════════════════════════════════════════════════
+#  SCHEDULES — next-run math, due selection, persistence, catch-up
+# ════════════════════════════════════════════════════════════
+
+from datetime import datetime, timedelta  # noqa: E402
+import schedules as sched_mod  # noqa: E402
+from schedules import ScheduleManager, compute_next_run  # noqa: E402
+from schedule_parse import parse_schedule, parse_schedule_command  # noqa: E402
+from cli_engine import detect_limit  # noqa: E402
+
+
+def _epoch(y, mo, d, h, mi):
+    return datetime(y, mo, d, h, mi).timestamp()
+
+
+def test_next_run_daily():
+    # before today's slot -> today; after -> tomorrow
+    base = datetime(2026, 6, 2, 8, 0)
+    nxt = compute_next_run("daily", {"hh": 9, "mm": 0}, base.timestamp())
+    check("sched: daily before slot -> today 09:00",
+          datetime.fromtimestamp(nxt) == datetime(2026, 6, 2, 9, 0))
+    base2 = datetime(2026, 6, 2, 10, 0)
+    nxt2 = compute_next_run("daily", {"hh": 9, "mm": 0}, base2.timestamp())
+    check("sched: daily after slot -> tomorrow 09:00",
+          datetime.fromtimestamp(nxt2) == datetime(2026, 6, 3, 9, 0))
+
+
+def test_next_run_interval_and_once():
+    after = _epoch(2026, 6, 2, 8, 0)
+    check("sched: interval adds seconds",
+          compute_next_run("interval", {"seconds": 18000}, after) == after + 18000)
+    future = after + 100
+    check("sched: once future returns run_at",
+          compute_next_run("once", {"run_at": future}, after) == future)
+    check("sched: once past returns None",
+          compute_next_run("once", {"run_at": after - 100}, after) is None)
+
+
+def test_next_run_weekly():
+    # 2026-06-02 is a Tuesday (weekday 1). Want Wednesday (2) at 09:00 -> next day.
+    base = datetime(2026, 6, 2, 8, 0)
+    nxt = compute_next_run("weekly", {"days": [2], "hh": 9, "mm": 0}, base.timestamp())
+    got = datetime.fromtimestamp(nxt)
+    check("sched: weekly picks next chosen weekday",
+          got == datetime(2026, 6, 3, 9, 0), str(got))
+
+
+def _sm():
+    return ScheduleManager(os.path.join(_tmpdir, f"sched_{os.urandom(4).hex()}.json"))
+
+
+def test_schedule_add_due_touch():
+    sm = _sm()
+    now = _epoch(2026, 6, 2, 8, 0)
+    s = sm.add(1, 1, "do x", "daily", {"hh": 9, "mm": 0}, now=now)
+    first_next = s["next_run"]   # capture BEFORE touch_run mutates the live dict
+    check("sched: add returns schedule with future next_run", s and first_next > now)
+    check("sched: not due before next_run", sm.due(now) == [])
+    check("sched: due at/after next_run", len(sm.due(first_next + 1)) == 1)
+    sm.touch_run(s["id"], now=first_next + 1)
+    check("sched: touch_run advances ~24h",
+          abs(sm.get(s["id"])["next_run"] - (first_next + 86400)) < 5)
+    check("sched: touch_run records last_run", sm.get(s["id"])["last_run"] is not None)
+
+
+def test_schedule_once_disables_after_run():
+    sm = _sm()
+    now = _epoch(2026, 6, 2, 8, 0)
+    s = sm.add(1, 1, "ping", "once", {"run_at": now + 60}, now=now)
+    sm.touch_run(s["id"], now=now + 61)
+    check("sched: once disabled after run", sm.get(s["id"])["enabled"] is False)
+    check("sched: once has no next_run after run", sm.get(s["id"])["next_run"] is None)
+
+
+def test_schedule_reconcile_catchup():
+    now = _epoch(2026, 6, 2, 10, 0)
+    # Build a schedule whose next_run is already in the past.
+    sm = _sm()
+    s = sm.add(1, 1, "x", "daily", {"hh": 9, "mm": 0}, now=_epoch(2026, 6, 2, 8, 0))
+    # force past-due
+    sm.get(s["id"])["next_run"] = now - 100
+    # catchup ON -> stays due
+    sm.reconcile_startup(now=now, catchup=True)
+    check("sched: catchup ON leaves past-due due", len(sm.due(now)) == 1)
+    # catchup OFF -> advanced to future, not due
+    sm.reconcile_startup(now=now, catchup=False)
+    check("sched: catchup OFF advances past-due", sm.due(now) == [])
+    check("sched: catchup OFF kept it enabled with future run",
+          sm.get(s["id"])["enabled"] and sm.get(s["id"])["next_run"] > now)
+
+
+def test_schedule_remove_and_owner_scope():
+    sm = _sm()
+    s = sm.add(7, 7, "x", "interval", {"seconds": 3600})
+    check("sched: other user can't remove", sm.remove(s["id"], 999) is False)
+    check("sched: owner removes", sm.remove(s["id"], 7) is True)
+    check("sched: list empty after remove", sm.list(7) == [])
+
+
+# ════════════════════════════════════════════════════════════
+#  NL PARSER + LIMIT DETECTION
+# ════════════════════════════════════════════════════════════
+
+def test_parse_schedule_forms():
+    fixed = datetime(2026, 6, 2, 8, 0)
+    p = parse_schedule("every 5 hours check the news", fixed)
+    check("parse: interval 5h", p and p["kind"] == "interval" and p["spec"]["seconds"] == 18000, str(p))
+    p = parse_schedule("daily at 9am summarise my inbox", fixed)
+    check("parse: daily 9am", p and p["kind"] == "daily" and p["spec"] == {"hh": 9, "mm": 0}, str(p))
+    p = parse_schedule("every day at 18:30 post update", fixed)
+    check("parse: daily 18:30", p and p["kind"] == "daily" and p["spec"]["hh"] == 18 and p["spec"]["mm"] == 30, str(p))
+    p = parse_schedule("on mon,wed at 09:00 standup", fixed)
+    check("parse: weekly mon,wed", p and p["kind"] == "weekly" and p["spec"]["days"] == [0, 2], str(p))
+    p = parse_schedule("in 30 minutes ping me", fixed)
+    check("parse: once in 30m", p and p["kind"] == "once", str(p))
+    p = parse_schedule("remind me to call mom at 9am", fixed)
+    check("parse: remind-me cue", p and p["kind"] == "once" and "call mom" in p["title"], str(p))
+    check("parse: plain text is not a schedule",
+          parse_schedule("what is the weather today", fixed) is None)
+
+
+def test_parse_schedule_command_forms():
+    fixed = datetime(2026, 6, 2, 8, 0)
+    p = parse_schedule_command("daily 09:00 summarise inbox", fixed)
+    check("cmd: daily 09:00", p and p["kind"] == "daily" and p["spec"]["hh"] == 9, str(p))
+    p = parse_schedule_command("every 5h check news", fixed)
+    check("cmd: every 5h", p and p["kind"] == "interval" and p["spec"]["seconds"] == 18000, str(p))
+    p = parse_schedule_command("once 2026-12-31 23:59 party time", fixed)
+    check("cmd: once explicit date", p and p["kind"] == "once", str(p))
+    p = parse_schedule_command("mon,fri 08:00 gym", fixed)
+    check("cmd: weekday list", p and p["kind"] == "weekly" and p["spec"]["days"] == [0, 4], str(p))
+
+
+def test_detect_limit():
+    check("limit: rate limit", detect_limit("You hit the rate limit, slow down") is not None)
+    check("limit: 429", detect_limit("HTTP 429 Too Many Requests") is not None)
+    check("limit: resource exhausted", detect_limit("Error: RESOURCE_EXHAUSTED") is not None)
+    check("limit: overloaded", detect_limit("The model is overloaded right now") is not None)
+    check("limit: normal text -> None", detect_limit("Here is your answer, all good.") is None)
+    check("limit: empty -> None", detect_limit("") is None)
+
+
+# ════════════════════════════════════════════════════════════
 
 def main():
     tests = [
@@ -310,6 +452,16 @@ def main():
         test_inbox_classifies_video_by_extension,
         test_inbox_counts,
         test_inbox_filter_returns_only_category,
+        test_next_run_daily,
+        test_next_run_interval_and_once,
+        test_next_run_weekly,
+        test_schedule_add_due_touch,
+        test_schedule_once_disables_after_run,
+        test_schedule_reconcile_catchup,
+        test_schedule_remove_and_owner_scope,
+        test_parse_schedule_forms,
+        test_parse_schedule_command_forms,
+        test_detect_limit,
     ]
     print("Running zilla fix tests...\n")
     for t in tests:

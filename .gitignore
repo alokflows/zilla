@@ -13,6 +13,7 @@ venv/
 # State files (regenerated at runtime)
 *.lock
 sessions.json
+schedules.json
 authorized_users.json
 denied_users.json
 settings.json

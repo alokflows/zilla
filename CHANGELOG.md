@@ -4,7 +4,26 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🔐 v2.5.0 — Trust-based roles, owner-gated model, slash-command menu, Inbox redesign *(latest)*
+## ⏰ v2.6.0 — Schedules, model-limit recovery, faster & leaner *(latest)*
+
+### ⏰ Scheduling engine (the big one)
+- Register unlimited recurring jobs that run automatically and DM you the result. Kinds: **once**, **every N minutes/hours**, **daily at HH:MM**, **weekly on chosen days**.
+- **Catch-up:** if the bot/PC was off when a job was due, it runs the missed job once on startup and sends it to you immediately. Toggle this in **Settings → "Catch up missed schedules"** (default ON).
+- Create them two ways: the **`/schedule`** command (e.g. `/schedule daily 09:00 summarise my inbox`, `/schedule every 5h check the news`, `/schedule mon,wed,fri 09:00 stand-up`) **or just say it** ("every day at 9am summarise my inbox") — the bot shows a confirm card before creating.
+- Manage from the panel: pause/resume, ▶️ run-now, 🗑 delete. Schedules persist to disk and survive restarts.
+- Runs go through the same per-user lock as chat, so a scheduled job never collides with a manual message.
+
+### 🚦 Model-limit recovery
+- When a model is rate-limited/quota-blocked (Claude can be down for hours), the bot detects it, tells you **which model is blocked**, and shows **model buttons right there** so you switch on the spot and resend. Works for chat and scheduled runs.
+
+### ⚡ Faster & leaner
+- **Fixed the real lag:** WebBridge/`/browse` used blocking network calls that **froze the whole bot** (typing, menus) for up to 30s. They now run off the event loop, so menus and the typing indicator stay instant.
+- `get_model()` is cached (mtime-gated) so it no longer reads disk on every call.
+- Removed dead code (unused `set_role`, a dead callback branch).
+
+---
+
+## 🔐 v2.5.0 — Trust-based roles, owner-gated model, slash-command menu, Inbox redesign
 
 ### 🧱 Why the security model changed
 I tested it directly: **agy executes tools — file writes, shell commands — in headless mode no matter what** (`--dangerously-skip-permissions`, the `toolPermission` setting, and `--sandbox` all fail to block it). There's no way to safely sandbox an untrusted user inside agy. So the bot now uses a **trust-based model** instead of pretending to restrict.
