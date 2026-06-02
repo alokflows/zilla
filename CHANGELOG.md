@@ -4,7 +4,20 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🌍 v4.0.0 — Cross-platform + pluggable backends + one-click installer *(latest)*
+## 🧪 v4.1.0 — Testing-round fixes (menus, inbox, flashing, cancel, backend) *(latest)*
+
+Fixes from hands-on testing:
+
+- **No more stale-menu collisions.** Every menu now has a **✕ Close** button, and opening a new menu automatically **kills the previous menu's buttons** — so tapping an old menu in your chat history can't silently change your session anymore.
+- **Inbox: delete files.** Each file row now has **🗑 Delete** (alongside 📤 Send) that removes the file from disk immediately (path-validated) and refreshes the list.
+- **No more scary console flashing.** A Windows window-suppressor hides the console windows that agy (and its child tools / ConPTY) briefly popped during a run — including on `/browse`. Nothing flashes now.
+- **Cancel no longer bleeds old replies.** Canceling mid-run used to dump the raw terminal screen, which still showed the *previous* answer. Cancel now returns a clean "🛑 Canceled" (plus only the current turn's output if any) — verified.
+- **Backend switch is clean.** Conversation IDs are tagged with their backend; switching agy ⇄ claude now **starts a fresh conversation** instead of erroring on a mismatched ID.
+- **Reach Claude faster.** The `/model` screen shows the active backend and has a **🧠 Use claude / Use agy** button to switch right there; the model list matches the active backend.
+
+---
+
+## 🌍 v4.0.0 — Cross-platform + pluggable backends + one-click installer
 
 The "install anywhere, run on any AI" release.
 

@@ -81,7 +81,8 @@ class SessionManager:
         _, session = self._find(name, user_id)
         return session.get("conversation_id") if session else None
 
-    def set_conversation_id(self, conv_id: str, user_id: int, session_name: str = None):
+    def set_conversation_id(self, conv_id: str, user_id: int, session_name: str = None,
+                            backend: str = None):
         name = session_name or self.get_active_name(user_id)
         key, session = self._find(name, user_id)
         if not session:
@@ -91,7 +92,16 @@ class SessionManager:
                 "messages": 0, "last_seen_step": 0, "title": None,
             }
         self.state["sessions"][key]["conversation_id"] = conv_id
+        # Conversation ids are backend-specific (agy brain dir vs claude session).
+        # Remember which backend made this one so we never resume it on the other.
+        if backend is not None:
+            self.state["sessions"][key]["conv_backend"] = backend
         self._save()
+
+    def get_conv_backend(self, user_id: int, session_name: str = None) -> str | None:
+        name = session_name or self.get_active_name(user_id)
+        _, session = self._find(name, user_id)
+        return session.get("conv_backend") if session else None
 
     # ── Last Seen Step ────────────────────────────────────
 

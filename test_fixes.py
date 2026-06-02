@@ -288,6 +288,19 @@ def test_inbox_filter_returns_only_category():
           len(aud) == 1 and aud[0]["category"] == "audio")
 
 
+def test_inbox_delete_file():
+    img, aud, doc = _setup_inbox()
+    target = os.path.join(doc, "report.pdf")
+    check("inbox-del: file exists before", os.path.exists(target))
+    check("inbox-del: deletes a real inbox file", media.delete_inbox_file(target) is True)
+    check("inbox-del: file gone after", not os.path.exists(target))
+    # Security: must REFUSE to delete a path outside the inbox folders.
+    outside = os.path.join(_tmpdir, "outside_secret.txt")
+    open(outside, "w").close()
+    check("inbox-del: refuses path outside inbox", media.delete_inbox_file(outside) is False)
+    check("inbox-del: outside file untouched", os.path.exists(outside))
+
+
 # ════════════════════════════════════════════════════════════
 #  SCHEDULES — next-run math, due selection, persistence, catch-up
 # ════════════════════════════════════════════════════════════
@@ -516,6 +529,7 @@ def main():
         test_inbox_classifies_video_by_extension,
         test_inbox_counts,
         test_inbox_filter_returns_only_category,
+        test_inbox_delete_file,
         test_next_run_daily,
         test_next_run_interval_and_once,
         test_next_run_weekly,

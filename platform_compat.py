@@ -15,6 +15,8 @@
 
 import os
 import sys
+import time
+import threading
 import logging
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,88 @@ def release_instance_lock(handle, lock_path: str):
 def apply_window_hiding():
     if IS_WINDOWS:
         import winhide  # noqa: F401  (importing applies the subprocess patch)
+
+
+# ── Flash suppressor (Windows) ────────────────────────────
+#  The agy CLI runs under ConPTY, and agy itself spawns shell tools (git,
+#  node, cmd, ...) even for simple answers. When the bot runs without a
+#  console (pythonw), those briefly pop a black "console window" that flashes
+#  on screen. winhide only covers OUR direct subprocesses — not agy's children
+#  or ConPTY's conhost. This watcher hides any NEW window of class
+#  "ConsoleWindowClass" that appears while a CLI turn is running, so nothing
+#  flashes. It does NOT touch Windows Terminal (different class) or windows
+#  that already existed before the turn started.
+
+class FlashSuppressor:
+    """Start() before a CLI run, stop() after. No-op off Windows."""
+
+    def __init__(self):
+        self._stop = True
+        self._thread = None
+        self._baseline = set()
+
+    def start(self):
+        if not IS_WINDOWS:
+            return self
+        try:
+            self._baseline = set(self._console_windows())
+            self._stop = False
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        except Exception as e:
+            logger.debug(f"[FLASH] suppressor start failed: {e}")
+        return self
+
+    def stop(self):
+        self._stop = True
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+
+    def _console_windows(self):
+        """Yield (hwnd) of every visible window whose class is ConsoleWindowClass."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        found = []
+        buf = ctypes.create_unicode_buffer(64)
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def cb(hwnd, _):
+            try:
+                if user32.IsWindowVisible(hwnd):
+                    user32.GetClassNameW(hwnd, buf, 64)
+                    if buf.value == "ConsoleWindowClass":
+                        found.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(cb, 0)
+        return found
+
+    def _run(self):
+        import ctypes
+        user32 = ctypes.windll.user32
+        SW_HIDE = 0
+        while not self._stop:
+            try:
+                for hwnd in self._console_windows():
+                    if hwnd not in self._baseline:
+                        user32.ShowWindow(hwnd, SW_HIDE)  # hide the flash
+            except Exception:
+                pass
+            time.sleep(0.03)
+        # one final sweep so a late-spawned window doesn't linger
+        try:
+            for hwnd in self._console_windows():
+                if hwnd not in self._baseline:
+                    user32.ShowWindow(hwnd, 0)
+        except Exception:
+            pass
 
 
 # ── PtyProcess — run a TUI CLI in a real pseudo-terminal ──

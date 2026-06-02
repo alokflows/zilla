@@ -77,7 +77,8 @@ from cli_engine import run_cli_async, get_latest_step, detect_limit
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
-    get_inbox_stats, get_inbox_items, get_inbox_counts, format_file_size, extract_text,
+    get_inbox_stats, get_inbox_items, get_inbox_counts, delete_inbox_file,
+    format_file_size, extract_text,
 )
 from formatter import format_for_telegram, detect_file_paths
 from users import AuthManager
@@ -116,6 +117,11 @@ schedules_mgr: ScheduleManager = None
 # Per-chat cancel events — set to cancel the active CLI request for that chat
 _active_cancel: dict[int, threading.Event] = {}
 
+# Per-chat id of the CURRENT live menu message. When a new menu opens we strip
+# the previous one's buttons so old menus in the chat history can't be tapped
+# again (no stale session/menu collisions). The ✕ Close button clears it too.
+_active_menu: dict[int, int] = {}
+
 # Per-user CLI serialization. The agy CLI keeps ONE conversation per user, and
 # running two invocations against the same conversation at once corrupts its
 # transcript and makes each handler scoop up the other turn's steps (responses
@@ -133,6 +139,16 @@ def _get_user_lock(uid: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _user_cli_locks[uid] = lock
     return lock
+
+
+def _conv_for_run(uid: int, sname: str):
+    """The conversation id to resume — but only if it was created by the CURRENT
+    backend. agy brain-dir ids and claude session ids aren't interchangeable, so
+    after switching backend we start a fresh conversation instead of mismatching."""
+    cid = sessions.get_conversation_id(user_id=uid, session_name=sname)
+    if cid and sessions.get_conv_backend(uid, sname) != get_backend():
+        return None
+    return cid
 
 
 async def _acquire_turn(uid: int, update: Update) -> asyncio.Lock:
@@ -333,6 +349,26 @@ async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  KEYBOARDS
 # ══════════════════════════════════════════════════════════
 
+def _close_btn():
+    return InlineKeyboardButton("✕ Close", callback_data="menu_close")
+
+
+async def _open_menu(update, context, text, reply_markup, parse_mode=None):
+    """Open a NEW menu from a command: strip the previous menu's buttons (so old
+    menus can't be re-tapped) and remember this one as the live menu."""
+    chat_id = update.effective_chat.id
+    prev = _active_menu.get(chat_id)
+    msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    if prev and prev != msg.message_id:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=prev, reply_markup=None)
+        except Exception:
+            pass
+    _active_menu[chat_id] = msg.message_id
+    return msg
+
+
 def _can_change_model(uid: int) -> bool:
     """Owner always; admins only if the owner has enabled it."""
     if not auth:
@@ -365,6 +401,7 @@ def kb_menu(uid: int = 0):
         ])
     if auth and auth.is_owner(uid):
         rows.append([InlineKeyboardButton("👥 Users", callback_data="menu_users")])
+    rows.append([_close_btn()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -384,6 +421,7 @@ def kb_sessions(all_sessions: dict, active: str):
     buttons.append([
         InlineKeyboardButton("➕ New", callback_data="sess_new"),
         InlineKeyboardButton("◀ Menu", callback_data="menu_back"),
+        _close_btn(),
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -408,8 +446,12 @@ def kb_model(current: str):
             buttons.append(row); row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("✏️ Custom…", callback_data="model_custom")])
-    buttons.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
+    other = "claude" if get_backend() == "agy" else "agy"
+    buttons.append([
+        InlineKeyboardButton("✏️ Custom…", callback_data="model_custom"),
+        InlineKeyboardButton(f"🧠 Use {other}", callback_data="model_switch_backend"),
+    ])
+    buttons.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -450,13 +492,13 @@ def kb_settings(uid: int = 0):
             f"🧠 Backend: {get_backend()}  (tap to switch)",
             callback_data="set_toggle_backend",
         )])
-    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_back():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀ Menu", callback_data="menu_back")],
+        [InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()],
     ])
 
 
@@ -478,6 +520,7 @@ def kb_users(users: dict):
     buttons.append([
         InlineKeyboardButton("➕ Add User", callback_data="user_add_start"),
         InlineKeyboardButton("◀ Menu", callback_data="menu_back"),
+        _close_btn(),
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -508,7 +551,7 @@ def kb_inbox_categories(counts: dict):
             rows.append([InlineKeyboardButton(
                 f"{label} ({n})", callback_data=f"ibx_cat_{cat}_0",
             )])
-    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -519,12 +562,13 @@ def kb_inbox_list(category: str, items: list, offset: int):
     for i, item in enumerate(page):
         idx = offset + i
         name = item["name"]
-        label = name if len(name) <= 28 else name[:25] + "…"
+        label = name if len(name) <= 24 else name[:21] + "…"
         send_cb = f"ibx_send_{category}_{idx}"
         rows.append([
             InlineKeyboardButton(
                 f"{label} ({format_file_size(item['size'])})", callback_data=send_cb),
             InlineKeyboardButton("📤", callback_data=send_cb),
+            InlineKeyboardButton("🗑", callback_data=f"ibx_del_{category}_{idx}"),
         ])
     nav = []
     if offset > 0:
@@ -535,7 +579,7 @@ def kb_inbox_list(category: str, items: list, offset: int):
             "More ➡️", callback_data=f"ibx_cat_{category}_{offset + INBOX_PAGE}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_inbox")])
+    rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_inbox"), _close_btn()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -561,7 +605,7 @@ def kb_schedules(items: list):
             InlineKeyboardButton("▶️ Run now", callback_data=f"sched_run_{s['id']}"),
             InlineKeyboardButton("🗑 Delete", callback_data=f"sched_del_{s['id']}"),
         ])
-    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back")])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -704,9 +748,10 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text(
+    await _open_menu(
+        update, context,
         "⚡ Zilla — Control Panel\n════════════════════════",
-        reply_markup=kb_menu(uid),
+        kb_menu(uid),
     )
 
 
@@ -765,9 +810,7 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = info.get("title", "")
         title_str = f' — "{title}"' if title else ""
         lines.append(f"  {name}{marker}{title_str} — {msgs} msgs")
-    await update.message.reply_text(
-        "\n".join(lines), reply_markup=kb_sessions(all_sessions, active),
-    )
+    await _open_menu(update, context, "\n".join(lines), kb_sessions(all_sessions, active))
 
 
 async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -801,9 +844,10 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Model selection requires admin access.")
         return
     current = get_model()
-    await update.message.reply_text(
+    await _open_menu(
+        update, context,
         f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n{_model_note()}",
-        reply_markup=kb_model(current),
+        kb_model(current),
     )
 
 
@@ -812,9 +856,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth.can(uid, "admin"):
         await update.message.reply_text("Settings require admin access.")
         return
-    await update.message.reply_text(
-        "⚙️ Settings\n═══════════", reply_markup=kb_settings(uid),
-    )
+    await _open_menu(update, context, "⚙️ Settings\n═══════════", kb_settings(uid))
 
 
 async def cmd_brain(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -867,9 +909,10 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     items = schedules_mgr.list(uid)
-    await update.message.reply_text(
+    await _open_menu(
+        update, context,
         _schedule_panel_text(items),
-        reply_markup=kb_schedules(items) if items else kb_back(),
+        kb_schedules(items) if items else kb_back(),
     )
 
 
@@ -899,12 +942,12 @@ async def _run_scheduled(application, s: dict):
             conv_id = None
             sname = s.get("session_name")
             if sname:
-                conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+                conv_id = _conv_for_run(uid, sname)
             response, detected = await run_cli_async(
                 s["prompt"], conv_id, skip_permissions=auth.can(uid, "admin"),
             )
             if sname and detected and detected != conv_id:
-                sessions.set_conversation_id(detected, user_id=uid, session_name=sname)
+                sessions.set_conversation_id(detected, user_id=uid, session_name=sname, backend=get_backend())
     except Exception as e:
         response = f"Error: {e}"
         logger.error(f"[SCHED] run {s['id']} failed: {e}", exc_info=True)
@@ -1148,7 +1191,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with await _acquire_turn(uid, update):
                 _active_cancel[chat_id] = cancel_event
                 sname = sessions.get_active_name(uid)
-                conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+                conv_id = _conv_for_run(uid, sname)
                 info = sessions.get_session_info(user_id=uid, session_name=sname)
                 if info and info.get("messages", 0) == 0:
                     sessions.auto_title(transcript, user_id=uid, session_name=sname)
@@ -1158,7 +1201,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     skip_permissions=auth.can(uid, "admin"),
                 )
                 if detected_id and detected_id != conv_id:
-                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
                 final_conv = detected_id or conv_id
                 if final_conv:
                     sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
@@ -1233,14 +1276,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with await _acquire_turn(uid, update):
             _active_cancel[chat_id] = cancel_event
             sname = sessions.get_active_name(uid)
-            conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+            conv_id = _conv_for_run(uid, sname)
             response, detected_id = await run_cli_async(
                 prompt, conv_id,
                 cancel_event=cancel_event,
                 skip_permissions=auth.can(uid, "admin"),
             )
             if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
             final_conv = detected_id or conv_id
             if final_conv:
                 sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
@@ -1300,14 +1343,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with await _acquire_turn(uid, update):
                 _active_cancel[chat_id] = cancel_event
                 sname = sessions.get_active_name(uid)
-                conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+                conv_id = _conv_for_run(uid, sname)
                 response, detected_id = await run_cli_async(
                     prompt, conv_id,
                     cancel_event=cancel_event,
                     skip_permissions=auth.can(uid, "admin"),
                 )
                 if detected_id and detected_id != conv_id:
-                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
                 final_conv = detected_id or conv_id
                 if final_conv:
                     sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
@@ -1442,7 +1485,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # every result back to that same session — never the now-active one.
             _active_cancel[chat_id] = cancel_event
             sname = sessions.get_active_name(uid)
-            conv_id = sessions.get_conversation_id(user_id=uid, session_name=sname)
+            conv_id = _conv_for_run(uid, sname)
 
             info = sessions.get_session_info(user_id=uid, session_name=sname)
             if info and info.get("messages", 0) == 0:
@@ -1455,7 +1498,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname)
+                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
 
             final_conv = detected_id or conv_id
             if final_conv:
@@ -1487,8 +1530,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
 
+        # ── Close: collapse this menu so it can't be re-tapped later ──
+        if data == "menu_close":
+            _active_menu.pop(chat_id, None)
+            try:
+                await query.edit_message_text("✓ Closed. Send /menu to reopen.")
+            except Exception:
+                await query.edit_message_reply_markup(reply_markup=None)
+            return
+
         # ── Menu ──
         if data == "menu_back":
+            _active_menu[chat_id] = query.message.message_id
             await query.edit_message_text(
                 "⚡ Zilla — Control Panel\n════════════════════════",
                 reply_markup=kb_menu(uid),
@@ -1567,6 +1620,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("📤 Sent" if ok else "⚠️ Could not send", show_alert=not ok)
             else:
                 await query.answer("File no longer available.", show_alert=True)
+
+        elif data.startswith("ibx_del_"):
+            # ibx_del_{category}_{index}
+            rest = data.removeprefix("ibx_del_")
+            cat, _, idx_str = rest.rpartition("_")
+            idx = int(idx_str) if idx_str.isdigit() else -1
+            items = get_inbox_items(cat)
+            if 0 <= idx < len(items):
+                gone = delete_inbox_file(items[idx]["path"])
+                await query.answer("🗑 Deleted" if gone else "Couldn't delete.", show_alert=not gone)
+            else:
+                await query.answer("File no longer available.", show_alert=True)
+            # Refresh the list in place (re-read, clamp offset to a valid page).
+            items = get_inbox_items(cat)
+            if not items:
+                await query.edit_message_text(
+                    "📥 Empty now.", reply_markup=kb_inbox_categories(get_inbox_counts()))
+            else:
+                off = (idx // INBOX_PAGE) * INBOX_PAGE
+                if off >= len(items):
+                    off = max(0, off - INBOX_PAGE)
+                label = dict(INBOX_CAT_META).get(cat, cat)
+                shown = min(off + INBOX_PAGE, len(items))
+                await query.edit_message_text(
+                    f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
+                    reply_markup=kb_inbox_list(cat, items, off),
+                )
 
         elif data == "menu_browse":
             if not auth.can(uid, "admin"):
@@ -1647,6 +1727,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         # ── Model ──
+        elif data == "model_switch_backend":
+            if not auth.is_owner(uid):
+                await query.answer("Only the owner can switch backend.", show_alert=True)
+                return
+            new_backend = "claude" if get_backend() == "agy" else "agy"
+            set_backend(new_backend)
+            current = get_model()
+            await query.edit_message_text(
+                f"🤖 Model Selection\n════════════════\nBackend: {new_backend}\n"
+                f"Current: {current}\n\n{_model_note()}",
+                reply_markup=kb_model(current),
+            )
+
         elif data == "model_custom":
             if not _can_change_model(uid):
                 await query.answer("Model changes are disabled by the owner.", show_alert=True)

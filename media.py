@@ -260,6 +260,22 @@ def get_inbox_items(category: str | None = None) -> list[dict]:
     return items
 
 
+def delete_inbox_file(path: str) -> bool:
+    """Delete a file ONLY if it lives inside an inbox folder (path-validated)."""
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    roots = [os.path.realpath(d) for d in (INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS)]
+    if not any(real == r or real.startswith(r + os.sep) for r in roots):
+        return False
+    try:
+        os.remove(real)
+        return True
+    except OSError:
+        return False
+
+
 def get_inbox_counts() -> dict:
     """Count files per display category: {images, audio, video, documents}."""
     counts = {c: 0 for c in INBOX_CATEGORIES}

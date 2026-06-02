@@ -7,7 +7,7 @@
 #  MAX_TOTAL_RUNTIME catastrophic ceiling.
 # ============================================================
 
-from platform_compat import apply_window_hiding, PtyProcess
+from platform_compat import apply_window_hiding, PtyProcess, FlashSuppressor
 apply_window_hiding()  # MUST be early: suppresses child console windows on Windows (no-op elsewhere)
 
 import asyncio
@@ -636,6 +636,7 @@ def run_cli(
     starting_step = get_latest_step(conversation_id)
     last_transcript_step = starting_step
     poller = TranscriptPoller(conversation_id, starting_step, progress_callback)
+    flash = None
 
     try:
         custom_env = os.environ.copy()
@@ -644,6 +645,8 @@ def run_cli(
         # CLI will load, for traceability.
         logger.info(f"[ENGINE] Model (from agy settings): {get_selected_model()}")
 
+        # Hide any console windows agy (or its child tools / ConPTY) flash up.
+        flash = FlashSuppressor().start()  # stopped in finally
         pty = PtyProcess(200, 1000)
         pty.spawn(cmd_parts, cwd=CLI_WORKING_DIR, env=custom_env)
 
@@ -751,9 +754,10 @@ def run_cli(
         # head, which is just startup banners) for the PTY fallback below.
         if len(raw_output) > 5000:
             raw_output = raw_output[-5000:]
-        response = clean_response(raw_output)
+        pty_response = clean_response(raw_output)
 
-        # Always try transcript first (authoritative, clean)
+        # Transcript is the AUTHORITATIVE, turn-isolated answer. Try it first.
+        response = ""
         if conversation_id:
             real_response = get_new_responses(conversation_id, starting_step)
             tool_file_paths = _extract_file_paths(conversation_id, starting_step)
@@ -767,9 +771,15 @@ def run_cli(
                     if path_lines:
                         real_response = (real_response + "\n" + path_lines).strip()
                 response = real_response
-            # If transcript is empty, fall through to PTY output — never discard
 
-        if not response:
+        # PTY-screen fallback is the raw TUI scrollback — it can contain the
+        # PREVIOUS turn's text. Only trust it on a NORMAL exit. On cancel/idle/
+        # max-runtime we DON'T have a clean current-turn answer, so we return
+        # just the status header (below) instead of dumping stale screen content.
+        if not response and exit_reason == "normal":
+            response = pty_response
+
+        if not response and exit_reason == "normal":
             response = "No response from CLI. Try rephrasing."
 
         response = sanitize_response(response)
@@ -800,6 +810,8 @@ def run_cli(
     finally:
         # Belt-and-suspenders: never leak the global lock on any exit path.
         _release_new_conv_lock()
+        if flash:
+            flash.stop()
 
 
 def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip_permissions):
