@@ -4,7 +4,15 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🧪 v4.1.0 — Testing-round fixes (menus, inbox, flashing, cancel, backend) *(latest)*
+## 🧹 v4.1.1 — Audit & cleanup *(latest)*
+
+- Audited the v4.1.0 changes: working tree clean, no leftover temp/probe files, 96/96 tests pass.
+- Removed dead code left over from the cross-platform refactor (an unused `command` string + the now-unused `subprocess` import in `cli_engine`).
+- Confirmed intact: the long-run **⏳ Working… [Cancel]** progress message, the idle-reaper delivery (now sourced from the clean transcript — you still get the partial answer, without the old screen-bleed), and the cancel flow. No behavior change beyond the cleanup.
+
+---
+
+## 🧪 v4.1.0 — Testing-round fixes (menus, inbox, flashing, cancel, backend)
 
 Fixes from hands-on testing:
 

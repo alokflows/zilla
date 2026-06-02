@@ -17,7 +17,6 @@ import re
 import time
 import logging
 import threading
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
@@ -625,7 +624,6 @@ def run_cli(
     # Use a generous print-timeout so the CLI itself never fires before our idle reaper
     print_timeout_min = max(1, (max_total_runtime or 3600) // 60)
     cmd_parts.extend(["--print-timeout", f"{print_timeout_min}m", "--print", prompt])
-    command = subprocess.list2cmdline(cmd_parts)
 
     conv_label = conversation_id[:12] if conversation_id else "new"
     logger.info(
