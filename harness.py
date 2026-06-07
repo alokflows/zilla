@@ -285,8 +285,10 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
     if conv_dir is None:
         conv_dir = os.path.join(AGI_BRAIN_DIR, "Outbox")
 
+    relay = _relay_protocol(os.path.join(AGI_BRAIN_DIR, "Bridge"))
+
     if not is_new:
-        return operating_contract(backend)
+        return operating_contract(backend) + "\n\n" + relay
 
     parts: list[str] = [engine_context(backend)]
     instructions = _raw_instructions()
@@ -298,7 +300,32 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
         parts.append("AVAILABLE SKILLS (load only when the task needs one):\n" + skills)
 
     parts.append(f"{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}")
+    parts.append(relay)
     return "\n\n".join(parts)
+
+
+def _relay_protocol(bridge_dir: str) -> str:
+    """Instruction block teaching the agent the human-in-the-loop file bridge.
+    This is what lets an autonomous login/checkout pause for an OTP, phone
+    number, password, or final confirmation and resume with the owner's reply
+    delivered through Telegram. Kept short so it costs little per turn."""
+    return (
+        "HUMAN-IN-THE-LOOP (credentials / OTP / confirmations):\n"
+        "When you need something only the human can provide — a phone number, an "
+        "OTP/2FA code, a password, or a final yes/no before an irreversible action "
+        "(placing an order, spending money, deleting data) — DO NOT guess, invent, "
+        "or give up. Ask the human through this file bridge and wait:\n"
+        "  1. Pick a random 16-hex id, e.g. via `openssl rand -hex 8`.\n"
+        f"  2. Write {bridge_dir}/ask_<id>.json containing exactly:\n"
+        '     {"id":"<id>","kind":"otp|text|password|confirm",'
+        '"prompt":"<your question>","chat_id":0,"created":<unix_seconds>}\n'
+        f"  3. Poll for {bridge_dir}/answer_<id>.json every ~3s (up to ~10 min). "
+        'When it appears, read its JSON "value" field — that is the human\'s reply.\n'
+        "  4. Delete both files, then continue using the value.\n"
+        "Use kind=otp for one-time codes, password for secrets (both are masked in "
+        "chat), text for things like a phone number or address, confirm for yes/no. "
+        "The bot relays your prompt to the owner's Telegram and writes their answer."
+    )
 
 
 def wrap_prompt(user_message: str, *, is_new: bool, backend: str | None = None,

@@ -82,6 +82,7 @@ from media import (
 )
 from formatter import format_for_telegram, detect_file_paths
 from harness import log_event, log_summary
+import interactive
 from users import AuthManager
 from schedules import ScheduleManager, describe as describe_schedule
 from schedule_parse import parse_schedule, parse_schedule_command
@@ -165,6 +166,12 @@ schedules_mgr: ScheduleManager = None
 
 # Per-chat cancel events — set to cancel the active CLI request for that chat
 _active_cancel: dict[int, threading.Event] = {}
+
+# Human-in-the-loop credential/OTP bridge: chat_id -> ask_id currently awaiting
+# that chat's reply, plus the set of ask ids we've already DMed (so the watcher
+# doesn't re-prompt). See interactive.py for the file protocol.
+_pending_bridge: dict[int, str] = {}
+_bridge_announced: set[str] = set()
 
 # Per-chat id of the CURRENT live menu message. When a new menu opens we strip
 # the previous one's buttons so old menus in the chat history can't be tapped
@@ -1652,6 +1659,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # Human-in-the-loop bridge: if the agent asked this chat for an OTP / phone /
+    # password / confirmation, this message IS the answer — hand it back to the
+    # waiting CLI turn instead of starting a new one.
+    pending_ask = _pending_bridge.get(chat_id)
+    if pending_ask:
+        text = update.message.text or ""
+        try:
+            interactive.write_answer(pending_ask, text)
+            _pending_bridge.pop(chat_id, None)
+            await update.message.reply_text("✅ Got it — continuing.")
+        except Exception as e:
+            await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
+        return
+
     # Owner add-user flow intercept
     if auth.is_owner(uid) and "adduser_flow" in context.user_data:
         await _handle_adduser_flow(update, context, context.user_data["adduser_flow"])
@@ -2243,12 +2264,64 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 #  STARTUP
 # ══════════════════════════════════════════════════════════
 
+async def bridge_watcher(application):
+    """Relay the agent's credential/OTP/confirm requests to the owner's Telegram.
+
+    Polls the Bridge dir; for each new ask it DMs the prompt and records that the
+    chat owes an answer (captured by handle_message). Cleans up answered/stale
+    asks. Inert when the agent isn't asking for anything.
+    """
+    _KIND_LABEL = {"otp": "🔐 One-time code", "password": "🔑 Password",
+                   "text": "✍️ Input needed", "confirm": "❓ Please confirm"}
+    logger.info("[BRIDGE] credential/OTP watcher started")
+    while True:
+        try:
+            for ask in interactive.read_pending_asks():
+                if ask.id in _bridge_announced:
+                    continue
+                target = ask.chat_id or OWNER_CHAT_ID
+                if not target:
+                    continue
+                if _pending_bridge.get(target) and _pending_bridge[target] != ask.id:
+                    continue  # one outstanding ask per chat at a time
+                hint = "\n\n<i>Reply with the value — used once.</i>" if ask.is_secret else ""
+                try:
+                    await application.bot.send_message(
+                        chat_id=target,
+                        text=f"{_KIND_LABEL.get(ask.kind, '✍️ Input needed')}\n\n"
+                             f"{format_for_telegram(ask.prompt)[0]}{hint}",
+                        parse_mode="HTML",
+                    )
+                    _bridge_announced.add(ask.id)
+                    _pending_bridge[target] = ask.id
+                    log_event("bridge_ask", kind=ask.kind, chat=target)
+                except Exception as e:
+                    logger.error(f"[BRIDGE] could not DM ask {ask.id}: {e}")
+            interactive.expire_stale()
+            # Forget announced asks that are gone (answered+cleared) so the maps
+            # don't grow unbounded.
+            live = {a.id for a in interactive.read_pending_asks()}
+            for aid in list(_bridge_announced):
+                if aid not in live:
+                    _bridge_announced.discard(aid)
+                    for cid, pid in list(_pending_bridge.items()):
+                        if pid == aid:
+                            _pending_bridge.pop(cid, None)
+        except Exception as e:
+            logger.error(f"[BRIDGE] watcher error: {e}", exc_info=True)
+        await asyncio.sleep(2)
+
+
 async def post_init(application):
     # Register the native Telegram slash-command menu (the "/" autocomplete).
     await _register_commands(application)
 
     # Start the background scheduler (custom asyncio loop).
     application.create_task(scheduler_loop(application))
+
+    # Start the human-in-the-loop credential/OTP relay watcher.
+    interactive.ensure_bridge_dir()
+    application.create_task(bridge_watcher(application))
 
     if OWNER_CHAT_ID:
         try:
