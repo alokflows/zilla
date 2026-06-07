@@ -41,6 +41,7 @@ import asyncio
 import atexit
 import sys
 import os
+import re
 import logging
 import threading
 import time
@@ -78,6 +79,7 @@ from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
     get_inbox_stats, get_inbox_items, get_inbox_counts, delete_inbox_file,
+    get_outbox_items, get_outbox_counts, delete_outbox_file,
     format_file_size, extract_text,
 )
 from formatter import format_for_telegram, detect_file_paths
@@ -505,6 +507,7 @@ def kb_menu(uid: int = 0):
     rows = [
         [InlineKeyboardButton("📁 Sessions", callback_data="menu_sessions"),
          InlineKeyboardButton("📥 Inbox", callback_data="menu_inbox")],
+        [InlineKeyboardButton("📤 Outbox", callback_data="menu_outbox")],
     ]
     if is_admin:
         # ⏰ Schedules previously had NO menu entry (command-only) — added here.
@@ -656,6 +659,10 @@ def kb_user_detail(target_id: int, role: str = "admin"):
 
 # ── Inbox (drill-down: categories → paginated list → send) ───
 INBOX_PAGE = 10
+# Max files auto-attached per response. Beyond this, the rest stay in the
+# Outbox and the user pulls them via 📤 Outbox (kept sane so one huge result
+# can't spam the chat with dozens of uploads).
+MAX_AUTO_DELIVER = 10
 INBOX_CAT_META = [
     ("images", "📷 Images"),
     ("audio", "🎵 Audio"),
@@ -701,6 +708,55 @@ def kb_inbox_list(category: str, items: list, offset: int):
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_inbox"), _close_btn()])
+    return InlineKeyboardMarkup(rows)
+
+
+# ── Outbox (agent-produced files) ─────────────────────────
+# Same UX as the Inbox, but over ~/AGI-Brain/Outbox. Outbox has no audio.
+OUTBOX_CAT_META = [
+    ("images", "📷 Images"),
+    ("video", "🎬 Video"),
+    ("documents", "📄 Documents"),
+]
+
+
+def kb_outbox_categories(counts: dict):
+    rows = []
+    for cat, label in OUTBOX_CAT_META:
+        n = counts.get(cat, 0)
+        if n:
+            rows.append([InlineKeyboardButton(
+                f"{label} ({n})", callback_data=f"obx_cat_{cat}_0",
+            )])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_outbox_list(category: str, items: list, offset: int):
+    """One row per file: [ name (size) | 📤 send | 🗑 delete ]."""
+    rows = []
+    page = items[offset:offset + INBOX_PAGE]
+    for i, item in enumerate(page):
+        idx = offset + i
+        name = item["name"]
+        label = name if len(name) <= 24 else name[:21] + "…"
+        send_cb = f"obx_send_{category}_{idx}"
+        rows.append([
+            InlineKeyboardButton(
+                f"{label} ({format_file_size(item['size'])})", callback_data=send_cb),
+            InlineKeyboardButton("📤", callback_data=send_cb),
+            InlineKeyboardButton("🗑", callback_data=f"obx_del_{category}_{idx}"),
+        ])
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(
+            "⬅️ Prev", callback_data=f"obx_cat_{category}_{max(0, offset - INBOX_PAGE)}"))
+    if offset + INBOX_PAGE < len(items):
+        nav.append(InlineKeyboardButton(
+            "More ➡️", callback_data=f"obx_cat_{category}_{offset + INBOX_PAGE}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_outbox"), _close_btn()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -778,16 +834,23 @@ async def send_response(update, context, response: str, user_id: int, chat_id: i
         except Exception:
             pass
 
-    # Auto-deliver files mentioned in response (admin+ only)
+    # Auto-deliver files mentioned in response (admin+ only).
+    # A Telegram user can't open a server-side path, so we attach the actual
+    # files. Cap is generous (was 3 — which silently dropped the rest of a
+    # multi-file result); anything beyond the cap stays in 📤 Outbox.
     if auth.can(user_id, "admin"):
         file_paths = detect_file_paths(response)
         conv_id = sessions.get_conversation_id(user_id=user_id)
         files_sent = 0
-        for fp in file_paths[:3]:
+        for fp in file_paths[:MAX_AUTO_DELIVER]:
             if await safe_send_file(context.bot, chat_id, fp, conv_id=conv_id, user_id=user_id):
                 files_sent += 1
         if files_sent:
-            await safe_send(context.bot, chat_id, f"📎 {files_sent} file(s) delivered.")
+            extra = len(file_paths) - files_sent
+            note = f"📎 {files_sent} file(s) delivered."
+            if extra > 0:
+                note += f" {extra} more in 📤 Outbox (/menu → Outbox)."
+            await safe_send(context.bot, chat_id, note)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1061,6 +1124,47 @@ _SCHED_MAX_RETRIES = 3    # attempts per occurrence before giving up (and notify
 # Response shapes that mean "the run did not really succeed".
 _SCHED_FAIL_PREFIXES = ("Error:", "Claude error:", "⏱️", "⚠️ Stopped")
 
+# A bare "take a screenshot" intent — short, no chaining. Such schedules must
+# NOT go through the CLI agent: on the scheduler path the agent's browser tools
+# aren't wired up, so it errors with "Kimi WebBridge not working" even though a
+# one-off /browse screenshot works. We route these straight to the bridge.
+_SCREENSHOT_RE = re.compile(r"\bscreen\s?shot\b", re.IGNORECASE)
+
+
+def _is_simple_screenshot(prompt: str) -> bool:
+    p = (prompt or "").strip()
+    if not _SCREENSHOT_RE.search(p):
+        return False
+    return len(p.split()) <= 8 and not re.search(r"\b(then|after|and)\b", p, re.IGNORECASE)
+
+
+async def _screenshot_via_bridge(application, s: dict) -> tuple[bool, str, str]:
+    """Take a screenshot through KimiWebBridge directly (the path that actually
+    works) and stash it in the Outbox, so delivery + the send allowlist pass.
+    Returns the (ok, response, detail) triple _execute_schedule promises."""
+    import shutil
+    bot = application.bot
+    try:
+        await bot.send_chat_action(chat_id=s["chat_id"], action=ChatAction.TYPING)
+    except Exception:
+        pass
+    try:
+        result = await bridge_command("screenshot", {}, timeout=30)
+    except Exception as e:
+        return False, f"Error: screenshot bridge unreachable: {e}", str(e)
+    src = (result.get("data") or {}).get("path", "")
+    if not (src and os.path.isfile(src)):
+        return False, f"Error: screenshot failed: {json.dumps(result)[:200]}", "no path"
+    try:
+        os.makedirs(OUTBOX_IMAGES, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = os.path.splitext(src)[1] or ".png"
+        dest = os.path.join(OUTBOX_IMAGES, f"screenshot_{ts}{ext}")
+        shutil.copyfile(src, dest)
+    except Exception as e:
+        return False, f"Error: could not save screenshot: {e}", str(e)
+    return True, f"📸 Screenshot saved to {dest}", ""
+
 
 async def _execute_schedule(application, s: dict) -> tuple[bool, str, str]:
     """Run one schedule's prompt. Returns (ok, response, detail). No delivery,
@@ -1081,6 +1185,10 @@ async def _execute_schedule(application, s: dict) -> tuple[bool, str, str]:
         except Exception:
             pass
         return False, "", "owner deauthorized"
+
+    # Screenshot schedules bypass the CLI agent entirely (see _screenshot_via_bridge).
+    if _is_simple_screenshot(s.get("prompt", "")):
+        return await _screenshot_via_bridge(application, s)
 
     try:
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -1131,6 +1239,17 @@ async def _deliver_schedule_result(application, s: dict, response: str):
                             parse_mode="HTML")
             await bot.send_message(chat_id=chat_id, text="🤖 Switch model:",
                                    reply_markup=kb_model(get_model()))
+        # Attach any files the job produced. Scheduled jobs never did this
+        # before — a schedule that made a chart/sheet/screenshot delivered only
+        # the text path, never the file.
+        if auth and auth.can(uid, "admin"):
+            paths = detect_file_paths(response or "")
+            sent = 0
+            for fp in paths[:MAX_AUTO_DELIVER]:
+                if await safe_send_file(bot, chat_id, fp, user_id=uid):
+                    sent += 1
+            if sent:
+                await safe_send(bot, chat_id, f"📎 {sent} file(s) delivered.")
     except Exception as e:
         logger.error(f"[SCHED] deliver {s['id']} failed: {e}")
 
@@ -1892,6 +2011,82 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(
                     f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
                     reply_markup=kb_inbox_list(cat, items, off),
+                )
+
+        elif data == "menu_outbox":
+            counts = get_outbox_counts()
+            total = sum(counts.values())
+            if not total:
+                await query.edit_message_text(
+                    "📤 Outbox empty.\nFiles you ask me to create land here.",
+                    reply_markup=kb_back())
+            else:
+                await query.edit_message_text(
+                    f"📤 Outbox — {total} item(s)\nPick a category:",
+                    reply_markup=kb_outbox_categories(counts),
+                )
+
+        elif data.startswith("obx_cat_"):
+            # obx_cat_{category}_{offset}
+            rest = data.removeprefix("obx_cat_")
+            cat, _, off_str = rest.rpartition("_")
+            offset = int(off_str) if off_str.isdigit() else 0
+            items = get_outbox_items(cat)
+            if not items:
+                await query.edit_message_text(
+                    "📤 Nothing here anymore.",
+                    reply_markup=kb_outbox_categories(get_outbox_counts()),
+                )
+            else:
+                label = dict(OUTBOX_CAT_META).get(cat, cat)
+                shown = min(offset + INBOX_PAGE, len(items))
+                await query.edit_message_text(
+                    f"{label} — {len(items)} file(s)\nShowing {offset + 1}–{shown}. "
+                    f"Tap a file or 📤 to send it here.",
+                    reply_markup=kb_outbox_list(cat, items, offset),
+                )
+
+        elif data.startswith("obx_send_"):
+            # obx_send_{category}_{index}
+            rest = data.removeprefix("obx_send_")
+            cat, _, idx_str = rest.rpartition("_")
+            idx = int(idx_str) if idx_str.isdigit() else -1
+            items = get_outbox_items(cat)
+            if 0 <= idx < len(items):
+                item = items[idx]
+                ok = await safe_send_file(
+                    context.bot, chat_id, item["path"],
+                    caption=item["name"], user_id=uid,
+                )
+                await query.answer("📤 Sent" if ok else "⚠️ Could not send", show_alert=not ok)
+            else:
+                await query.answer("File no longer available.", show_alert=True)
+
+        elif data.startswith("obx_del_"):
+            # obx_del_{category}_{index}
+            rest = data.removeprefix("obx_del_")
+            cat, _, idx_str = rest.rpartition("_")
+            idx = int(idx_str) if idx_str.isdigit() else -1
+            items = get_outbox_items(cat)
+            if 0 <= idx < len(items):
+                gone = delete_outbox_file(items[idx]["path"])
+                await query.answer("🗑 Deleted" if gone else "Couldn't delete.", show_alert=not gone)
+            else:
+                await query.answer("File no longer available.", show_alert=True)
+            # Refresh the list in place (re-read, clamp offset to a valid page).
+            items = get_outbox_items(cat)
+            if not items:
+                await query.edit_message_text(
+                    "📤 Empty now.", reply_markup=kb_outbox_categories(get_outbox_counts()))
+            else:
+                off = (idx // INBOX_PAGE) * INBOX_PAGE
+                if off >= len(items):
+                    off = max(0, off - INBOX_PAGE)
+                label = dict(OUTBOX_CAT_META).get(cat, cat)
+                shown = min(off + INBOX_PAGE, len(items))
+                await query.edit_message_text(
+                    f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
+                    reply_markup=kb_outbox_list(cat, items, off),
                 )
 
         elif data == "menu_browse":

@@ -342,6 +342,59 @@ def test_inbox_delete_file():
 
 
 # ════════════════════════════════════════════════════════════
+#  OUTBOX — browse/send/delete of agent-produced files (v4.6)
+# ════════════════════════════════════════════════════════════
+
+def _setup_outbox():
+    base = os.path.join(_tmpdir, f"outbox_{os.urandom(4).hex()}")
+    img = os.path.join(base, "images"); doc = os.path.join(base, "documents")
+    for d in (img, doc):
+        os.makedirs(d, exist_ok=True)
+    open(os.path.join(img, "chart.png"), "w").close()
+    open(os.path.join(doc, "report.pdf"), "w").close()
+    open(os.path.join(doc, "sales.xlsx"), "w").close()
+    open(os.path.join(doc, "clip.mp4"), "w").close()   # video lives under documents
+    media.OUTBOX_IMAGES, media.OUTBOX_DOCUMENTS = img, doc
+    return img, doc
+
+
+def test_outbox_lists_and_classifies():
+    _setup_outbox()
+    counts = media.get_outbox_counts()
+    check("outbox: counts per category",
+          counts == {"images": 1, "video": 1, "documents": 2}, str(counts))
+    vids = {i["name"] for i in media.get_outbox_items("video")}
+    check("outbox: video split out of documents", vids == {"clip.mp4"}, str(vids))
+
+
+def test_outbox_delete_is_path_scoped():
+    _, doc = _setup_outbox()
+    target = os.path.join(doc, "report.pdf")
+    check("outbox-del: file exists before", os.path.exists(target))
+    check("outbox-del: deletes a real outbox file", media.delete_outbox_file(target) is True)
+    check("outbox-del: file gone after", not os.path.exists(target))
+    outside = os.path.join(_tmpdir, "outbox_outside_secret.txt")
+    open(outside, "w").close()
+    check("outbox-del: refuses path outside outbox", media.delete_outbox_file(outside) is False)
+    check("outbox-del: outside file untouched", os.path.exists(outside))
+
+
+def test_detect_file_paths_posix():
+    # The Windows-only extractor silently delivered ZERO files on macOS/Linux.
+    # This guards the cross-platform delivery fix.
+    from formatter import detect_file_paths
+    base = os.path.join(_tmpdir, f"deliver_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    f1 = os.path.join(base, "report.pdf"); open(f1, "w").close()
+    f2 = os.path.join(base, "sales.xlsx"); open(f2, "w").close()
+    msg = f"Here are your files:\n• {f1}\n• {f2}\nDone."
+    got = detect_file_paths(msg)
+    check("deliver: POSIX bullet paths detected", f1 in got and f2 in got, str(got))
+    check("deliver: only existing files returned",
+          detect_file_paths(f"see /no/such/file_{os.urandom(3).hex()}.pdf") == [])
+
+
+# ════════════════════════════════════════════════════════════
 #  SCHEDULES — next-run math, due selection, persistence, catch-up
 # ════════════════════════════════════════════════════════════
 
@@ -706,6 +759,9 @@ def main():
         test_inbox_counts,
         test_inbox_filter_returns_only_category,
         test_inbox_delete_file,
+        test_outbox_lists_and_classifies,
+        test_outbox_delete_is_path_scoped,
+        test_detect_file_paths_posix,
         test_next_run_daily,
         test_next_run_interval_and_once,
         test_next_run_weekly,

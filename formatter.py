@@ -290,35 +290,52 @@ def _escape_mdv2_with_formatting(text: str) -> str:
 # ══════════════════════════════════════════════════════════
 
 def detect_file_paths(text: str) -> list[str]:
-    """Extract Windows file paths from response text."""
+    """Extract file paths (Windows AND POSIX) from response text.
+
+    Zilla is cross-platform, so this must catch both `C:\\Users\\...` and
+    `/Users/me/...` / `~/...`. The Windows-only version silently delivered
+    zero files on macOS/Linux, where the agent writes to /Users/.../AGI-Brain.
+    """
     import os
     paths = []
 
-    # Quoted paths
+    def _add(p: str):
+        if p and p not in paths:
+            paths.append(p)
+
+    # ── Windows drive-letter paths ──────────────────────────────
+    # Quoted
     for match in re.findall(r'["\']([A-Z]:[\\/][^"\']+?)["\']', text, re.IGNORECASE):
-        paths.append(match)
-
-    # Backtick paths
+        _add(match)
+    # Backtick
     for match in re.findall(r'`([A-Z]:[\\/][^`]+?)`', text, re.IGNORECASE):
-        if match not in paths:
-            paths.append(match)
-
-    # "saved to/at" patterns
+        _add(match)
+    # "saved to/at"
     for match in re.findall(
         r'(?:saved|created|written|output|generated|exported|stored|placed|available)'
         r'\s+(?:to|at|in|as)\s+([A-Z]:[\\/][^\s\n\r,;]+)', text, re.IGNORECASE
     ):
-        clean = match.rstrip(".,;:)'\"]}*")
-        if clean not in paths:
-            paths.append(clean)
-
-    # Unquoted paths
+        _add(match.rstrip(".,;:)'\"]}*"))
+    # Unquoted
     for match in re.findall(r'[A-Z]:[\\/](?:[^\s<>"|?*\n`]+[\\/])*[^\s<>"|?*\n`]+', text, re.IGNORECASE):
-        match = match.rstrip(".,;:)'\"]}*")
-        if match not in paths:
-            paths.append(match)
+        _add(match.rstrip(".,;:)'\"]}*"))
 
-    # Validate
+    # ── POSIX paths (absolute /… and home ~/…) ──────────────────
+    # Quoted or backtick-wrapped
+    for match in re.findall(r'["\'`]((?:~|/)[^"\'`\n]+?)["\'`]', text):
+        _add(os.path.expanduser(match.strip()))
+    # "saved to/at"
+    for match in re.findall(
+        r'(?:saved|created|written|output|generated|exported|stored|placed|available)'
+        r'\s+(?:to|at|in|as)\s+((?:~|/)[^\s\n\r,;]+)', text, re.IGNORECASE
+    ):
+        _add(os.path.expanduser(match.rstrip(".,;:)'\"]}*")))
+    # Unquoted — bullet lists ("• /a/b/c.pdf"), inline mentions, etc.
+    # Require a real filename segment so we don't grab bare "/" or "/usr".
+    for match in re.findall(r'(?:~|/)(?:[\w.\-]+/)+[\w.\-]+\.[A-Za-z0-9]{1,8}', text):
+        _add(os.path.expanduser(match.rstrip(".,;:)'\"]}*")))
+
+    # ── Validate: only real, existing files, de-duplicated ──────
     valid = []
     for p in paths:
         normalized = os.path.normpath(p)

@@ -197,7 +197,7 @@ TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_MAX_SEND_FILE = 50 * 1024 * 1024  # 50 MB
 
 # --- Bot ---
-BOT_VERSION = "4.1.1"
+BOT_VERSION = "4.6.0"
 
 
 # ── Settings (simple JSON dict) ───────────────────────────

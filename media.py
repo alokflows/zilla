@@ -11,6 +11,7 @@ from datetime import datetime
 
 from config import (
     FFMPEG_PATH, INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS,
+    OUTBOX_DOCUMENTS, OUTBOX_IMAGES,
     TELEGRAM_MAX_SEND_FILE,
 )
 
@@ -300,3 +301,65 @@ def format_file_size(size_bytes: int) -> str:
     elif size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+# ── Outbox (files the agent PRODUCES) ─────────────────────
+#
+# The CLI writes generated files (reports, sheets, charts, screenshots…) into
+# ~/AGI-Brain/Outbox/{documents,images}. The bot auto-delivers what it can,
+# but the user also needs to browse/send/delete the rest from Telegram — same
+# UX as the Inbox. These mirror the inbox helpers (video split out of docs;
+# Outbox has no audio folder).
+
+OUTBOX_CATEGORIES = ("images", "video", "documents")
+
+
+def get_outbox_items(category: str | None = None) -> list[dict]:
+    """List outbox items with metadata, newest first. Same shape as
+    get_inbox_items: {name, category, size, path, mtime}."""
+    items = []
+    for folder_category, folder in [
+        ("images", OUTBOX_IMAGES), ("documents", OUTBOX_DOCUMENTS),
+    ]:
+        if not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            fpath = os.path.join(folder, fname)
+            if not os.path.isfile(fpath):
+                continue
+            cat = _classify(folder_category, fname)
+            if category and cat != category:
+                continue
+            try:
+                mtime = os.path.getmtime(fpath)
+                size = os.path.getsize(fpath)
+            except OSError:
+                continue
+            items.append({"name": fname, "category": cat, "size": size,
+                          "path": fpath, "mtime": mtime})
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return items
+
+
+def delete_outbox_file(path: str) -> bool:
+    """Delete a file ONLY if it lives inside an outbox folder (path-validated)."""
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    roots = [os.path.realpath(d) for d in (OUTBOX_IMAGES, OUTBOX_DOCUMENTS)]
+    if not any(real == r or real.startswith(r + os.sep) for r in roots):
+        return False
+    try:
+        os.remove(real)
+        return True
+    except OSError:
+        return False
+
+
+def get_outbox_counts() -> dict:
+    """Count files per display category: {images, video, documents}."""
+    counts = {c: 0 for c in OUTBOX_CATEGORIES}
+    for item in get_outbox_items():
+        counts[item["category"]] = counts.get(item["category"], 0) + 1
+    return counts
