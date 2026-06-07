@@ -69,11 +69,11 @@ from config import (
     AGI_BRAIN_DIR, HOME_DIR, ensure_dirs, KIMI_BRIDGE_URL,
     get_model, set_model, get_idle_kill_after, get_setting, set_setting,
     OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES, BRAIN_DIR,
-    AGY_MODELS, AGY_EFFORTS, model_display, SCHEDULES_FILE,
+    SCHEDULES_FILE, agy_models_live,
     model_catalog, get_backend, set_backend,
 )
 from sessions import SessionManager
-from cli_engine import run_cli_async, get_latest_step, detect_limit
+from cli_engine import run_cli_async, get_latest_step, detect_limit, backend_status
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
@@ -81,6 +81,7 @@ from media import (
     format_file_size, extract_text,
 )
 from formatter import format_for_telegram, detect_file_paths
+from harness import log_event, log_summary
 from users import AuthManager
 from schedules import ScheduleManager, describe as describe_schedule
 from schedule_parse import parse_schedule, parse_schedule_command
@@ -376,29 +377,91 @@ def _can_change_model(uid: int) -> bool:
     return auth.can_change_model(uid, get_setting("admins_can_change_model", True))
 
 
+async def _backend_panel() -> str:
+    """Live identity of the active backend (account, plan, current model).
+    Runs the (cached) status lookup off the event loop so menus stay instant."""
+    st = await asyncio.to_thread(backend_status)
+    lines = [f"🧠 {st['label']}"]
+    if st["backend"] == "claude":
+        if st.get("logged_in"):
+            acct = st.get("account") or "unknown"
+            plan = (st.get("plan") or "").capitalize()
+            lines.append(f"✅ Logged in: {acct}" + (f" · {plan}" if plan else ""))
+        else:
+            err = f" ({st['error']})" if st.get("error") else ""
+            lines.append(f"🔴 Not logged in{err} — run: claude auth login")
+    else:  # agy
+        if not st.get("installed"):
+            lines.append("🔴 Not installed on this Mac yet (setup pending)")
+        elif st.get("logged_in"):
+            lines.append(f"✅ Logged in · {st.get('auth_method') or 'Google OAuth'}")
+        else:
+            err = f" ({st['error']})" if st.get("error") else ""
+            lines.append(f"🟡 Installed but not responding{err}")
+    cur = st.get("model")
+    if cur:
+        label = next((lbl for lbl, val in model_catalog() if val == cur), cur)
+        lines.append(f"🤖 Model: {label}  ({cur})")
+    return "\n".join(lines)
+
+
+async def _health_panel() -> str:
+    """Diagnostics from the structured trust log — shows the trust gate and the
+    self-healing scheduler actually working. Read off the event loop."""
+    counts = await asyncio.to_thread(log_summary)
+    turns = counts.get("turn_end", 0)
+    flagged = counts.get("hallucination_flagged", 0)
+    retries = counts.get("hallucination_retry", 0)
+    sched_ok = counts.get("schedule_ok", 0)
+    sched_fail = counts.get("schedule_failed", 0)
+    lines = [
+        "🩺 Health & Diagnostics",
+        "═══════════════════",
+        "",
+        await _backend_panel(),
+        "",
+        f"⏱️ Uptime: {get_uptime_str()}",
+        f"💬 Turns handled: {turns}",
+        f"🛡️ Hallucinations caught: {flagged}"
+        + (f" · {retries} re-checked" if retries else ""),
+        f"⏰ Scheduled runs: {sched_ok} ok · {sched_fail} failed",
+        "",
+        f"🔧 Zilla v{BOT_VERSION}",
+        "Trust log: logs/trust_log.jsonl",
+    ]
+    return "\n".join(lines)
+
+
 def _model_note() -> str:
     """Backend-specific hint shown under the model picker."""
     if get_backend() == "claude":
         return ("ℹ️ Backend: Claude Code. Pick Opus/Sonnet/Haiku, or ✏️ Custom for "
                 "an exact model name. (Switch backend in /settings.)")
-    return ("ℹ️ Backend: agy. Common Gemini options below; agy fetches the full "
-            "list from your Antigravity account — use ✏️ Custom for any exact name "
-            "from agy's own Switch Model screen.")
+    return ("ℹ️ Backend: agy. This is the LIVE list from your Antigravity account "
+            "(via `agy models`). Tap one to switch — it applies to your next "
+            "message. ✏️ Custom takes any exact name agy accepts.")
 
 
 def kb_menu(uid: int = 0):
+    is_admin = bool(auth and auth.can(uid, "admin"))
     rows = [
         [InlineKeyboardButton("📁 Sessions", callback_data="menu_sessions"),
          InlineKeyboardButton("📥 Inbox", callback_data="menu_inbox")],
-        [InlineKeyboardButton("🖥️ Status", callback_data="menu_status")],
     ]
-    if auth and auth.can(uid, "admin"):
-        if _can_change_model(uid):
-            rows[0].append(InlineKeyboardButton("🤖 Model", callback_data="menu_model"))
-        rows.insert(1, [
+    if is_admin:
+        # ⏰ Schedules previously had NO menu entry (command-only) — added here.
+        rows.append([
+            InlineKeyboardButton("⏰ Schedules", callback_data="menu_schedules"),
             InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-            InlineKeyboardButton("🌐 Browse", callback_data="menu_browse"),
         ])
+        model_row = [InlineKeyboardButton("🌐 Browse", callback_data="menu_browse")]
+        if _can_change_model(uid):
+            model_row.insert(0, InlineKeyboardButton("🤖 Model", callback_data="menu_model"))
+        rows.append(model_row)
+    rows.append([
+        InlineKeyboardButton("🖥️ Status", callback_data="menu_status"),
+        InlineKeyboardButton("🩺 Health", callback_data="menu_health"),
+    ])
     if auth and auth.is_owner(uid):
         rows.append([InlineKeyboardButton("👥 Users", callback_data="menu_users")])
     rows.append([_close_btn()])
@@ -846,7 +909,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = get_model()
     await _open_menu(
         update, context,
-        f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n{_model_note()}",
+        f"🤖 Model Selection\n════════════════\n{await _backend_panel()}\n\n{_model_note()}",
         kb_model(current),
     )
 
@@ -924,12 +987,26 @@ def _make_schedule(uid: int, chat_id: int, parsed: dict):
 
 
 # ── Scheduler runtime (custom asyncio loop; no APScheduler dependency) ──
+#
+#  Self-healing model (fixes the old silent-failure bug where touch_run advanced
+#  the schedule even when the run errored, losing the job forever):
+#    _execute_schedule  → runs the CLI, classifies ok/failure, NO delivery.
+#    _deliver_*         → sends the result to Telegram.
+#    _run_and_record    → loop path: deliver on success/give-up, mark outcome,
+#                         RETRY a failed run a few times before advancing.
+#    _run_now           → manual ▶️ trigger: run + deliver, never advance.
 
-_SCHED_TICK = 20  # seconds between due-checks
+_SCHED_TICK = 20          # seconds between due-checks
+_SCHED_RETRY_DELAY = 120  # wait this long before retrying a failed run
+_SCHED_MAX_RETRIES = 3    # attempts per occurrence before giving up (and notifying)
+
+# Response shapes that mean "the run did not really succeed".
+_SCHED_FAIL_PREFIXES = ("Error:", "Claude error:", "⏱️", "⚠️ Stopped")
 
 
-async def _run_scheduled(application, s: dict):
-    """Run one schedule's prompt through agy and DM the result."""
+async def _execute_schedule(application, s: dict) -> tuple[bool, str, str]:
+    """Run one schedule's prompt. Returns (ok, response, detail). No delivery,
+    no schedule mutation — pure execution + outcome classification."""
     uid = s["user_id"]
     chat_id = s["chat_id"]
     bot = application.bot
@@ -937,6 +1014,8 @@ async def _run_scheduled(application, s: dict):
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception:
         pass
+
+    ok, detail, response = True, "", ""
     try:
         async with _get_user_lock(uid):
             conv_id = None
@@ -949,9 +1028,25 @@ async def _run_scheduled(application, s: dict):
             if sname and detected and detected != conv_id:
                 sessions.set_conversation_id(detected, user_id=uid, session_name=sname, backend=get_backend())
     except Exception as e:
-        response = f"Error: {e}"
+        ok, detail, response = False, str(e), f"Error: {e}"
         logger.error(f"[SCHED] run {s['id']} failed: {e}", exc_info=True)
 
+    # Response-level failure detection (empty / rate-limited / error text).
+    if ok:
+        if not (response and response.strip()):
+            ok, detail = False, "empty response"
+        elif detect_limit(response):
+            ok, detail = False, f"model limited: {detect_limit(response)}"
+        elif response.lstrip().startswith(_SCHED_FAIL_PREFIXES):
+            ok, detail = False, response.strip()[:200]
+    return ok, response, detail
+
+
+async def _deliver_schedule_result(application, s: dict, response: str):
+    """Send a schedule's output to its chat, with the rate-limit switch helper."""
+    bot = application.bot
+    chat_id = s["chat_id"]
+    uid = s["user_id"]
     header = f"⏰ Scheduled — {s.get('title','')}\n"
     try:
         formatted, parse_mode = format_for_telegram(response or "(no output)")
@@ -968,8 +1063,51 @@ async def _run_scheduled(application, s: dict):
         logger.error(f"[SCHED] deliver {s['id']} failed: {e}")
 
 
+async def _run_and_record(application, s: dict):
+    """Loop path: run a due schedule, deliver, and record the outcome with retry.
+    A failed run is retried (_SCHED_MAX_RETRIES × _SCHED_RETRY_DELAY) before the
+    schedule advances — and the user is told if it ultimately couldn't complete."""
+    sid = s["id"]
+    title = s.get("title", "")
+    ok, response, detail = await _execute_schedule(application, s)
+    if ok:
+        schedules_mgr.mark_success(sid)
+        log_event("schedule_ok", id=sid, title=title[:40])
+        await _deliver_schedule_result(application, s, response)
+        return
+    outcome, attempt = schedules_mgr.mark_failure(
+        sid, _SCHED_RETRY_DELAY, _SCHED_MAX_RETRIES)
+    log_event("schedule_failed", id=sid, title=title[:40],
+              attempt=attempt, outcome=outcome, detail=(detail or "")[:200])
+    if outcome == "gaveup":
+        # Never silent: tell the owner what happened + hand over any partial output.
+        try:
+            await safe_send(
+                application.bot, s["chat_id"],
+                f"⚠️ Scheduled job couldn't complete: <b>{title}</b>\n"
+                f"Tried {attempt}× over a few minutes. I'll run it again at its next "
+                f"scheduled time.\nLast issue: {(detail or 'unknown')[:200]}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        if response and response.strip():
+            await _deliver_schedule_result(application, s, response)
+    # 'retry' / 'gone' → stay quiet; it will run again on its own.
+
+
+async def _run_now(application, s: dict):
+    """Manual ▶️ Run now: execute + deliver, WITHOUT advancing the schedule."""
+    ok, response, detail = await _execute_schedule(application, s)
+    await _deliver_schedule_result(
+        application, s,
+        response if (response and response.strip()) else (detail or "(no output)"))
+
+
 async def scheduler_loop(application):
-    """Background loop: catch up missed jobs at boot, then run due jobs."""
+    """Background loop: catch up missed jobs at boot, then run due jobs.
+    Due jobs run concurrently (one slow job no longer blocks the others); the
+    per-user lock still serializes a single user's runs."""
     import time as _t
     try:
         schedules_mgr.reconcile_startup(
@@ -979,10 +1117,14 @@ async def scheduler_loop(application):
     logger.info("[SCHED] scheduler loop started")
     while True:
         try:
-            for s in schedules_mgr.due():
-                logger.info(f"[SCHED] running {s['id']} ({s.get('title','')[:30]})")
-                await _run_scheduled(application, s)
-                schedules_mgr.touch_run(s["id"])
+            due = schedules_mgr.due()
+            if due:
+                for s in due:
+                    logger.info(f"[SCHED] running {s['id']} ({s.get('title','')[:30]})")
+                await asyncio.gather(
+                    *[_run_and_record(application, s) for s in due],
+                    return_exceptions=True,
+                )
         except Exception as e:
             logger.error(f"[SCHED] loop error: {e}", exc_info=True)
         await asyncio.sleep(_SCHED_TICK)
@@ -1564,7 +1706,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             current = get_model()
             await query.edit_message_text(
-                f"🤖 Model Selection\n════════════════\nCurrent: {current}\n\n{_model_note()}",
+                f"🤖 Model Selection\n════════════════\n{await _backend_panel()}\n\n{_model_note()}",
                 reply_markup=kb_model(current),
             )
 
@@ -1670,11 +1812,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session_count = len(sessions.list_sessions(uid))
             await query.edit_message_text(
                 "🖥️ Status\n═════════\n\n"
+                f"{await _backend_panel()}\n\n"
                 f"⏱️ Uptime: {get_uptime_str()}\n"
-                f"🤖 Model: {get_model()}\n"
                 f"📁 Sessions: {session_count}\n"
                 f"🔧 Version: v{BOT_VERSION}",
                 reply_markup=kb_back(),
+            )
+
+        elif data == "menu_health":
+            await query.edit_message_text(await _health_panel(), reply_markup=kb_back())
+
+        elif data == "menu_schedules":
+            if not auth.can(uid, "admin"):
+                await query.answer("Admin access required.", show_alert=True)
+                return
+            items = schedules_mgr.list(uid)
+            await query.edit_message_text(
+                _schedule_panel_text(items),
+                reply_markup=kb_schedules(items) if items else kb_back(),
             )
 
         # ── Sessions ──
@@ -1762,7 +1917,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stored = set_model(chosen)
             ok = stored == chosen
             head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
-            src = "Claude Code" if get_backend() == "claude" else "agy's settings.json"
+            src = "--model alias" if get_backend() == "claude" else "agy --model flag"
             await query.edit_message_text(
                 f"{head}\n════════════════\n"
                 f"<b>{get_backend()}</b> will now use: <b>{stored}</b>\n"
@@ -1871,7 +2026,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s = schedules_mgr.get(sid)
             if s and s.get("user_id") == uid:
                 await query.answer("▶️ Running now…")
-                asyncio.create_task(_run_scheduled(context.application, s))
+                asyncio.create_task(_run_now(context.application, s))
             else:
                 await query.answer("Not found.", show_alert=True)
 

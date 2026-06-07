@@ -35,7 +35,12 @@ def check(name, cond, detail=""):
         print(f"  FAIL  {name}  {detail}")
 
 
-# ── Point config at a throwaway agy settings file BEFORE importing it ──
+# ── Isolate config BEFORE importing it ──
+# These tests exercise the agy model path and must not read or write the real
+# repo state: force the agy backend, point the agy settings + the bot settings
+# files at throwaway locations. (Without forcing the backend, a real .env with
+# BACKEND=claude would route set_model into claude_model and pollute the live
+# settings.json — exactly the bug that surfaced once a Mac .env existed.)
 _tmpdir = tempfile.mkdtemp(prefix="zilla_test_")
 _fake_agy = os.path.join(_tmpdir, "agy_settings.json")
 with open(_fake_agy, "w", encoding="utf-8") as f:
@@ -45,8 +50,14 @@ with open(_fake_agy, "w", encoding="utf-8") as f:
         "trustedWorkspaces": ["C:\\Users\\Isha"],
     }, f, indent=2)
 os.environ["AGY_SETTINGS_FILE"] = _fake_agy
+os.environ["BACKEND"] = "agy"            # set before import; .env can't override (setdefault)
 
 import config  # noqa: E402
+
+# Redirect the bot's own settings KV to a throwaway file so set_setting / the
+# claude_model path can't write the real settings.json during the run.
+config.SETTINGS_FILE = os.path.join(_tmpdir, "bot_settings.json")
+config._settings_cache = None
 from sessions import SessionManager  # noqa: E402
 
 
@@ -94,18 +105,47 @@ def test_model_fallback_when_file_missing(tmp_path_holder):
         config.AGY_SETTINGS_FILE = _fake_agy
 
 
-def test_model_catalog_format():
-    # 5 models x 3 efforts = 15 distinct, correctly-formatted strings.
-    combos = [config.model_display(base, eff)
-              for _, base in config.AGY_MODELS for eff in config.AGY_EFFORTS]
-    check("model: catalog has 15 combos", len(combos) == 15, f"got {len(combos)}")
-    check("model: combos are unique", len(set(combos)) == 15)
-    check("model: format matches agy 'Name (Effort)'",
-          "Gemini 3.1 Pro (High)" in combos and "Gemini 2.5 Flash (Low)" in combos,
-          str(combos))
-    # The confirmed-valid string the user's agy was already using must be offered.
-    check("model: confirmed-valid string is selectable",
-          "Gemini 3.1 Pro (High)" in combos)
+def test_agy_models_parse_and_fallback():
+    # Parser pulls real "Name (Effort)" lines, ignores headers/blanks.
+    raw = ("Gemini 3.5 Flash (Medium)\nGemini 3.1 Pro (High)\n"
+           "Claude Opus 4.6 (Thinking)\nGPT-OSS 120B (Medium)\n\n  \nUsage: foo")
+    parsed = config._parse_agy_models(raw)
+    check("agy: parser extracts real models",
+          parsed == ["Gemini 3.5 Flash (Medium)", "Gemini 3.1 Pro (High)",
+                     "Claude Opus 4.6 (Thinking)", "GPT-OSS 120B (Medium)"],
+          str(parsed))
+    check("agy: parser drops the 'Usage' header line",
+          all("Usage" not in p for p in parsed))
+    # Live list falls back (not crashes, no fakes) when the binary can't be run.
+    orig = config._run_agy_models
+    try:
+        config._run_agy_models = lambda timeout=8.0: None
+        config._agy_models_cache.update(val=None, ts=0.0, live=False)
+        live = config.agy_models_live(force=True)
+        check("agy: falls back to offline real list",
+              live == config.AGY_MODELS_FALLBACK, str(live[:2]))
+        check("agy: reachable=False when binary unavailable",
+              config.agy_reachable() is False)
+        # When the binary DOES return data, that's used and reachable=True.
+        config._run_agy_models = lambda timeout=8.0: "Gemini 3.1 Pro (Low)\nGemini 3.1 Pro (High)"
+        live = config.agy_models_live(force=True)
+        check("agy: uses live data when available",
+              live == ["Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (High)"], str(live))
+        check("agy: reachable=True with live data", config.agy_reachable() is True)
+    finally:
+        config._run_agy_models = orig
+        config._agy_models_cache.update(val=None, ts=0.0, live=False)
+
+
+def test_agy_label_compact():
+    # Button labels stay short and readable for a phone.
+    check("agy: label gemini", config._agy_label("Gemini 3.5 Flash (Medium)") == "3.5 Flash·Med",
+          config._agy_label("Gemini 3.5 Flash (Medium)"))
+    check("agy: label claude thinking",
+          config._agy_label("Claude Opus 4.6 (Thinking)") == "Opus 4.6·Think",
+          config._agy_label("Claude Opus 4.6 (Thinking)"))
+    check("agy: no fake uniform efforts (fallback has per-model levels)",
+          "Gemini 3.1 Pro (Medium)" not in config.AGY_MODELS_FALLBACK)
 
 
 # ════════════════════════════════════════════════════════════
@@ -392,6 +432,36 @@ def test_schedule_reconcile_catchup():
           sm.get(s["id"])["enabled"] and sm.get(s["id"])["next_run"] > now)
 
 
+def test_schedule_failure_retry():
+    sm = _sm()
+    now = _epoch(2026, 6, 2, 8, 0)
+    s = sm.add(1, 1, "x", "daily", {"hh": 9, "mm": 0}, now=now)
+    sid = s["id"]
+    # First 3 failures → retry soon (next_run = now + retry_delay).
+    for i in (1, 2, 3):
+        outcome, attempt = sm.mark_failure(sid, retry_delay=120, max_retries=3, now=now)
+        check(f"sched: failure {i} → retry", outcome == "retry" and attempt == i, f"{outcome},{attempt}")
+        check(f"sched: retry {i} sets soon next_run",
+              abs(sm.get(sid)["next_run"] - (now + 120)) < 5)
+    # 4th failure exhausts retries → give up THIS occurrence, advance, reset.
+    outcome, attempt = sm.mark_failure(sid, 120, 3, now=now)
+    check("sched: exhausted → gaveup", outcome == "gaveup" and attempt == 4, f"{outcome},{attempt}")
+    check("sched: gaveup resets fail_count", sm.get(sid).get("fail_count") == 0)
+    check("sched: gaveup advances to a future run", sm.get(sid)["next_run"] > now)
+    # Success resets the counter and advances normally.
+    s2 = sm.add(2, 2, "y", "interval", {"seconds": 3600}, now=now)
+    sm.mark_failure(s2["id"], 120, 3, now=now)
+    sm.mark_success(s2["id"], now=now)
+    check("sched: success resets fail_count", sm.get(s2["id"]).get("fail_count") == 0)
+    check("sched: success advances ~interval",
+          abs(sm.get(s2["id"])["next_run"] - (now + 3600)) < 5)
+    # A one-off that keeps failing gives up AND disables (no future occurrence).
+    s3 = sm.add(3, 3, "z", "once", {"run_at": now + 60}, now=now)
+    o, _ = sm.mark_failure(s3["id"], 120, 0, now=now + 61)
+    check("sched: failed one-off gives up + disables",
+          o == "gaveup" and sm.get(s3["id"])["enabled"] is False)
+
+
 def test_schedule_remove_and_owner_scope():
     sm = _sm()
     s = sm.add(7, 7, "x", "interval", {"seconds": 3600})
@@ -434,6 +504,93 @@ def test_parse_schedule_command_forms():
     check("cmd: weekday list", p and p["kind"] == "weekly" and p["spec"]["days"] == [0, 4], str(p))
 
 
+def test_verify_gate():
+    from verify import assess, looks_like_data_request
+    # The 1500-bookings failure mode: data request answered with a dense,
+    # unsourced dataset → must flag.
+    fab = ("get me the booking data for all customers",
+           "1. A $1,250 2026-01-03\n2. B $890 2026-01-04\n3. C $4,300\n"
+           "4. D $220\n5. E $1,910\n6. F $760\nTotal: 1500 bookings $1,284,300")
+    check("verify: flags fabricated dataset", assess(*fab) is not None)
+    # Honest failure → never flag (good behavior).
+    check("verify: honest failure not flagged",
+          assess("get the booking data", "I FAILED to fetch it — no data source available.") is None)
+    # Creative task → not a data request → never flag.
+    check("verify: creative not flagged",
+          assess("write a poem about the sea", "The waves roll soft against the shore.") is None)
+    # User supplied the data → grounded → never flag.
+    check("verify: grounded (uploaded) not flagged",
+          assess("how many rows in this file?", "This file has 1,512 rows across 6 columns.") is None)
+    # Cited a source → never flag.
+    check("verify: sourced answer not flagged",
+          assess("how many bookings today?",
+                 "According to the bookings API I queried, there were 1,247 today.") is None)
+    # General knowledge with a stray number → not the fabrication shape.
+    check("verify: general knowledge not flagged",
+          assess("how many planets are there?", "There are 8 planets.") is None)
+    check("verify: data-request intent detection",
+          looks_like_data_request("how many orders did we get") and
+          not looks_like_data_request("tell me a joke"))
+
+
+def test_autoharness_classify():
+    from autoharness import classify, plan_directive, SIMPLE, COMPLEX
+    simple = ["hi", "what is 2+2", "translate hello to french", "define entropy",
+              "who wrote hamlet", "convert 5km to miles"]
+    cplx = ["build me a todo app", "research the best laptops under 1000",
+            "get the sales data from the sheet", "make an apk that tracks water",
+            "scrape the prices and put them in a spreadsheet",
+            "first find the data then create a report"]
+    for m in simple:
+        check(f"auto: simple «{m[:18]}»", classify(m) == SIMPLE, classify(m))
+    for m in cplx:
+        check(f"auto: complex «{m[:18]}»", classify(m) == COMPLEX, classify(m))
+    check("auto: simple → no directive", plan_directive("hi") == "")
+    check("auto: complex → execution directive",
+          "EXECUTION MODE" in plan_directive("build an app"))
+    check("auto: empty → simple", classify("") == SIMPLE)
+
+
+def test_needs_browser():
+    from autoharness import needs_browser, plan_directive
+    # Web/interactive intent → attach the browser.
+    web = ["browse to example.com and tell me the heading",
+           "find me 3 cotton night suits online with links and prices",
+           "order me a night suit", "log into my gmail", "sign into my account",
+           "go to amazon.in and check prices", "what's the cheapest flight online",
+           "click the submit button", "book me a table for two",
+           "add it to my cart and checkout"]
+    # Non-web work (incl. non-web COMPLEX tasks) → no browser, stays fast.
+    noweb = ["hi", "what is 2+2", "explain recursion", "build me a todo app",
+             "summarize this PDF", "write a python script to rename files",
+             "search the codebase for the bug", "download the model weights"]
+    for m in web:
+        check(f"browser: yes «{m[:18]}»", needs_browser(m) is True, needs_browser(m))
+    for m in noweb:
+        check(f"browser: no «{m[:18]}»", needs_browser(m) is False, needs_browser(m))
+    check("browser: empty → no", needs_browser("") is False)
+    # Browser directive only appears when the browser is actually attached.
+    check("browser: directive gated off",
+          "WEB / BROWSER" not in plan_directive("build me a todo app"))
+    check("browser: directive present when web",
+          "WEB / BROWSER" in plan_directive("order me a night suit online"))
+
+
+def test_mcp_configs_generated():
+    import json as _json
+    from config import MCP_BROWSER_CONFIG, MCP_NONE_CONFIG, PLAYWRIGHT_MCP_VERSION
+    backends._ensure_mcp_configs()
+    with open(MCP_BROWSER_CONFIG) as f:
+        b = _json.load(f)
+    with open(MCP_NONE_CONFIG) as f:
+        n = _json.load(f)
+    check("mcp: browser has playwright", "playwright" in b.get("mcpServers", {}))
+    check("mcp: pinned exact version (not @latest)",
+          f"@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}" in b["mcpServers"]["playwright"]["args"]
+          and "latest" not in PLAYWRIGHT_MCP_VERSION)
+    check("mcp: none config is empty", n.get("mcpServers") == {})
+
+
 def test_detect_limit():
     check("limit: rate limit", detect_limit("You hit the rate limit, slow down") is not None)
     check("limit: 429", detect_limit("HTTP 429 Too Many Requests") is not None)
@@ -471,6 +628,7 @@ def test_claude_json_parsing():
 
 def test_model_catalog_per_backend():
     orig = config.get_backend
+    orig_runner = config._run_agy_models
     try:
         config.get_backend = lambda: "claude"
         cat = config.model_catalog()
@@ -478,13 +636,30 @@ def test_model_catalog_per_backend():
         check("catalog: claude has opus/sonnet/haiku",
               vals == ["opus", "sonnet", "haiku"], str(vals))
         config.get_backend = lambda: "agy"
-        check("catalog: agy has 15 gemini combos", len(config.model_catalog()) == 15)
+        # agy catalog = the REAL list (mocked here), as (compact_label, full_value).
+        config._run_agy_models = lambda timeout=8.0: ("Gemini 3.5 Flash (Low)\n"
+                                                      "Gemini 3.1 Pro (High)\n"
+                                                      "Claude Opus 4.6 (Thinking)")
+        config._agy_models_cache.update(val=None, ts=0.0, live=False)
+        cat = config.model_catalog()
+        vals = [v for _, v in cat]
+        check("catalog: agy uses real live models",
+              vals == ["Gemini 3.5 Flash (Low)", "Gemini 3.1 Pro (High)",
+                       "Claude Opus 4.6 (Thinking)"], str(vals))
+        check("catalog: agy labels are compact",
+              [l for l, _ in cat] == ["3.5 Flash·Low", "3.1 Pro·High", "Opus 4.6·Think"],
+              str([l for l, _ in cat]))
     finally:
         config.get_backend = orig
+        config._run_agy_models = orig_runner
+        config._agy_models_cache.update(val=None, ts=0.0, live=False)
 
 
 def test_platform_compat_lock():
-    check("pc: running on Windows in this test env", pc.IS_WINDOWS is True)
+    # Exactly one of the OS flags must be true (portable: Win/macOS/Linux).
+    check("pc: exactly one OS flag set",
+          sum([pc.IS_WINDOWS, pc.IS_MAC, pc.IS_LINUX]) == 1,
+          f"win={pc.IS_WINDOWS} mac={pc.IS_MAC} linux={pc.IS_LINUX}")
     lockp = os.path.join(_tmpdir, f"lock_{os.urandom(3).hex()}.lock")
     h1 = pc.acquire_instance_lock(lockp)
     check("pc: first lock acquired", h1 is not None)
@@ -515,7 +690,8 @@ def main():
         test_model_set_persists_and_reads_back,
         test_model_set_preserves_other_keys,
         lambda: test_model_fallback_when_file_missing(None),
-        test_model_catalog_format,
+        test_agy_models_parse_and_fallback,
+        test_agy_label_compact,
         test_session_create_is_fresh,
         test_session_isolation_between_sessions,
         test_session_isolation_between_users,
@@ -536,10 +712,15 @@ def main():
         test_schedule_add_due_touch,
         test_schedule_once_disables_after_run,
         test_schedule_reconcile_catchup,
+        test_schedule_failure_retry,
         test_schedule_remove_and_owner_scope,
         test_parse_schedule_forms,
         test_parse_schedule_command_forms,
         test_detect_limit,
+        test_autoharness_classify,
+        test_needs_browser,
+        test_mcp_configs_generated,
+        test_verify_gate,
         test_claude_json_parsing,
         test_model_catalog_per_backend,
         test_platform_compat_lock,

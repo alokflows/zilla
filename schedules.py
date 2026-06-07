@@ -189,6 +189,49 @@ class ScheduleManager:
             s["next_run"] = nxt
         self._save()
 
+    # ── Run outcome (self-healing: retry on failure, never silently skip) ──
+
+    def mark_success(self, sid: str, now: float | None = None):
+        """A run succeeded: clear the failure counter and advance normally."""
+        s = self.schedules.get(sid)
+        if s is not None:
+            s["fail_count"] = 0
+        self.touch_run(sid, now)
+
+    def mark_failure(self, sid: str, retry_delay: float, max_retries: int,
+                     now: float | None = None) -> tuple[str, int]:
+        """A run failed. Returns (outcome, attempt):
+          • ('retry', n)  — schedule a soon retry (next_run = now + retry_delay)
+                            while attempts ≤ max_retries.
+          • ('gaveup', n) — exhausted retries for THIS occurrence; reset the
+                            counter and advance to the next normal occurrence
+                            (so a daily job that fails today still runs tomorrow).
+          • ('gone', 0)   — schedule no longer exists.
+        The schedule is NEVER silently dropped: it always has a future next_run
+        (unless it's a finished one-off), so a missed/failed job recovers.
+        """
+        s = self.schedules.get(sid)
+        if not s:
+            return ("gone", 0)
+        now = now if now is not None else time.time()
+        attempt = int(s.get("fail_count", 0)) + 1
+        s["fail_count"] = attempt
+        s["last_run"] = now
+        if attempt <= max_retries:
+            s["next_run"] = now + retry_delay
+            self._save()
+            return ("retry", attempt)
+        # Exhausted: reset and move to the next normal occurrence.
+        s["fail_count"] = 0
+        nxt = compute_next_run(s["kind"], s["spec"], now)
+        if nxt is None:                 # finished one-off that kept failing
+            s["enabled"] = False
+            s["next_run"] = None
+        else:
+            s["next_run"] = nxt
+        self._save()
+        return ("gaveup", attempt)
+
     # ── Runtime selection ─────────────────────────────────
 
     def due(self, now: float | None = None) -> list[dict]:

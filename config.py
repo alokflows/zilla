@@ -8,7 +8,9 @@
 import os
 import sys
 import json
+import time
 import logging
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,21 @@ CLAUDE_PATH = os.getenv("CLAUDE_PATH") or _find_exe(
     else os.path.join(HOME_DIR, ".local", "bin", "claude"),
 )
 
+# --- Embedded browser (Playwright MCP, Claude backend only) ---
+# The browser is loaded ONLY for web/interactive turns (see autoharness.needs_browser)
+# so simple turns stay fast. We pin an EXACT version instead of "@latest": @latest
+# forces a network version-check on every one-shot `claude -p`, which races the MCP
+# startup timeout and makes the browser register only ~⅔ of the time (the bug where the
+# bot silently fell back to WebFetch). A pinned version resolves from the npx cache with
+# no network → deterministic, fast startup. Bump this string to upgrade.
+PLAYWRIGHT_MCP_VERSION = os.getenv("PLAYWRIGHT_MCP_VERSION", "0.0.75")
+# Give the (cold) MCP server room to hand-shake before Claude gives up on its tools.
+MCP_STARTUP_TIMEOUT_MS = os.getenv("MCP_STARTUP_TIMEOUT_MS", "30000")
+# Generated MCP config files live in the git-ignored cache dir.
+MCP_CONFIG_DIR = os.path.join(BASE_DIR, "cache", "mcp")
+MCP_BROWSER_CONFIG = os.path.join(MCP_CONFIG_DIR, "browser.json")
+MCP_NONE_CONFIG = os.path.join(MCP_CONFIG_DIR, "none.json")
+
 # --- Idle reaper: kill CLI only after this many seconds of silence ---
 # "Silence" = no PTY bytes AND no new transcript step.
 # 0 = never kill (wait forever). Overridden at runtime via Settings panel.
@@ -130,8 +147,17 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH") or _find_exe(
     os.path.join(AGI_BRAIN_DIR, "Tools", "ffmpeg", "ffmpeg.exe") if _IS_WIN else "ffmpeg",
 )
 
-# --- Skills ---
+# --- Skills (backend-aware: each "mode" has its own skill set) ---
+# agy reads skills from its antigravity dir; Claude Code from ~/.claude/skills.
+# Switching backend therefore swaps the active skill set — see get_skills_dir().
 SKILLS_DIR = os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "skills")
+CLAUDE_SKILLS_DIR = os.path.join(HOME_DIR, ".claude", "skills")
+
+
+def get_skills_dir(backend: str | None = None) -> str:
+    """Skills directory for the given backend (or the active one)."""
+    b = (backend or get_backend()).strip().lower()
+    return CLAUDE_SKILLS_DIR if b == "claude" else SKILLS_DIR
 
 # --- Kimi WebBridge ---
 KIMI_BRIDGE_URL = os.getenv("KIMI_BRIDGE_URL", "http://127.0.0.1:10086")
@@ -222,25 +248,86 @@ def set_setting(key: str, value):
 
 _AGY_MODEL_FALLBACK = "Gemini 3.1 Pro (High)"
 
-# Real agy models. Base names are exactly the display strings agy builds from
-# its own internal model keys (Gemini31Pro, Gemini3Flash, Gemini25Pro,
-# Gemini25Flash, Gemini31FlashLite). The effort suffix uses agy's "%s (%s)"
-# format with its Low/Medium/High thinking levels. The full display string
-# (e.g. "Gemini 3.1 Pro (High)") is written verbatim into agy's settings.json.
-# Edit here if agy adds or renames a model.
-AGY_MODELS = [
-    ("3.1 Pro", "Gemini 3.1 Pro"),
-    ("3 Flash", "Gemini 3 Flash"),
-    ("2.5 Pro", "Gemini 2.5 Pro"),
-    ("2.5 Flash", "Gemini 2.5 Flash"),
-    ("3.1 Lite", "Gemini 3.1 Flash Lite"),
+# agy's model list is NOT a uniform "5 families × Low/Med/High" grid — each model
+# exposes its OWN set of thinking levels (3.1 Pro is Low/High only; the Claude
+# models are "(Thinking)" only; GPT-OSS is "(Medium)" only). So we DON'T build a
+# cartesian product (that invented combos that don't exist — the "fake models"
+# bug). The live truth comes from `agy models`; this is only the offline fallback,
+# kept as the exact display strings agy itself prints. Update if agy changes.
+AGY_MODELS_FALLBACK = [
+    "Gemini 3.5 Flash (Low)",
+    "Gemini 3.5 Flash (Medium)",
+    "Gemini 3.5 Flash (High)",
+    "Gemini 3.1 Pro (Low)",
+    "Gemini 3.1 Pro (High)",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking)",
+    "GPT-OSS 120B (Medium)",
 ]
-AGY_EFFORTS = ["Low", "Medium", "High"]
+
+# Live `agy models` cache (the binary call is ~0.3s; cache so the picker is snappy).
+# "live" records whether the last fetch came from the binary (True) or fell back
+# to the offline list (False) — used as an honest "agy reachable/logged-in" signal.
+_agy_models_cache: dict = {"val": None, "ts": 0.0, "live": False}
+_AGY_MODELS_TTL = 300.0
 
 
-def model_display(base: str, effort: str) -> str:
-    """The exact string agy stores: 'Gemini 3.1 Pro (High)'."""
-    return f"{base} ({effort})"
+def _run_agy_models(timeout: float = 8.0) -> str | None:
+    """Raw stdout of `agy models`, or None on any failure. Isolated so tests can
+    monkeypatch it without invoking the real binary."""
+    try:
+        r = subprocess.run([CLI_PATH, "models"], capture_output=True, text=True,
+                           timeout=timeout)
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return r.stdout
+    except Exception as e:
+        logger.debug(f"[CONFIG] `agy models` failed: {e}")
+    return None
+
+
+def _parse_agy_models(raw: str) -> list[str]:
+    """Pull display strings ('Name (Effort)') out of `agy models` output."""
+    out = []
+    for line in (raw or "").splitlines():
+        s = line.strip()
+        # Real model lines look like "Gemini 3.1 Pro (High)" — name + (level).
+        if s and s.endswith(")") and "(" in s and not s.lower().startswith(("usage", "flags", "available")):
+            if s not in out:
+                out.append(s)
+    return out
+
+
+def agy_models_live(force: bool = False) -> list[str]:
+    """The REAL models agy offers right now (cached). Falls back to the offline
+    list if the binary can't be reached, so the picker never shows fakes."""
+    now = time.time()
+    if (not force and _agy_models_cache["val"] is not None
+            and now - _agy_models_cache["ts"] < _AGY_MODELS_TTL):
+        return _agy_models_cache["val"]
+    parsed = _parse_agy_models(_run_agy_models() or "")
+    val = parsed if parsed else list(AGY_MODELS_FALLBACK)
+    _agy_models_cache.update(val=val, ts=now, live=bool(parsed))
+    return val
+
+
+def agy_reachable() -> bool:
+    """True if `agy models` last returned real data (binary present + logged in).
+    Refreshes the cache if it's empty so the first call is meaningful."""
+    if _agy_models_cache["val"] is None:
+        agy_models_live()
+    return bool(_agy_models_cache.get("live"))
+
+
+def _agy_label(display: str) -> str:
+    """Compact button label from a full display string, e.g.
+    'Gemini 3.5 Flash (Medium)' → '3.5 Flash·Med', 'Claude Opus 4.6 (Thinking)'
+    → 'Opus 4.6·Think'. Keeps inline buttons short on a phone."""
+    name, _, eff = display.partition(" (")
+    name = name.replace("Gemini ", "").replace("Claude ", "").strip()
+    eff = eff.rstrip(")").strip()
+    eff_short = {"Low": "Low", "Medium": "Med", "High": "High",
+                 "Thinking": "Think"}.get(eff, eff[:4])
+    return f"{name}·{eff_short}" if eff_short else name
 
 
 # mtime-gated cache so get_model() doesn't hit disk on every call.
@@ -266,11 +353,14 @@ def _read_agy_settings() -> dict:
     return _agy_cache
 
 
-# Claude Code models (aliases accepted by `claude --model`).
+# Claude Code models. Values are the aliases `claude --model` accepts; they
+# always resolve to the LATEST model in each family (so this never goes stale).
+# Labels show the current underlying version for clarity. ✏️ Custom still lets
+# you type an exact id like `claude-opus-4-8`.
 CLAUDE_MODELS = [
-    ("Opus", "opus"),
-    ("Sonnet", "sonnet"),
-    ("Haiku", "haiku"),
+    ("Opus 4.8", "opus"),
+    ("Sonnet 4.6", "sonnet"),
+    ("Haiku 4.5", "haiku"),
 ]
 _CLAUDE_MODEL_FALLBACK = "sonnet"
 
@@ -286,15 +376,11 @@ def get_model() -> str:
 
 
 def model_catalog() -> list[tuple[str, str]]:
-    """(button_label, value) pairs for the current backend's model picker."""
+    """(button_label, value) pairs for the current backend's model picker.
+    agy's list is the REAL `agy models` output (no invented combos)."""
     if get_backend() == "claude":
         return [(label, val) for label, val in CLAUDE_MODELS]
-    # agy: 5 Gemini families × Low/Med/High thinking levels
-    out = []
-    for tag, base in AGY_MODELS:
-        for eff in AGY_EFFORTS:
-            out.append((f"{tag}·{eff[:3]}", model_display(base, eff)))
-    return out
+    return [(_agy_label(m), m) for m in agy_models_live()]
 
 
 def _agy_set_model(model_name: str) -> str:

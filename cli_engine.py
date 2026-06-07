@@ -26,6 +26,8 @@ from config import (
     get_idle_kill_after, get_backend, get_model,
 )
 
+from harness import wrap_prompt, log_event
+
 logger = logging.getLogger(__name__)
 
 executor = ThreadPoolExecutor(max_workers=4)
@@ -390,73 +392,13 @@ class TranscriptPoller:
 
 
 # ══════════════════════════════════════════════════════════
-#  INSTRUCTIONS
+#  INSTRUCTIONS / SKILLS  → moved to harness.py
 # ══════════════════════════════════════════════════════════
-
-_INSTRUCTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_instructions.md")
-_cached_instructions: str | None = None
-
-
-def get_instructions() -> str | None:
-    global _cached_instructions
-    if _cached_instructions is not None:
-        return _cached_instructions
-    if not os.path.exists(_INSTRUCTIONS_FILE):
-        return None
-    try:
-        with open(_INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
-            _cached_instructions = f.read().strip()
-    except Exception:
-        return None
-    return _cached_instructions
-
-
-def reload_instructions():
-    global _cached_instructions
-    _cached_instructions = None
-    return get_instructions()
-
-
-def _get_skills_summary() -> str:
-    if not os.path.isdir(SKILLS_DIR):
-        return ""
-    lines = []
-    try:
-        for name in sorted(os.listdir(SKILLS_DIR)):
-            skill_md = os.path.join(SKILLS_DIR, name, "SKILL.md")
-            if os.path.isfile(skill_md):
-                desc = _parse_skill_description(skill_md)
-                lines.append(f"- **{name}**: {desc}")
-    except Exception:
-        pass
-    return "\n".join(lines) if lines else ""
-
-
-def _parse_skill_description(skill_md: str) -> str:
-    try:
-        with open(skill_md, "r", encoding="utf-8") as f:
-            content = f.read(2000)
-        if content.startswith("---"):
-            end = content.find("---", 3)
-            if end > 0:
-                frontmatter = content[3:end]
-                for line in frontmatter.split("\n"):
-                    if line.strip().startswith("description:"):
-                        desc = line.split(":", 1)[1].strip().strip('"').strip("'")
-                        if desc and not desc.startswith("|"):
-                            return desc[:100]
-                        idx = frontmatter.find("description:")
-                        after = frontmatter[idx:]
-                        desc_lines = []
-                        for dl in after.split("\n")[1:]:
-                            if dl.startswith("  ") or dl.startswith("\t"):
-                                desc_lines.append(dl.strip())
-                            else:
-                                break
-                        return " ".join(desc_lines)[:100] if desc_lines else "(no description)"
-    except Exception:
-        pass
-    return "(no description)"
+#  Operating-context assembly (instructions + skills + trust contract)
+#  now lives in harness.build_preamble / wrap_prompt, injected on EVERY
+#  turn for BOTH backends. The old get_instructions/_get_skills_summary
+#  here were injected only on a NEW agy conversation (and never reached
+#  the model on continued turns or on claude), so they were replaced.
 
 
 # ══════════════════════════════════════════════════════════
@@ -466,6 +408,50 @@ def _parse_skill_description(skill_md: str) -> str:
 def get_selected_model() -> str | None:
     from config import get_model
     return get_model() or None
+
+
+def backend_status() -> dict:
+    """Normalized identity/health of the ACTIVE backend, for the model/menu
+    panels. Honest: reports not-installed / not-logged-in instead of pretending.
+    Keys: backend, label, installed, logged_in, account, plan, model, error."""
+    import os as _os
+    from config import get_backend, get_model, CLAUDE_PATH, CLI_PATH, AGY_SETTINGS_FILE
+    b = get_backend()
+    if b == "claude":
+        from backends import claude_identity
+        ident = claude_identity()
+        return {
+            "backend": "claude",
+            "label": "Claude Code (Anthropic)",
+            "installed": _os.path.exists(CLAUDE_PATH),
+            "logged_in": bool(ident.get("loggedIn")),
+            "account": ident.get("email") or ident.get("orgName"),
+            "plan": ident.get("subscriptionType"),
+            "auth_method": ident.get("authMethod"),
+            "model": get_model(),
+            "error": ident.get("error"),
+        }
+    # agy has no whoami command + auth lives in the Keychain, so "logged in" is
+    # inferred honestly from whether `agy models` returns real data (it needs auth).
+    from config import agy_reachable
+    installed = _os.path.exists(CLI_PATH)
+    reachable = agy_reachable() if installed else False
+    err = None
+    if not installed:
+        err = "agy not installed on this machine"
+    elif not reachable:
+        err = "agy installed but not responding — may be logged out (Google OAuth)"
+    return {
+        "backend": "agy",
+        "label": "Antigravity CLI (Gemini)",
+        "installed": installed,
+        "logged_in": reachable,
+        "account": None,                 # agy CLI exposes no account identity
+        "plan": None,
+        "auth_method": "Google OAuth" if installed else None,
+        "model": get_model() if installed else None,
+        "error": err,
+    }
 
 
 # Signals that the current model is rate-limited / unavailable. Matched
@@ -602,18 +588,15 @@ def run_cli(
         # an executor worker forever (no worse than pre-fix behaviour).
         _holding_new_conv_lock = _new_conv_lock.acquire(timeout=_NEW_CONV_DETECT_TIMEOUT)
         snapshot_before = _get_conv_dirs_snapshot()
-        instructions = get_instructions()
-        if instructions:
-            conv_dir = os.path.join(AGI_BRAIN_DIR, "Outbox")
-            instructions = instructions.replace("{CONV_DIR}", conv_dir)
-            instructions = instructions.replace("{AGI_BRAIN_DIR}", AGI_BRAIN_DIR)
-            instructions = instructions.replace("{HOME_DIR}", HOME_DIR)
-            instructions = instructions.replace("{SKILLS_DIR}", SKILLS_DIR)
-            prompt = (
-                f"{instructions}\n"
-                f"USER MESSAGE (answer THIS — everything above is formatting context):\n"
-                f"{prompt}"
-            )
+
+    # Layer-1 harness: inject the operating context EVERY turn (full onboarding
+    # on a new conversation, the compact trust/style contract on continued ones).
+    # This is what keeps the anti-hallucination rules + skills reliably in front
+    # of the model — previously they were injected only on the first turn.
+    prompt = wrap_prompt(
+        prompt, is_new=is_new, backend="agy",
+        conv_dir=os.path.join(AGI_BRAIN_DIR, "Outbox"),
+    )
 
     # Build command — no --conversation for new sessions; let CLI create its own ID
     cmd_parts = [CLI_PATH]
@@ -621,6 +604,13 @@ def run_cli(
         cmd_parts.extend(["--conversation", conversation_id])
     if skip_permissions:
         cmd_parts.append("--dangerously-skip-permissions")
+    # Pin the model for THIS turn via the real --model flag (agy v1.0.6+). This is
+    # authoritative for the session and means the bot's choice always wins, even if
+    # agy's own settings.json drifts (e.g. the owner uses agy directly). Bad strings
+    # are harmless — agy silently falls back — and the picker only offers real ones.
+    _model = get_selected_model()
+    if _model:
+        cmd_parts.extend(["--model", _model])
     # Use a generous print-timeout so the CLI itself never fires before our idle reaper
     print_timeout_min = max(1, (max_total_runtime or 3600) // 60)
     cmd_parts.extend(["--print-timeout", f"{print_timeout_min}m", "--print", prompt])
@@ -638,10 +628,9 @@ def run_cli(
 
     try:
         custom_env = os.environ.copy()
-        # The model is NOT passed via env or flag — agy reads it from its own
-        # settings.json (config.set_model writes it there). We only log what the
-        # CLI will load, for traceability.
-        logger.info(f"[ENGINE] Model (from agy settings): {get_selected_model()}")
+        # Model is now pinned per-turn via the --model flag built above (and still
+        # mirrored in agy's settings.json by set_model, so a default is always sane).
+        logger.info(f"[ENGINE] Model (via --model): {_model}")
 
         # Hide any console windows agy (or its child tools / ConPTY) flash up.
         flash = FlashSuppressor().start()  # stopped in finally
@@ -812,17 +801,73 @@ def run_cli(
             flash.stop()
 
 
-def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip_permissions):
-    """Pick the backend and run one turn (blocking; called in the thread pool)."""
-    if get_backend() == "claude":
+def _dispatch_turn(backend, prompt, conversation_id, progress_callback, cancel_event,
+                   skip_permissions, use_browser=False):
+    """Run exactly one turn against the chosen backend. Returns (response, conv)."""
+    if backend == "claude":
         from backends import run_claude
         return run_claude(
             prompt, conversation_id,
             progress_callback=progress_callback, cancel_event=cancel_event,
             skip_permissions=skip_permissions, model=get_model(),
+            use_browser=use_browser,
         )
     # default: agy (PTY + transcript)
     return run_cli(prompt, conversation_id, progress_callback, cancel_event, skip_permissions)
+
+
+def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip_permissions):
+    """Pick the backend, run one turn, and apply the anti-hallucination gate
+    (one corrective retry if the answer looks fabricated). Blocking; thread-pool."""
+    from verify import assess, correction_prompt
+    from autoharness import classify, needs_browser
+    backend = get_backend()
+    started = time.time()
+    # Decide ONCE from the raw user message so the corrective retry keeps browser
+    # access too (the retry prompt is a wrapper that may lack the web keywords).
+    use_browser = needs_browser(prompt)
+    log_event("turn_start", backend=backend, model=get_model(),
+              task=classify(prompt), browser=use_browser,
+              conv=(conversation_id[:8] if conversation_id else "new"))
+    try:
+        response, conv = _dispatch_turn(
+            backend, prompt, conversation_id, progress_callback, cancel_event,
+            skip_permissions, use_browser=use_browser)
+
+        # ── Anti-hallucination gate ──────────────────────────────────────────
+        # `prompt` here is the RAW user message (harness wrapping happens inside
+        # the backend), so intent detection is accurate. Conservative: only the
+        # clear "invented a dataset with no sourcing" shape triggers a retry.
+        if not (cancel_event and cancel_event.is_set()):
+            reasons = assess(prompt, response)
+            if reasons:
+                log_event("hallucination_flagged", backend=backend, reasons=reasons,
+                          conv=(conv[:8] if conv else None), chars=len(response or ""))
+                if progress_callback:
+                    try:
+                        progress_callback("🔎 Verifying — re-checking for unsourced data…")
+                    except Exception:
+                        pass
+                # One corrective retry, CONTINUING the same conversation so the
+                # model has its own prior answer in context to fix.
+                r2, c2 = _dispatch_turn(
+                    backend, correction_prompt(prompt), conv,
+                    progress_callback, cancel_event, skip_permissions,
+                    use_browser=use_browser)
+                resolved = assess(prompt, r2) is None
+                log_event("hallucination_retry", backend=backend,
+                          resolved=resolved, conv=(c2[:8] if c2 else None),
+                          chars=len(r2 or ""))
+                response, conv = r2, (c2 or conv)
+
+        log_event("turn_end", backend=backend,
+                  conv=(conv[:8] if conv else None),
+                  chars=len(response or ""), secs=round(time.time() - started, 1))
+        return response, conv
+    except Exception as e:
+        log_event("turn_error", backend=backend, error=str(e)[:300],
+                  secs=round(time.time() - started, 1))
+        raise
 
 
 async def run_cli_async(
