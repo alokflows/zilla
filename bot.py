@@ -170,8 +170,11 @@ _active_cancel: dict[int, threading.Event] = {}
 # Human-in-the-loop credential/OTP bridge: chat_id -> ask_id currently awaiting
 # that chat's reply, plus the set of ask ids we've already DMed (so the watcher
 # doesn't re-prompt). See interactive.py for the file protocol.
-_pending_bridge: dict[int, str] = {}
+_pending_bridge: dict[int, tuple[str, float]] = {}
 _bridge_announced: set[str] = set()
+# How long a chat stays bound to one ask. After this, an unanswered (orphaned)
+# ask must NOT keep swallowing the user's next unrelated message.
+_BRIDGE_PENDING_TTL = 900.0
 
 # Per-chat id of the CURRENT live menu message. When a new menu opens we strip
 # the previous one's buttons so old menus in the chat history can't be tapped
@@ -1662,16 +1665,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Human-in-the-loop bridge: if the agent asked this chat for an OTP / phone /
     # password / confirmation, this message IS the answer — hand it back to the
     # waiting CLI turn instead of starting a new one.
-    pending_ask = _pending_bridge.get(chat_id)
-    if pending_ask:
-        text = update.message.text or ""
-        try:
-            interactive.write_answer(pending_ask, text)
+    pending = _pending_bridge.get(chat_id)
+    if pending:
+        ask_id, ann_ts = pending
+        if time.time() - ann_ts > _BRIDGE_PENDING_TTL:
+            # Orphaned/stale ask — release the chat and process this message
+            # normally instead of swallowing it as an answer.
             _pending_bridge.pop(chat_id, None)
-            await update.message.reply_text("✅ Got it — continuing.")
-        except Exception as e:
-            await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
-        return
+            interactive.clear_ask(ask_id)
+        else:
+            text = update.message.text or ""
+            try:
+                interactive.write_answer(ask_id, text)
+                _pending_bridge.pop(chat_id, None)
+                await update.message.reply_text("✅ Got it — continuing.")
+            except Exception as e:
+                await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
+            return
 
     # Owner add-user flow intercept
     if auth.is_owner(uid) and "adduser_flow" in context.user_data:
@@ -2282,7 +2292,8 @@ async def bridge_watcher(application):
                 target = ask.chat_id or OWNER_CHAT_ID
                 if not target:
                     continue
-                if _pending_bridge.get(target) and _pending_bridge[target] != ask.id:
+                cur = _pending_bridge.get(target)
+                if cur and cur[0] != ask.id:
                     continue  # one outstanding ask per chat at a time
                 hint = "\n\n<i>Reply with the value — used once.</i>" if ask.is_secret else ""
                 try:
@@ -2293,7 +2304,7 @@ async def bridge_watcher(application):
                         parse_mode="HTML",
                     )
                     _bridge_announced.add(ask.id)
-                    _pending_bridge[target] = ask.id
+                    _pending_bridge[target] = (ask.id, time.time())
                     log_event("bridge_ask", kind=ask.kind, chat=target)
                 except Exception as e:
                     logger.error(f"[BRIDGE] could not DM ask {ask.id}: {e}")
@@ -2304,8 +2315,8 @@ async def bridge_watcher(application):
             for aid in list(_bridge_announced):
                 if aid not in live:
                     _bridge_announced.discard(aid)
-                    for cid, pid in list(_pending_bridge.items()):
-                        if pid == aid:
+                    for cid, pv in list(_pending_bridge.items()):
+                        if pv[0] == aid:
                             _pending_bridge.pop(cid, None)
         except Exception as e:
             logger.error(f"[BRIDGE] watcher error: {e}", exc_info=True)
