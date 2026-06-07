@@ -4,7 +4,14 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🧹 v4.1.1 — Audit & cleanup *(latest)*
+## ⚡ Natural-language schedules understand spelled-out numbers *(latest)*
+
+- **Fixed the "every three minutes" hang.** A request like *"Schedule every three minutes, send me a screenshot"* used to fall through the schedule parser (it only understood digits), so the whole message was handed to the agent — which spent many minutes running the task instead of creating a schedule. The parser now rewrites spelled-out numbers (`three` → `3`, `twenty five` → `25`, up to 99) before matching, so these become an instant **📅 Create this schedule?** confirmation. Once created, the recurring screenshot uses the fast bridge path, not the agent.
+- Number rewriting is scoped so ordinary words are untouched (`a screenshot`, `someone`, `anyone` stay as-is). Covered by new tests in `test_fixes.py`.
+
+---
+
+## 🧹 v4.1.1 — Audit & cleanup
 
 - Audited the v4.1.0 changes: working tree clean, no leftover temp/probe files, 96/96 tests pass.
 - Removed dead code left over from the cross-platform refactor (an unused `command` string + the now-unused `subprocess` import in `cli_engine`).
