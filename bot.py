@@ -663,6 +663,24 @@ INBOX_PAGE = 10
 # Outbox and the user pulls them via 📤 Outbox (kept sane so one huge result
 # can't spam the chat with dozens of uploads).
 MAX_AUTO_DELIVER = 10
+# Only auto-attach files the agent JUST produced. A continued conversation can
+# echo old file paths in its context; without this gate the bot re-delivers
+# (vomits) files from earlier turns. Files made this turn are seconds old.
+FRESH_DELIVER_WINDOW = 300  # seconds
+
+
+def _fresh_files(paths: list, window: int = FRESH_DELIVER_WINDOW) -> list:
+    """Keep only paths modified within `window` seconds — deliver what was just
+    created, never re-send old files a response happens to mention."""
+    now = time.time()
+    out = []
+    for p in paths:
+        try:
+            if now - os.path.getmtime(p) <= window:
+                out.append(p)
+        except OSError:
+            pass
+    return out
 INBOX_CAT_META = [
     ("images", "📷 Images"),
     ("audio", "🎵 Audio"),
@@ -839,7 +857,7 @@ async def send_response(update, context, response: str, user_id: int, chat_id: i
     # files. Cap is generous (was 3 — which silently dropped the rest of a
     # multi-file result); anything beyond the cap stays in 📤 Outbox.
     if auth.can(user_id, "admin"):
-        file_paths = detect_file_paths(response)
+        file_paths = _fresh_files(detect_file_paths(response))
         conv_id = sessions.get_conversation_id(user_id=user_id)
         files_sent = 0
         for fp in file_paths[:MAX_AUTO_DELIVER]:
@@ -1243,7 +1261,7 @@ async def _deliver_schedule_result(application, s: dict, response: str):
         # before — a schedule that made a chart/sheet/screenshot delivered only
         # the text path, never the file.
         if auth and auth.can(uid, "admin"):
-            paths = detect_file_paths(response or "")
+            paths = _fresh_files(detect_file_paths(response or ""))
             sent = 0
             for fp in paths[:MAX_AUTO_DELIVER]:
                 if await safe_send_file(bot, chat_id, fp, user_id=uid):
