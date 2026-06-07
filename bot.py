@@ -1184,6 +1184,32 @@ async def _screenshot_via_bridge(application, s: dict) -> tuple[bool, str, str]:
     return True, f"📸 Screenshot saved to {dest}", ""
 
 
+async def _send_screenshot_now(update, context, uid: int, chat_id: int) -> bool:
+    """On-demand 'send me a screenshot': take it through the fast bridge and
+    deliver it, skipping the agent (which can spin for minutes on this).
+
+    Returns True if a screenshot was delivered. On any bridge failure it returns
+    False WITHOUT replying, so the caller can fall back to the normal agent path
+    — this fast path is a pure optimization, never a regression.
+    """
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+    try:
+        result = await bridge_command("screenshot", {}, timeout=30)
+        path = (result.get("data") or {}).get("path", "")
+        if path and os.path.isfile(path):
+            ok = await safe_send_file(context.bot, chat_id, path,
+                                      caption="📸 Screenshot", user_id=uid)
+            return bool(ok)
+        return False
+    except Exception as e:
+        logger.info(f"[SHOT] on-demand bridge failed, falling back to agent: {e}")
+        return False
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+
+
 async def _execute_schedule(application, s: dict) -> tuple[bool, str, str]:
     """Run one schedule's prompt. Returns (ok, response, detail). No delivery,
     no schedule mutation — pure execution + outcome classification."""
@@ -1849,6 +1875,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if parsed:
             await _offer_schedule(update, context, parsed)
             return
+
+        # Bare "send me a screenshot": route to the fast bridge instead of the
+        # agent, which can spin for minutes on this. Falls back to the agent if
+        # the bridge isn't reachable, so it never makes things worse.
+        if _is_simple_screenshot(user_message or ""):
+            if await _send_screenshot_now(update, context, uid, chat_id):
+                return
 
     logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 

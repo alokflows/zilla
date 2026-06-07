@@ -8,6 +8,7 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 - **Fixed the "every three minutes" hang.** A request like *"Schedule every three minutes, send me a screenshot"* used to fall through the schedule parser (it only understood digits), so the whole message was handed to the agent — which spent many minutes running the task instead of creating a schedule. The parser now rewrites spelled-out numbers (`three` → `3`, `twenty five` → `25`, up to 99) before matching, so these become an instant **📅 Create this schedule?** confirmation. Once created, the recurring screenshot uses the fast bridge path, not the agent.
 - Number rewriting is scoped so ordinary words are untouched (`a screenshot`, `someone`, `anyone` stay as-is). Covered by new tests in `test_fixes.py`.
+- **On-demand screenshots are fast too.** A bare *"send me a screenshot"* / *"send display screenshot"* typed directly used to go through the agent (≈1 min). It now takes the same fast bridge path the `/browse screenshot` command and scheduled screenshots use, returning in seconds. It only triggers on short, single-intent requests (anything with `then`/`after`/`and`, or longer than 8 words, still goes to the agent), and if the bridge isn't reachable it silently falls back to the agent — so it's a pure speed-up, never a regression.
 
 ---
 
