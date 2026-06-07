@@ -175,6 +175,24 @@ def _to_html(text: str) -> str:
     return "".join(html_parts)
 
 
+def _safe_href(url: str) -> str:
+    """Return the URL only if it uses a safe web scheme, else "".
+
+    A crafted CLI/model response could otherwise inject tg://, javascript:,
+    file:, or data: links that the Telegram client renders as tappable deep
+    links (account hijack / local-file read / UI spoofing). We allow only
+    http/https absolute links; anything else drops the link but keeps the text.
+    """
+    u = (url or "").strip()
+    low = u.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        # Reject embedded control chars / quotes that could break the attribute.
+        if any(c in u for c in ('"', "'", "<", ">", "\n", "\r", "\t", " ")):
+            return ""
+        return u
+    return ""
+
+
 def _format_inline_html(text: str) -> str:
     parts = _INLINE_CODE_RE.split(text)
     result = []
@@ -186,7 +204,12 @@ def _format_inline_html(text: str) -> str:
             chunk = escape_html(part)
             chunk = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", chunk)
             chunk = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", chunk)
-            chunk = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', chunk)
+            chunk = re.sub(
+                r"\[([^\]]+)\]\(([^)]+)\)",
+                lambda m: (f'<a href="{_safe_href(m.group(2))}">{m.group(1)}</a>'
+                           if _safe_href(m.group(2)) else m.group(1)),
+                chunk,
+            )
             result.append(chunk)
     return "".join(result)
 

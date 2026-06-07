@@ -695,8 +695,13 @@ def run_cli(
                 detected = _find_new_conv(snapshot_before)
                 if detected:
                     conversation_id = detected
-                    starting_step = get_latest_step(conversation_id)
-                    last_transcript_step = starting_step
+                    # I-STEP: a freshly-minted conversation dir has NO prior turns,
+                    # so the floor is 0. Reading get_latest_step() here would sample
+                    # the live, actively-written transcript and could capture this
+                    # turn's own early steps as the floor — dropping the real answer
+                    # or bleeding a partial. Pin to 0 instead.
+                    starting_step = 0
+                    last_transcript_step = 0
                     logger.info(f"[ENGINE] Detected new conv mid-run: {conversation_id[:12]}...")
                     _release_new_conv_lock()  # our dir exists now — others may proceed
                 elif _holding_new_conv_lock and total_elapsed > _NEW_CONV_DETECT_TIMEOUT:

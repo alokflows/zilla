@@ -106,7 +106,55 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=_log_handlers,
 )
+
+
+class _TokenRedactFilter(logging.Filter):
+    """Strip the bot token out of any log record. python-telegram-bot/httpx log
+    full request URLs of the form api.telegram.org/bot<TOKEN>/... — without this
+    the live token lands in plaintext log files."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            tok = BOT_TOKEN
+            if tok:
+                msg = record.getMessage()
+                if tok in msg:
+                    record.msg = msg.replace(tok, "bot<REDACTED>")
+                    record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+# Attach to the root + the noisy HTTP libraries so it covers every handler.
+for _ln in ("", "httpx", "telegram", "telegram.ext", "telegram.request"):
+    logging.getLogger(_ln).addFilter(_TokenRedactFilter())
+
 logger = logging.getLogger(__name__)
+
+
+def _harden_file_perms() -> None:
+    """Best-effort chmod 600 on secret/state files (no-op on Windows)."""
+    if os.name == "nt":
+        return
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in (".env", "sessions.json", "settings.json", "schedules.json",
+                 "authorized_users.json", "denied_users.json"):
+        p = os.path.join(base, name)
+        try:
+            if os.path.exists(p):
+                os.chmod(p, 0o600)
+        except OSError:
+            pass
+    try:
+        if os.path.isdir(LOG_DIR):
+            os.chmod(LOG_DIR, 0o700)
+            for f in os.listdir(LOG_DIR):
+                fp = os.path.join(LOG_DIR, f)
+                if os.path.isfile(fp):
+                    os.chmod(fp, 0o600)
+    except OSError:
+        pass
 
 BOT_START_TIME = time.time()
 
@@ -1010,6 +1058,20 @@ async def _execute_schedule(application, s: dict) -> tuple[bool, str, str]:
     uid = s["user_id"]
     chat_id = s["chat_id"]
     bot = application.bot
+
+    # SECURITY: a schedule is a stored prompt that runs the agentic CLI with full
+    # host privileges. If the owning user was de-authorized after creating it, the
+    # schedule must NOT keep firing (otherwise removal isn't really revocation —
+    # it's a persistent backdoor). Disable + skip any schedule whose owner is no
+    # longer authorized.
+    if not (auth and (auth.is_owner(uid) or auth.is_authorized(uid))):
+        logger.warning(f"[SCHED] skip {s['id']}: user {uid} no longer authorized — disabling")
+        try:
+            schedules_mgr.set_enabled(s["id"], uid, False)
+        except Exception:
+            pass
+        return False, "", "owner deauthorized"
+
     try:
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception:
@@ -1297,6 +1359,13 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 url = " ".join(context.args)
                 if not url.startswith(("http://", "https://")):
                     url = f"https://{url}"
+            # SECURITY: only allow real web schemes. Block file://, javascript:,
+            # data:, chrome:// etc. that could read local files or run script in
+            # the browser session the bot drives.
+            _low = url.strip().lower()
+            if not (_low.startswith("http://") or _low.startswith("https://")):
+                await update.message.reply_text("Only http:// and https:// URLs are allowed.")
+                return
             result = await bridge_command(
                 "navigate", {"url": url, "newTab": True}, timeout=15)
             if result.get("data", {}).get("success"):
@@ -1619,6 +1688,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
+    # Bind before the try so a BaseException (e.g. asyncio.CancelledError on
+    # shutdown, which `except Exception` does NOT catch) can't leave `response`
+    # unbound at the send_response call below.
+    response = ""
     try:
         async with await _acquire_turn(uid, update):
             # Pin the session to whatever is active the moment WE start running.
@@ -1928,6 +2001,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Settings ──
         elif data == "set_toggle_photo":
+            if not auth.can(uid, "admin"):
+                await query.answer("Admin access required.", show_alert=True)
+                return
             current = get_setting("auto_describe_photos", False)
             set_setting("auto_describe_photos", not current)
             await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
@@ -2303,7 +2379,19 @@ def main():
         except Exception:
             pass
 
+    # SECURITY: refuse to start ownerless. With OWNER_CHAT_ID unset it defaults
+    # to 0, is_owner(0) is True, and the bot becomes unmanageable (nobody can
+    # add/remove users or revoke a compromised admin). Fail loud instead.
+    if not OWNER_CHAT_ID:
+        _cout("❌ TELEGRAM_OWNER_ID is not set. Refusing to start without an owner.")
+        _cout("   Set it in .env (get your numeric id from @userinfobot), then restart.")
+        logger.critical("[STARTUP] TELEGRAM_OWNER_ID unset — aborting.")
+        sys.exit(1)
+
     ensure_dirs()
+    # SECURITY: keep secrets/state owner-only (the bot token lives in .env; state
+    # files carry conversation ids + auto-titled message snippets).
+    _harden_file_perms()
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)
