@@ -4,7 +4,21 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## ⚡ Natural-language schedules understand spelled-out numbers *(latest)*
+## 🧹 Code cleanup & structure pass *(latest)*
+
+Behaviour-preserving tidy-up — the bot does exactly what it did before, but the
+code is smaller and easier to work on (and safer to edit, including by AI).
+
+- **`bot.py` slimmed from 2,804 → ~2,510 lines.**
+- **New `keyboards.py`** holds all 14 inline-menu builders (pure UI: data in, buttons out). Verified by invoking every builder.
+- **The 566-line button handler is now a thin dispatcher** routing to eight focused `_cb_*` helpers (one per feature). Proven identical by a characterization harness that compared all 46 button paths before/after.
+- **One shared `_run_cli_turn` helper** replaces the ~18-line CLI-turn block that the text/voice/photo/document handlers each copied. Proven identical the same way.
+- **Bug fix:** document text extraction now runs off the event loop (`asyncio.to_thread`) — a large PDF no longer freezes the bot for everyone.
+- Removed the empty `SCRATCH.md`. All 174 tests pass.
+
+---
+
+## ⚡ Natural-language schedules understand spelled-out numbers
 
 - **Fixed the "every three minutes" hang.** A request like *"Schedule every three minutes, send me a screenshot"* used to fall through the schedule parser (it only understood digits), so the whole message was handed to the agent — which spent many minutes running the task instead of creating a schedule. The parser now rewrites spelled-out numbers (`three` → `3`, `twenty five` → `25`, up to 99) before matching, so these become an instant **📅 Create this schedule?** confirmation. Once created, the recurring screenshot uses the fast bridge path, not the agent.
 - Number rewriting is scoped so ordinary words are untouched (`a screenshot`, `someone`, `anyone` stay as-is). Covered by new tests in `test_fixes.py`.
