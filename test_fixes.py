@@ -543,6 +543,25 @@ def test_parse_schedule_forms():
     check("parse: remind-me cue", p and p["kind"] == "once" and "call mom" in p["title"], str(p))
     check("parse: plain text is not a schedule",
           parse_schedule("what is the weather today", fixed) is None)
+    # Spelled-out numbers must parse like digits (the "every three minutes"
+    # failure: without this the whole message fell through to the agent and a
+    # trivial request spun for many minutes instead of becoming a schedule).
+    p = parse_schedule("Schedule every three minutes, send me a screenshot", fixed)
+    check("parse: interval word 'three'",
+          p and p["kind"] == "interval" and p["spec"]["seconds"] == 180
+          and p["prompt"] == "send me a screenshot", str(p))
+    p = parse_schedule("every twenty five minutes ping me", fixed)
+    check("parse: interval word 'twenty five'",
+          p and p["kind"] == "interval" and p["spec"]["seconds"] == 1500, str(p))
+    p = parse_schedule("every five hours check the news", fixed)
+    check("parse: interval word 'five hours'",
+          p and p["kind"] == "interval" and p["spec"]["seconds"] == 18000, str(p))
+    # Number-word rewriting must not maul ordinary words or real tasks.
+    from schedule_parse import normalize_numbers
+    check("parse: 'a screenshot' stays a word",
+          normalize_numbers("send me a screenshot") == "send me a screenshot")
+    check("parse: 'someone' not rewritten",
+          normalize_numbers("ask someone anyone") == "ask someone anyone")
 
 
 def test_parse_schedule_command_forms():

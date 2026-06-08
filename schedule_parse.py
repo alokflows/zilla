@@ -25,6 +25,38 @@ _WEEKDAYS = {
     "sun": 6, "sunday": 6,
 }
 
+# Spelled-out numbers → digits, so "every three minutes" parses exactly like
+# "every 3 minutes". Without this the whole message falls through to the agent
+# and a trivial request can spin for many minutes instead of becoming a schedule.
+_ONES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_ONES_ALT = "|".join(_ONES)
+_TENS_ALT = "|".join(_TENS)
+# Combos first ("twenty five" → 25), then bare tens, then bare ones — order
+# matters so "twenty" inside "twenty five" isn't rewritten on its own.
+_COMBO_RE = re.compile(rf"\b({_TENS_ALT})[\s-]+({_ONES_ALT})\b", re.IGNORECASE)
+_TENS_RE = re.compile(rf"\b({_TENS_ALT})\b", re.IGNORECASE)
+_ONES_RE = re.compile(rf"\b({_ONES_ALT})\b", re.IGNORECASE)
+
+
+def normalize_numbers(text: str) -> str:
+    """Rewrite spelled-out numbers (0–99) to digits, leaving the rest intact."""
+    if not text:
+        return text
+    text = _COMBO_RE.sub(
+        lambda m: str(_TENS[m.group(1).lower()] + _ONES[m.group(2).lower()]), text)
+    text = _TENS_RE.sub(lambda m: str(_TENS[m.group(1).lower()]), text)
+    text = _ONES_RE.sub(lambda m: str(_ONES[m.group(1).lower()]), text)
+    return text
+
 
 def _clean_task(text: str) -> str:
     t = text.strip().strip(",.;:").strip()
@@ -108,7 +140,7 @@ def parse_schedule(text: str, now: datetime | None = None) -> dict | None:
     if not text or not text.strip():
         return None
     now = now or datetime.now()
-    raw = text.strip()
+    raw = normalize_numbers(text.strip())
     low = raw.lower()
 
     # Optional leading cue we can drop before matching the timing clause.
