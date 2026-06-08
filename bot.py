@@ -1709,7 +1709,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
         try:
-            extracted = extract_text(filepath)
+            extracted = await asyncio.to_thread(extract_text, filepath)
             if extracted:
                 prompt = (
                     f"User uploaded document: {fname}\n"
