@@ -4,7 +4,23 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🧹 Code cleanup & structure pass *(latest)*
+## 🎯 Installer picks the backend that's actually installed *(latest)*
+
+Built for shared/office machines where only ONE backend is present and you have
+no admin rights. Setup now follows reality instead of asking blindly:
+
+- **Detects `agy` and `claude`** the same way the running bot does (PATH + the
+  OS-specific install location) — so the installer and the bot always agree.
+- **Only one installed → it's chosen automatically** and named back to you.
+- **Both installed → it asks** which to use (1 or 2).
+- **Neither installed → a clear message** telling you to install one and re-run,
+  instead of silently writing a config that points at a missing CLI.
+- `--doctor` uses the same detection, so it no longer misses an installed-but-
+  not-on-PATH CLI. All 174 tests pass.
+
+---
+
+## 🧹 Code cleanup & structure pass
 
 Behaviour-preserving tidy-up — the bot does exactly what it did before, but the
 code is smaller and easier to work on (and safer to edit, including by AI).

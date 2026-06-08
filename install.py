@@ -4,7 +4,9 @@
 # ============================================================
 #  What it does:
 #    1. Checks Python + installs the Python dependencies.
-#    2. Asks you 4 things: backend, bot token, your Telegram ID, autostart?
+#    2. Detects which backend (agy / Claude Code) is actually installed and
+#       uses it automatically; only asks if BOTH are present. Then asks for the
+#       bot token, your Telegram ID, and whether to auto-start at login.
 #    3. Tells you exactly how to log into your AI CLI (agy or Claude Code).
 #    4. Writes the .env file.
 #    5. Optionally sets the bot to auto-start at login.
@@ -63,6 +65,27 @@ def find_cli(name: str) -> str | None:
     return shutil.which(name)
 
 
+def detect_backend(name: str) -> str | None:
+    """Path to an installed backend CLI ('agy' or 'claude'), or None if absent.
+    Mirrors config.py's resolution (PATH + the OS-specific install location) so
+    the installer and the running bot agree on what's actually present."""
+    found = shutil.which(name)
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    if name == "agy":
+        cands = ([os.path.join(home, "AppData", "Local", "agy", "bin", "agy.exe")]
+                 if IS_WIN else [os.path.join(home, ".local", "bin", "agy")])
+    else:  # claude
+        cands = ([os.path.join(home, ".local", "bin", "claude.exe")] if IS_WIN
+                 else [os.path.join(home, ".local", "bin", "claude"),
+                       os.path.join(home, ".claude", "local", "claude")])
+    for c in cands:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
 # ── doctor (self-check) ───────────────────────────────────
 def doctor() -> int:
     hr(); print("  Zilla — environment check"); hr()
@@ -99,10 +122,10 @@ def doctor() -> int:
 
     cli = "claude" if backend == "claude" else "agy"
     path = env.get("CLAUDE_PATH") if cli == "claude" else env.get("CLI_PATH")
-    path = path or find_cli(cli)
+    path = path or detect_backend(cli)
     if path and os.path.exists(path):
         ok(f"{cli} CLI found: {path}")
-    elif find_cli(cli):
+    elif detect_backend(cli):
         ok(f"{cli} CLI found on PATH")
     else:
         bad(f"{cli} CLI not found — install it and run `{cli}` once to log in"); problems += 1
@@ -249,19 +272,44 @@ def main():
 
     env = read_env()
 
-    if non_interactive:
-        backend = arg_backend if arg_backend in ("agy", "claude") else env.get("BACKEND", "agy")
-    else:
-        print()
-        print("  Which AI backend should power the bot?")
-        print("    1) agy     — antigravity CLI (Gemini)")
-        print("    2) claude  — Claude Code (Opus/Sonnet/Haiku)")
-        choice = ask("  Enter 1 or 2", "1" if (env.get("BACKEND", "agy") == "agy") else "2")
-        backend = "claude" if choice.strip() == "2" else "agy"
+    # Detect which backends are actually installed on THIS machine. We never
+    # write a config that points at a CLI that isn't here — on office PCs only
+    # one of the two is usually present, so the choice should follow reality.
+    paths = {"agy": detect_backend("agy"), "claude": detect_backend("claude")}
+    present = [b for b, p in paths.items() if p]
+    label = {"agy": "agy (antigravity CLI / Gemini)",
+             "claude": "Claude Code (Opus/Sonnet/Haiku)"}
+
+    print()
+    if not present:
+        bad("Neither backend is installed on this computer.")
+        info("Install ONE of these, run it once to log in, then re-run this installer:")
+        info("  • agy     — the antigravity CLI (Gemini)")
+        info("  • claude  — Claude Code")
+        # Fall back to the requested/previous backend so .env is still written;
+        # --doctor will keep flagging it until a CLI is present.
+        backend = (arg_backend if arg_backend in ("agy", "claude")
+                   else env.get("BACKEND", "agy"))
+    elif len(present) == 1:
+        backend = present[0]
+        ok(f"Detected one backend: {label[backend]} — using it.")
+        if non_interactive and arg_backend in ("agy", "claude") and arg_backend != backend:
+            info(f"(You asked for '{arg_backend}', but only '{backend}' is installed here.)")
+    else:  # both installed → genuinely ask
+        if non_interactive:
+            backend = arg_backend if arg_backend in present else env.get("BACKEND", present[0])
+            if backend not in present:
+                backend = present[0]
+        else:
+            print("  Both backends are installed. Which should power the bot?")
+            print(f"    1) {label['agy']}")
+            print(f"    2) {label['claude']}")
+            default = "2" if env.get("BACKEND") == "claude" else "1"
+            choice = ask("  Enter 1 or 2", default)
+            backend = "claude" if choice.strip() == "2" else "agy"
 
     cli = "claude" if backend == "claude" else "agy"
-    cli_path = find_cli(cli)
-    print()
+    cli_path = paths.get(cli)
     if cli_path:
         ok(f"{cli} found: {cli_path}")
         info(f"Make sure you've logged in: run  `{cli}`  once and sign in, then close it.")
