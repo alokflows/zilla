@@ -1268,6 +1268,42 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  MEDIA HANDLERS
 # ══════════════════════════════════════════════════════════
 
+async def _run_cli_turn(update, uid, chat_id, prompt, cancel_event, *, auto_title=False):
+    """Run one CLI turn against the user's active session and return the response.
+
+    Acquires the per-user lock, pins the session that is active the moment we
+    start (the user may /switch while queued), resumes/tracks its conversation,
+    optionally auto-titles a fresh session, and keeps the message bookkeeping in
+    sync. Shared by the text, voice, photo and document handlers.
+    """
+    async with await _acquire_turn(uid, update):
+        # Pin the session to whatever is active the moment WE start running, and
+        # write every result back to that same session — never the now-active one.
+        _active_cancel[chat_id] = cancel_event
+        sname = sessions.get_active_name(uid)
+        conv_id = _conv_for_run(uid, sname)
+
+        if auto_title:
+            info = sessions.get_session_info(user_id=uid, session_name=sname)
+            if info and info.get("messages", 0) == 0:
+                sessions.auto_title(prompt, user_id=uid, session_name=sname)
+
+        response, detected_id = await run_cli_async(
+            prompt, conv_id,
+            cancel_event=cancel_event,
+            skip_permissions=auth.can(uid, "admin"),
+        )
+
+        if detected_id and detected_id != conv_id:
+            sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
+
+        final_conv = detected_id or conv_id
+        if final_conv:
+            sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
+        sessions.increment_messages(user_id=uid, session_name=sname)
+    return response
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
@@ -1286,24 +1322,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if transcript and not transcript.startswith("["):
             await update.message.reply_text(f'🎤 "{transcript}"')
-            async with await _acquire_turn(uid, update):
-                _active_cancel[chat_id] = cancel_event
-                sname = sessions.get_active_name(uid)
-                conv_id = _conv_for_run(uid, sname)
-                info = sessions.get_session_info(user_id=uid, session_name=sname)
-                if info and info.get("messages", 0) == 0:
-                    sessions.auto_title(transcript, user_id=uid, session_name=sname)
-                response, detected_id = await run_cli_async(
-                    transcript, conv_id,
-                    cancel_event=cancel_event,
-                    skip_permissions=auth.can(uid, "admin"),
-                )
-                if detected_id and detected_id != conv_id:
-                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
-                final_conv = detected_id or conv_id
-                if final_conv:
-                    sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
-                sessions.increment_messages(user_id=uid, session_name=sname)
+            response = await _run_cli_turn(
+                update, uid, chat_id, transcript, cancel_event, auto_title=True)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1371,21 +1391,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        async with await _acquire_turn(uid, update):
-            _active_cancel[chat_id] = cancel_event
-            sname = sessions.get_active_name(uid)
-            conv_id = _conv_for_run(uid, sname)
-            response, detected_id = await run_cli_async(
-                prompt, conv_id,
-                cancel_event=cancel_event,
-                skip_permissions=auth.can(uid, "admin"),
-            )
-            if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
-            final_conv = detected_id or conv_id
-            if final_conv:
-                sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
-            sessions.increment_messages(user_id=uid, session_name=sname)
+        response = await _run_cli_turn(update, uid, chat_id, prompt, cancel_event)
         stop_typing.set()
         typing_task.cancel()
         await send_response(update, context, response, uid, chat_id)
@@ -1438,21 +1444,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Read the file and respond."
                 )
 
-            async with await _acquire_turn(uid, update):
-                _active_cancel[chat_id] = cancel_event
-                sname = sessions.get_active_name(uid)
-                conv_id = _conv_for_run(uid, sname)
-                response, detected_id = await run_cli_async(
-                    prompt, conv_id,
-                    cancel_event=cancel_event,
-                    skip_permissions=auth.can(uid, "admin"),
-                )
-                if detected_id and detected_id != conv_id:
-                    sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
-                final_conv = detected_id or conv_id
-                if final_conv:
-                    sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
-                sessions.increment_messages(user_id=uid, session_name=sname)
+            response = await _run_cli_turn(update, uid, chat_id, prompt, cancel_event)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1608,33 +1600,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # unbound at the send_response call below.
     response = ""
     try:
-        async with await _acquire_turn(uid, update):
-            # Pin the session to whatever is active the moment WE start running.
-            # The user may /switch while this message was queued or running;
-            # commands bypass this lock, so capture the target once and write
-            # every result back to that same session — never the now-active one.
-            _active_cancel[chat_id] = cancel_event
-            sname = sessions.get_active_name(uid)
-            conv_id = _conv_for_run(uid, sname)
-
-            info = sessions.get_session_info(user_id=uid, session_name=sname)
-            if info and info.get("messages", 0) == 0:
-                sessions.auto_title(user_message, user_id=uid, session_name=sname)
-
-            response, detected_id = await run_cli_async(
-                user_message, conv_id,
-                cancel_event=cancel_event,
-                skip_permissions=auth.can(uid, "admin"),
-            )
-
-            if detected_id and detected_id != conv_id:
-                sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
-
-            final_conv = detected_id or conv_id
-            if final_conv:
-                sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
-            sessions.increment_messages(user_id=uid, session_name=sname)
-
+        response = await _run_cli_turn(
+            update, uid, chat_id, user_message, cancel_event, auto_title=True)
     except Exception as e:
         response = f"Error: {str(e)}"
         logger.error(f"Handler error: {e}", exc_info=True)
