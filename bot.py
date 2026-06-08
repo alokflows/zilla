@@ -1649,7 +1649,565 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ══════════════════════════════════════════════════════════
 #  CALLBACK HANDLER
+# ──────────────────────────────────────────────────────────
+#  handle_callback() is a thin dispatcher: it answers the tap and
+#  routes by callback_data prefix to one focused _cb_* helper per
+#  feature (menus, sessions, model, settings, inbox, outbox,
+#  schedules, users). Each helper owns its own if/elif sub-chain.
 # ══════════════════════════════════════════════════════════
+
+async def _cb_misc(query, context, data, uid, chat_id):
+    if data == "menu_close":
+        _active_menu.pop(chat_id, None)
+        try:
+            await query.edit_message_text("✓ Closed. Send /menu to reopen.")
+        except Exception:
+            await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    if data == "menu_back":
+        _active_menu[chat_id] = query.message.message_id
+        await query.edit_message_text(
+            "⚡ Zilla — Control Panel\n════════════════════════",
+            reply_markup=kb_menu(uid),
+        )
+
+    elif data == "menu_browse":
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        try:
+            bdata = await bridge_status()
+            running = bdata.get("running", False)
+            ext = bdata.get("extension_connected", False)
+            status_text = (
+                f"🌐 WebBridge\n══════════\n\n"
+                f"Daemon: {'🟢 Running' if running else '🔴 Stopped'}\n"
+                f"Extension: {'🟢 Connected' if ext else '🔴 Disconnected'}\n\n"
+                "Use /browse <url> to open pages."
+            )
+        except Exception:
+            status_text = "🌐 WebBridge\n\n🔴 Not reachable. Start the daemon first."
+        await query.edit_message_text(status_text, reply_markup=kb_back())
+
+    elif data == "menu_status":
+        session_count = len(sessions.list_sessions(uid))
+        await query.edit_message_text(
+            "🖥️ Status\n═════════\n\n"
+            f"{await _backend_panel()}\n\n"
+            f"⏱️ Uptime: {get_uptime_str()}\n"
+            f"📁 Sessions: {session_count}\n"
+            f"🔧 Version: v{BOT_VERSION}",
+            reply_markup=kb_back(),
+        )
+
+    elif data == "menu_health":
+        await query.edit_message_text(await _health_panel(), reply_markup=kb_back())
+
+    elif data == "cancel_active":
+        cancel_ev = _active_cancel.get(chat_id)
+        if cancel_ev and not cancel_ev.is_set():
+            cancel_ev.set()
+            await query.edit_message_text("🛑 Canceling…")
+        else:
+            await query.edit_message_text("Nothing to cancel.")
+
+    else:
+        # Unknown — restore the menu rather than replacing with an error
+        await query.edit_message_text(
+            "⚡ Zilla — Control Panel\n════════════════════════",
+            reply_markup=kb_menu(uid),
+        )
+
+
+async def _cb_sessions(query, context, data, uid, chat_id):
+    if data == "menu_sessions":
+        all_sessions = sessions.list_sessions(uid)
+        active = sessions.get_active_name(uid)
+        lines = [f"📁 Sessions ({len(all_sessions)})\n"]
+        for name, info in all_sessions.items():
+            marker = " ◀" if name == active else ""
+            lines.append(f"  {name}{marker} — {info.get('messages', 0)} msgs")
+        await query.edit_message_text(
+            "\n".join(lines), reply_markup=kb_sessions(all_sessions, active),
+        )
+
+    elif data == "sess_list":
+        all_sessions = sessions.list_sessions(uid)
+        active = sessions.get_active_name(uid)
+        await query.edit_message_text(
+            "📁 Sessions", reply_markup=kb_sessions(all_sessions, active),
+        )
+
+    elif data.startswith("sess_switch_"):
+        name = data.removeprefix("sess_switch_")
+        sessions.set_active_name(name, uid)
+        active = sessions.get_active_name(uid)
+        await query.edit_message_text(
+            f"✅ Switched to [{name}].",
+            reply_markup=kb_sessions(sessions.list_sessions(uid), active),
+        )
+
+    elif data.startswith("sess_delete_"):
+        name = data.removeprefix("sess_delete_")
+        await query.edit_message_text(
+            f"🗑️ Delete session [{name}]?\n\nThis cannot be undone.",
+            reply_markup=kb_session_delete(name),
+        )
+
+    elif data.startswith("sess_confirm_del_"):
+        name = data.removeprefix("sess_confirm_del_")
+        removed = sessions.delete_session(name, uid)
+        active = sessions.get_active_name(uid)
+        head = f"🗑️ [{name}] deleted." if removed else f"[{name}] not found."
+        await query.edit_message_text(
+            f"{head}\nActive: [{active}]",
+            reply_markup=kb_sessions(sessions.list_sessions(uid), active),
+        )
+
+    elif data == "sess_new":
+        existing = sessions.list_sessions(uid)
+        i = 1
+        while True:
+            name = f"session-{i}"
+            if name not in existing:
+                break
+            i += 1
+        sessions.create_session(name, uid)
+        active = sessions.get_active_name(uid)
+        await query.edit_message_text(
+            f"📁 Session [{name}] created — next message starts fresh.",
+            reply_markup=kb_sessions(sessions.list_sessions(uid), active),
+        )
+
+
+async def _cb_model(query, context, data, uid, chat_id):
+    if data == "menu_model":
+        if not _can_change_model(uid):
+            await query.answer("Model changes are disabled by the owner.", show_alert=True)
+            return
+        current = get_model()
+        await query.edit_message_text(
+            f"🤖 Model Selection\n════════════════\n{await _backend_panel()}\n\n{_model_note()}",
+            reply_markup=kb_model(current),
+        )
+
+    elif data == "model_switch_backend":
+        if not auth.is_owner(uid):
+            await query.answer("Only the owner can switch backend.", show_alert=True)
+            return
+        new_backend = "claude" if get_backend() == "agy" else "agy"
+        set_backend(new_backend)
+        current = get_model()
+        await query.edit_message_text(
+            f"🤖 Model Selection\n════════════════\nBackend: {new_backend}\n"
+            f"Current: {current}\n\n{_model_note()}",
+            reply_markup=kb_model(current),
+        )
+
+    elif data == "model_custom":
+        if not _can_change_model(uid):
+            await query.answer("Model changes are disabled by the owner.", show_alert=True)
+            return
+        context.user_data["awaiting_custom_model"] = True
+        await query.edit_message_text(
+            "✏️ Send the exact model string as it appears in agy's own "
+            "\"Switch Model\" screen,\ne.g. <code>Gemini 3.1 Pro (High)</code>\n\n"
+            "Send /cancel to abort.",
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("model_"):
+        if not _can_change_model(uid):
+            await query.answer("Model changes are disabled by the owner.", show_alert=True)
+            return
+        chosen = data.removeprefix("model_")
+        # set_model persists for the active backend and returns the stored
+        # value (agy: read back from its settings.json; claude: the alias).
+        stored = set_model(chosen)
+        ok = stored == chosen
+        head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
+        src = "--model alias" if get_backend() == "claude" else "agy --model flag"
+        await query.edit_message_text(
+            f"{head}\n════════════════\n"
+            f"<b>{get_backend()}</b> will now use: <b>{stored}</b>\n"
+            f"(via {src})\n\nTakes effect on your next message.",
+            parse_mode="HTML",
+            reply_markup=kb_model(stored),
+        )
+
+    elif data == "err_retry":
+        await query.edit_message_text(
+            "🔄 Send your message again.",
+            reply_markup=kb_back(),
+        )
+
+    elif data == "err_model":
+        if not _can_change_model(uid):
+            await query.answer("Model changes are disabled by the owner.", show_alert=True)
+            return
+        current = get_model()
+        await query.edit_message_text(
+            f"🤖 Try a different model?\nCurrent: {current}",
+            reply_markup=kb_model(current),
+        )
+
+
+async def _cb_settings(query, context, data, uid, chat_id):
+    if data == "menu_settings":
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+    elif data == "set_toggle_photo":
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        current = get_setting("auto_describe_photos", False)
+        set_setting("auto_describe_photos", not current)
+        await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+    elif data == "set_cycle_idle":
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        current = get_idle_kill_after()
+        vals = [v for v, _ in _IDLE_OPTIONS]
+        try:
+            idx = vals.index(current)
+            new_val = vals[(idx + 1) % len(vals)]
+        except ValueError:
+            new_val = 600
+        set_setting("idle_kill_after", new_val)
+        await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+    elif data == "set_toggle_admin_model":
+        if not auth.is_owner(uid):
+            await query.answer("Owner only.", show_alert=True)
+            return
+        current = get_setting("admins_can_change_model", True)
+        set_setting("admins_can_change_model", not current)
+        await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+    elif data == "set_toggle_catchup":
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        current = get_setting("schedule_catchup", True)
+        set_setting("schedule_catchup", not current)
+        await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
+
+    elif data == "set_toggle_backend":
+        if not auth.is_owner(uid):
+            await query.answer("Owner only.", show_alert=True)
+            return
+        new_backend = "claude" if get_backend() == "agy" else "agy"
+        set_backend(new_backend)
+        await query.edit_message_text(
+            f"🧠 Backend switched to: {new_backend}\n"
+            f"Takes effect on your next message. Model: {get_model()}",
+            reply_markup=kb_settings(uid),
+        )
+
+
+async def _cb_inbox(query, context, data, uid, chat_id):
+    if data == "menu_inbox":
+        counts = get_inbox_counts()
+        total = sum(counts.values())
+        if not total:
+            await query.edit_message_text("📥 Inbox empty.", reply_markup=kb_back())
+        else:
+            await query.edit_message_text(
+                f"📥 Inbox — {total} item(s)\nPick a category:",
+                reply_markup=kb_inbox_categories(counts),
+            )
+
+    elif data.startswith("ibx_cat_"):
+        # ibx_cat_{category}_{offset}
+        rest = data.removeprefix("ibx_cat_")
+        cat, _, off_str = rest.rpartition("_")
+        offset = int(off_str) if off_str.isdigit() else 0
+        items = get_inbox_items(cat)
+        if not items:
+            await query.edit_message_text(
+                "📥 Nothing here anymore.",
+                reply_markup=kb_inbox_categories(get_inbox_counts()),
+            )
+        else:
+            label = dict(INBOX_CAT_META).get(cat, cat)
+            shown = min(offset + INBOX_PAGE, len(items))
+            await query.edit_message_text(
+                f"{label} — {len(items)} file(s)\nShowing {offset + 1}–{shown}. "
+                f"Tap a file or 📤 to send it here.",
+                reply_markup=kb_inbox_list(cat, items, offset),
+            )
+
+    elif data.startswith("ibx_send_"):
+        # ibx_send_{category}_{index}
+        rest = data.removeprefix("ibx_send_")
+        cat, _, idx_str = rest.rpartition("_")
+        idx = int(idx_str) if idx_str.isdigit() else -1
+        items = get_inbox_items(cat)
+        if 0 <= idx < len(items):
+            item = items[idx]
+            ok = await safe_send_file(
+                context.bot, chat_id, item["path"],
+                caption=item["name"], user_id=uid,
+            )
+            await query.answer("📤 Sent" if ok else "⚠️ Could not send", show_alert=not ok)
+        else:
+            await query.answer("File no longer available.", show_alert=True)
+
+    elif data.startswith("ibx_del_"):
+        # ibx_del_{category}_{index}
+        rest = data.removeprefix("ibx_del_")
+        cat, _, idx_str = rest.rpartition("_")
+        idx = int(idx_str) if idx_str.isdigit() else -1
+        items = get_inbox_items(cat)
+        if 0 <= idx < len(items):
+            gone = delete_inbox_file(items[idx]["path"])
+            await query.answer("🗑 Deleted" if gone else "Couldn't delete.", show_alert=not gone)
+        else:
+            await query.answer("File no longer available.", show_alert=True)
+        # Refresh the list in place (re-read, clamp offset to a valid page).
+        items = get_inbox_items(cat)
+        if not items:
+            await query.edit_message_text(
+                "📥 Empty now.", reply_markup=kb_inbox_categories(get_inbox_counts()))
+        else:
+            off = (idx // INBOX_PAGE) * INBOX_PAGE
+            if off >= len(items):
+                off = max(0, off - INBOX_PAGE)
+            label = dict(INBOX_CAT_META).get(cat, cat)
+            shown = min(off + INBOX_PAGE, len(items))
+            await query.edit_message_text(
+                f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
+                reply_markup=kb_inbox_list(cat, items, off),
+            )
+
+
+async def _cb_outbox(query, context, data, uid, chat_id):
+    if data == "menu_outbox":
+        counts = get_outbox_counts()
+        total = sum(counts.values())
+        if not total:
+            await query.edit_message_text(
+                "📤 Outbox empty.\nFiles you ask me to create land here.",
+                reply_markup=kb_back())
+        else:
+            await query.edit_message_text(
+                f"📤 Outbox — {total} item(s)\nPick a category:",
+                reply_markup=kb_outbox_categories(counts),
+            )
+
+    elif data.startswith("obx_cat_"):
+        # obx_cat_{category}_{offset}
+        rest = data.removeprefix("obx_cat_")
+        cat, _, off_str = rest.rpartition("_")
+        offset = int(off_str) if off_str.isdigit() else 0
+        items = get_outbox_items(cat)
+        if not items:
+            await query.edit_message_text(
+                "📤 Nothing here anymore.",
+                reply_markup=kb_outbox_categories(get_outbox_counts()),
+            )
+        else:
+            label = dict(OUTBOX_CAT_META).get(cat, cat)
+            shown = min(offset + INBOX_PAGE, len(items))
+            await query.edit_message_text(
+                f"{label} — {len(items)} file(s)\nShowing {offset + 1}–{shown}. "
+                f"Tap a file or 📤 to send it here.",
+                reply_markup=kb_outbox_list(cat, items, offset),
+            )
+
+    elif data.startswith("obx_send_"):
+        # obx_send_{category}_{index}
+        rest = data.removeprefix("obx_send_")
+        cat, _, idx_str = rest.rpartition("_")
+        idx = int(idx_str) if idx_str.isdigit() else -1
+        items = get_outbox_items(cat)
+        if 0 <= idx < len(items):
+            item = items[idx]
+            ok = await safe_send_file(
+                context.bot, chat_id, item["path"],
+                caption=item["name"], user_id=uid,
+            )
+            await query.answer("📤 Sent" if ok else "⚠️ Could not send", show_alert=not ok)
+        else:
+            await query.answer("File no longer available.", show_alert=True)
+
+    elif data.startswith("obx_del_"):
+        # obx_del_{category}_{index}
+        rest = data.removeprefix("obx_del_")
+        cat, _, idx_str = rest.rpartition("_")
+        idx = int(idx_str) if idx_str.isdigit() else -1
+        items = get_outbox_items(cat)
+        if 0 <= idx < len(items):
+            gone = delete_outbox_file(items[idx]["path"])
+            await query.answer("🗑 Deleted" if gone else "Couldn't delete.", show_alert=not gone)
+        else:
+            await query.answer("File no longer available.", show_alert=True)
+        # Refresh the list in place (re-read, clamp offset to a valid page).
+        items = get_outbox_items(cat)
+        if not items:
+            await query.edit_message_text(
+                "📤 Empty now.", reply_markup=kb_outbox_categories(get_outbox_counts()))
+        else:
+            off = (idx // INBOX_PAGE) * INBOX_PAGE
+            if off >= len(items):
+                off = max(0, off - INBOX_PAGE)
+            label = dict(OUTBOX_CAT_META).get(cat, cat)
+            shown = min(off + INBOX_PAGE, len(items))
+            await query.edit_message_text(
+                f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
+                reply_markup=kb_outbox_list(cat, items, off),
+            )
+
+
+async def _cb_schedules(query, context, data, uid, chat_id):
+    if data == "menu_schedules":
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        items = schedules_mgr.list(uid)
+        await query.edit_message_text(
+            _schedule_panel_text(items),
+            reply_markup=kb_schedules(items) if items else kb_back(),
+        )
+
+    elif data == "sched_confirm":
+        parsed = context.user_data.pop("pending_schedule", None)
+        if not parsed or not auth.can(uid, "admin"):
+            await query.edit_message_text("Nothing to create.")
+        else:
+            s = _make_schedule(uid, chat_id, parsed)
+            if s:
+                await query.edit_message_text(
+                    f"✅ Scheduled: {s['title']}\n"
+                    f"{describe_schedule(s['kind'], s['spec'])} · next {_fmt_next(s['next_run'])}",
+                )
+            else:
+                await query.edit_message_text("Couldn't create that schedule (time already past?).")
+
+    elif data == "sched_cancel":
+        context.user_data.pop("pending_schedule", None)
+        await query.edit_message_text("Cancelled — no schedule created.")
+
+    elif data == "sched_list":
+        items = schedules_mgr.list(uid)
+        await query.edit_message_text(
+            _schedule_panel_text(items),
+            reply_markup=kb_schedules(items) if items else kb_back(),
+        )
+
+    elif data.startswith("sched_toggle_"):
+        sid = data.removeprefix("sched_toggle_")
+        s = schedules_mgr.get(sid)
+        if s and s.get("user_id") == uid:
+            schedules_mgr.set_enabled(sid, uid, not s.get("enabled"))
+        items = schedules_mgr.list(uid)
+        await query.edit_message_text(
+            _schedule_panel_text(items),
+            reply_markup=kb_schedules(items) if items else kb_back(),
+        )
+
+    elif data.startswith("sched_del_"):
+        sid = data.removeprefix("sched_del_")
+        schedules_mgr.remove(sid, uid)
+        items = schedules_mgr.list(uid)
+        await query.answer("🗑 Deleted")
+        await query.edit_message_text(
+            _schedule_panel_text(items),
+            reply_markup=kb_schedules(items) if items else kb_back(),
+        )
+
+    elif data.startswith("sched_run_"):
+        sid = data.removeprefix("sched_run_")
+        s = schedules_mgr.get(sid)
+        if s and s.get("user_id") == uid:
+            await query.answer("▶️ Running now…")
+            asyncio.create_task(_run_now(context.application, s))
+        else:
+            await query.answer("Not found.", show_alert=True)
+
+
+async def _cb_users(query, context, data, uid, chat_id):
+    if data == "menu_users":
+        if not auth.is_owner(uid):
+            await query.answer("Owner only.", show_alert=True)
+            return
+        users = auth.list_users()
+        await query.edit_message_text(
+            f"👥 Users ({len(users)})\nTap to manage.",
+            reply_markup=kb_users(users),
+        )
+
+    elif data == "user_list":
+        if not auth.is_owner(uid):
+            return
+        users = auth.list_users()
+        await query.edit_message_text(
+            f"👥 Users ({len(users)})",
+            reply_markup=kb_users(users),
+        )
+
+    elif data.startswith("user_detail_"):
+        if not auth.is_owner(uid):
+            return
+        target_id = int(data.removeprefix("user_detail_"))
+        users = auth.list_users()
+        info = users.get(target_id, {})
+        name = info.get("name") or f"User {target_id}"
+        role = info.get("role", "user")
+        added = info.get("added_at", "unknown")
+        await query.edit_message_text(
+            f"👤 {name}\n══════════════════\n"
+            f"ID: {target_id}\n"
+            f"Role: {role}\n"
+            f"Added: {added}",
+            reply_markup=kb_user_detail(target_id, role),
+        )
+
+    elif data.startswith("user_remove_"):
+        if not auth.is_owner(uid):
+            return
+        target_id = int(data.removeprefix("user_remove_"))
+        users = auth.list_users()
+        info = users.get(target_id, {})
+        name = info.get("name") or f"User {target_id}"
+        await query.edit_message_text(
+            f"🗑️ Remove {name} ({target_id}) and deny their access?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, remove", callback_data=f"user_confirm_remove_{target_id}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data=f"user_detail_{target_id}")],
+            ]),
+        )
+
+    elif data.startswith("user_confirm_remove_"):
+        if not auth.is_owner(uid):
+            return
+        target_id = int(data.removeprefix("user_confirm_remove_"))
+        if auth.remove_user(target_id):
+            users = auth.list_users()
+            await query.edit_message_text(
+                f"🗑️ User {target_id} removed.",
+                reply_markup=kb_users(users),
+            )
+        else:
+            await query.edit_message_text("User not found.")
+
+    elif data == "user_add_start":
+        if not auth.is_owner(uid):
+            return
+        context.user_data["adduser_flow"] = {"step": "awaiting_id"}
+        await query.edit_message_text(
+            "➕ Add User\n══════════\n\n"
+            "Send the new user's Telegram ID (a number).\n"
+            "Type /cancel to abort.",
+            reply_markup=None,
+        )
+
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1659,553 +2217,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.answer()
-
-        # ── Close: collapse this menu so it can't be re-tapped later ──
-        if data == "menu_close":
-            _active_menu.pop(chat_id, None)
-            try:
-                await query.edit_message_text("✓ Closed. Send /menu to reopen.")
-            except Exception:
-                await query.edit_message_reply_markup(reply_markup=None)
-            return
-
-        # ── Menu ──
-        if data == "menu_back":
-            _active_menu[chat_id] = query.message.message_id
-            await query.edit_message_text(
-                "⚡ Zilla — Control Panel\n════════════════════════",
-                reply_markup=kb_menu(uid),
-            )
-
-        elif data == "menu_sessions":
-            all_sessions = sessions.list_sessions(uid)
-            active = sessions.get_active_name(uid)
-            lines = [f"📁 Sessions ({len(all_sessions)})\n"]
-            for name, info in all_sessions.items():
-                marker = " ◀" if name == active else ""
-                lines.append(f"  {name}{marker} — {info.get('messages', 0)} msgs")
-            await query.edit_message_text(
-                "\n".join(lines), reply_markup=kb_sessions(all_sessions, active),
-            )
-
-        elif data == "menu_model":
-            if not _can_change_model(uid):
-                await query.answer("Model changes are disabled by the owner.", show_alert=True)
-                return
-            current = get_model()
-            await query.edit_message_text(
-                f"🤖 Model Selection\n════════════════\n{await _backend_panel()}\n\n{_model_note()}",
-                reply_markup=kb_model(current),
-            )
-
-        elif data == "menu_settings":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
-                return
-            await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
-
-        elif data == "menu_inbox":
-            counts = get_inbox_counts()
-            total = sum(counts.values())
-            if not total:
-                await query.edit_message_text("📥 Inbox empty.", reply_markup=kb_back())
-            else:
-                await query.edit_message_text(
-                    f"📥 Inbox — {total} item(s)\nPick a category:",
-                    reply_markup=kb_inbox_categories(counts),
-                )
-
-        elif data.startswith("ibx_cat_"):
-            # ibx_cat_{category}_{offset}
-            rest = data.removeprefix("ibx_cat_")
-            cat, _, off_str = rest.rpartition("_")
-            offset = int(off_str) if off_str.isdigit() else 0
-            items = get_inbox_items(cat)
-            if not items:
-                await query.edit_message_text(
-                    "📥 Nothing here anymore.",
-                    reply_markup=kb_inbox_categories(get_inbox_counts()),
-                )
-            else:
-                label = dict(INBOX_CAT_META).get(cat, cat)
-                shown = min(offset + INBOX_PAGE, len(items))
-                await query.edit_message_text(
-                    f"{label} — {len(items)} file(s)\nShowing {offset + 1}–{shown}. "
-                    f"Tap a file or 📤 to send it here.",
-                    reply_markup=kb_inbox_list(cat, items, offset),
-                )
-
-        elif data.startswith("ibx_send_"):
-            # ibx_send_{category}_{index}
-            rest = data.removeprefix("ibx_send_")
-            cat, _, idx_str = rest.rpartition("_")
-            idx = int(idx_str) if idx_str.isdigit() else -1
-            items = get_inbox_items(cat)
-            if 0 <= idx < len(items):
-                item = items[idx]
-                ok = await safe_send_file(
-                    context.bot, chat_id, item["path"],
-                    caption=item["name"], user_id=uid,
-                )
-                await query.answer("📤 Sent" if ok else "⚠️ Could not send", show_alert=not ok)
-            else:
-                await query.answer("File no longer available.", show_alert=True)
-
-        elif data.startswith("ibx_del_"):
-            # ibx_del_{category}_{index}
-            rest = data.removeprefix("ibx_del_")
-            cat, _, idx_str = rest.rpartition("_")
-            idx = int(idx_str) if idx_str.isdigit() else -1
-            items = get_inbox_items(cat)
-            if 0 <= idx < len(items):
-                gone = delete_inbox_file(items[idx]["path"])
-                await query.answer("🗑 Deleted" if gone else "Couldn't delete.", show_alert=not gone)
-            else:
-                await query.answer("File no longer available.", show_alert=True)
-            # Refresh the list in place (re-read, clamp offset to a valid page).
-            items = get_inbox_items(cat)
-            if not items:
-                await query.edit_message_text(
-                    "📥 Empty now.", reply_markup=kb_inbox_categories(get_inbox_counts()))
-            else:
-                off = (idx // INBOX_PAGE) * INBOX_PAGE
-                if off >= len(items):
-                    off = max(0, off - INBOX_PAGE)
-                label = dict(INBOX_CAT_META).get(cat, cat)
-                shown = min(off + INBOX_PAGE, len(items))
-                await query.edit_message_text(
-                    f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
-                    reply_markup=kb_inbox_list(cat, items, off),
-                )
-
-        elif data == "menu_outbox":
-            counts = get_outbox_counts()
-            total = sum(counts.values())
-            if not total:
-                await query.edit_message_text(
-                    "📤 Outbox empty.\nFiles you ask me to create land here.",
-                    reply_markup=kb_back())
-            else:
-                await query.edit_message_text(
-                    f"📤 Outbox — {total} item(s)\nPick a category:",
-                    reply_markup=kb_outbox_categories(counts),
-                )
-
-        elif data.startswith("obx_cat_"):
-            # obx_cat_{category}_{offset}
-            rest = data.removeprefix("obx_cat_")
-            cat, _, off_str = rest.rpartition("_")
-            offset = int(off_str) if off_str.isdigit() else 0
-            items = get_outbox_items(cat)
-            if not items:
-                await query.edit_message_text(
-                    "📤 Nothing here anymore.",
-                    reply_markup=kb_outbox_categories(get_outbox_counts()),
-                )
-            else:
-                label = dict(OUTBOX_CAT_META).get(cat, cat)
-                shown = min(offset + INBOX_PAGE, len(items))
-                await query.edit_message_text(
-                    f"{label} — {len(items)} file(s)\nShowing {offset + 1}–{shown}. "
-                    f"Tap a file or 📤 to send it here.",
-                    reply_markup=kb_outbox_list(cat, items, offset),
-                )
-
-        elif data.startswith("obx_send_"):
-            # obx_send_{category}_{index}
-            rest = data.removeprefix("obx_send_")
-            cat, _, idx_str = rest.rpartition("_")
-            idx = int(idx_str) if idx_str.isdigit() else -1
-            items = get_outbox_items(cat)
-            if 0 <= idx < len(items):
-                item = items[idx]
-                ok = await safe_send_file(
-                    context.bot, chat_id, item["path"],
-                    caption=item["name"], user_id=uid,
-                )
-                await query.answer("📤 Sent" if ok else "⚠️ Could not send", show_alert=not ok)
-            else:
-                await query.answer("File no longer available.", show_alert=True)
-
-        elif data.startswith("obx_del_"):
-            # obx_del_{category}_{index}
-            rest = data.removeprefix("obx_del_")
-            cat, _, idx_str = rest.rpartition("_")
-            idx = int(idx_str) if idx_str.isdigit() else -1
-            items = get_outbox_items(cat)
-            if 0 <= idx < len(items):
-                gone = delete_outbox_file(items[idx]["path"])
-                await query.answer("🗑 Deleted" if gone else "Couldn't delete.", show_alert=not gone)
-            else:
-                await query.answer("File no longer available.", show_alert=True)
-            # Refresh the list in place (re-read, clamp offset to a valid page).
-            items = get_outbox_items(cat)
-            if not items:
-                await query.edit_message_text(
-                    "📤 Empty now.", reply_markup=kb_outbox_categories(get_outbox_counts()))
-            else:
-                off = (idx // INBOX_PAGE) * INBOX_PAGE
-                if off >= len(items):
-                    off = max(0, off - INBOX_PAGE)
-                label = dict(OUTBOX_CAT_META).get(cat, cat)
-                shown = min(off + INBOX_PAGE, len(items))
-                await query.edit_message_text(
-                    f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
-                    reply_markup=kb_outbox_list(cat, items, off),
-                )
-
-        elif data == "menu_browse":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
-                return
-            try:
-                bdata = await bridge_status()
-                running = bdata.get("running", False)
-                ext = bdata.get("extension_connected", False)
-                status_text = (
-                    f"🌐 WebBridge\n══════════\n\n"
-                    f"Daemon: {'🟢 Running' if running else '🔴 Stopped'}\n"
-                    f"Extension: {'🟢 Connected' if ext else '🔴 Disconnected'}\n\n"
-                    "Use /browse <url> to open pages."
-                )
-            except Exception:
-                status_text = "🌐 WebBridge\n\n🔴 Not reachable. Start the daemon first."
-            await query.edit_message_text(status_text, reply_markup=kb_back())
-
-        elif data == "menu_status":
-            session_count = len(sessions.list_sessions(uid))
-            await query.edit_message_text(
-                "🖥️ Status\n═════════\n\n"
-                f"{await _backend_panel()}\n\n"
-                f"⏱️ Uptime: {get_uptime_str()}\n"
-                f"📁 Sessions: {session_count}\n"
-                f"🔧 Version: v{BOT_VERSION}",
-                reply_markup=kb_back(),
-            )
-
-        elif data == "menu_health":
-            await query.edit_message_text(await _health_panel(), reply_markup=kb_back())
-
-        elif data == "menu_schedules":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
-                return
-            items = schedules_mgr.list(uid)
-            await query.edit_message_text(
-                _schedule_panel_text(items),
-                reply_markup=kb_schedules(items) if items else kb_back(),
-            )
-
-        # ── Sessions ──
-        elif data == "sess_list":
-            all_sessions = sessions.list_sessions(uid)
-            active = sessions.get_active_name(uid)
-            await query.edit_message_text(
-                "📁 Sessions", reply_markup=kb_sessions(all_sessions, active),
-            )
-
-        elif data.startswith("sess_switch_"):
-            name = data.removeprefix("sess_switch_")
-            sessions.set_active_name(name, uid)
-            active = sessions.get_active_name(uid)
-            await query.edit_message_text(
-                f"✅ Switched to [{name}].",
-                reply_markup=kb_sessions(sessions.list_sessions(uid), active),
-            )
-
-        elif data.startswith("sess_delete_"):
-            name = data.removeprefix("sess_delete_")
-            await query.edit_message_text(
-                f"🗑️ Delete session [{name}]?\n\nThis cannot be undone.",
-                reply_markup=kb_session_delete(name),
-            )
-
-        elif data.startswith("sess_confirm_del_"):
-            name = data.removeprefix("sess_confirm_del_")
-            removed = sessions.delete_session(name, uid)
-            active = sessions.get_active_name(uid)
-            head = f"🗑️ [{name}] deleted." if removed else f"[{name}] not found."
-            await query.edit_message_text(
-                f"{head}\nActive: [{active}]",
-                reply_markup=kb_sessions(sessions.list_sessions(uid), active),
-            )
-
-        elif data == "sess_new":
-            existing = sessions.list_sessions(uid)
-            i = 1
-            while True:
-                name = f"session-{i}"
-                if name not in existing:
-                    break
-                i += 1
-            sessions.create_session(name, uid)
-            active = sessions.get_active_name(uid)
-            await query.edit_message_text(
-                f"📁 Session [{name}] created — next message starts fresh.",
-                reply_markup=kb_sessions(sessions.list_sessions(uid), active),
-            )
-
-        # ── Model ──
-        elif data == "model_switch_backend":
-            if not auth.is_owner(uid):
-                await query.answer("Only the owner can switch backend.", show_alert=True)
-                return
-            new_backend = "claude" if get_backend() == "agy" else "agy"
-            set_backend(new_backend)
-            current = get_model()
-            await query.edit_message_text(
-                f"🤖 Model Selection\n════════════════\nBackend: {new_backend}\n"
-                f"Current: {current}\n\n{_model_note()}",
-                reply_markup=kb_model(current),
-            )
-
-        elif data == "model_custom":
-            if not _can_change_model(uid):
-                await query.answer("Model changes are disabled by the owner.", show_alert=True)
-                return
-            context.user_data["awaiting_custom_model"] = True
-            await query.edit_message_text(
-                "✏️ Send the exact model string as it appears in agy's own "
-                "\"Switch Model\" screen,\ne.g. <code>Gemini 3.1 Pro (High)</code>\n\n"
-                "Send /cancel to abort.",
-                parse_mode="HTML",
-            )
-
-        elif data.startswith("model_"):
-            if not _can_change_model(uid):
-                await query.answer("Model changes are disabled by the owner.", show_alert=True)
-                return
-            chosen = data.removeprefix("model_")
-            # set_model persists for the active backend and returns the stored
-            # value (agy: read back from its settings.json; claude: the alias).
-            stored = set_model(chosen)
-            ok = stored == chosen
-            head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
-            src = "--model alias" if get_backend() == "claude" else "agy --model flag"
-            await query.edit_message_text(
-                f"{head}\n════════════════\n"
-                f"<b>{get_backend()}</b> will now use: <b>{stored}</b>\n"
-                f"(via {src})\n\nTakes effect on your next message.",
-                parse_mode="HTML",
-                reply_markup=kb_model(stored),
-            )
-
-        # ── Settings ──
-        elif data == "set_toggle_photo":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
-                return
-            current = get_setting("auto_describe_photos", False)
-            set_setting("auto_describe_photos", not current)
-            await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
-
-        elif data == "set_cycle_idle":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
-                return
-            current = get_idle_kill_after()
-            vals = [v for v, _ in _IDLE_OPTIONS]
-            try:
-                idx = vals.index(current)
-                new_val = vals[(idx + 1) % len(vals)]
-            except ValueError:
-                new_val = 600
-            set_setting("idle_kill_after", new_val)
-            await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
-
-        elif data == "set_toggle_admin_model":
-            if not auth.is_owner(uid):
-                await query.answer("Owner only.", show_alert=True)
-                return
-            current = get_setting("admins_can_change_model", True)
-            set_setting("admins_can_change_model", not current)
-            await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
-
-        elif data == "set_toggle_catchup":
-            if not auth.can(uid, "admin"):
-                await query.answer("Admin access required.", show_alert=True)
-                return
-            current = get_setting("schedule_catchup", True)
-            set_setting("schedule_catchup", not current)
-            await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
-
-        elif data == "set_toggle_backend":
-            if not auth.is_owner(uid):
-                await query.answer("Owner only.", show_alert=True)
-                return
-            new_backend = "claude" if get_backend() == "agy" else "agy"
-            set_backend(new_backend)
-            await query.edit_message_text(
-                f"🧠 Backend switched to: {new_backend}\n"
-                f"Takes effect on your next message. Model: {get_model()}",
-                reply_markup=kb_settings(uid),
-            )
-
-        # ── Schedules ──
-        elif data == "sched_confirm":
-            parsed = context.user_data.pop("pending_schedule", None)
-            if not parsed or not auth.can(uid, "admin"):
-                await query.edit_message_text("Nothing to create.")
-            else:
-                s = _make_schedule(uid, chat_id, parsed)
-                if s:
-                    await query.edit_message_text(
-                        f"✅ Scheduled: {s['title']}\n"
-                        f"{describe_schedule(s['kind'], s['spec'])} · next {_fmt_next(s['next_run'])}",
-                    )
-                else:
-                    await query.edit_message_text("Couldn't create that schedule (time already past?).")
-
-        elif data == "sched_cancel":
-            context.user_data.pop("pending_schedule", None)
-            await query.edit_message_text("Cancelled — no schedule created.")
-
-        elif data == "sched_list":
-            items = schedules_mgr.list(uid)
-            await query.edit_message_text(
-                _schedule_panel_text(items),
-                reply_markup=kb_schedules(items) if items else kb_back(),
-            )
-
-        elif data.startswith("sched_toggle_"):
-            sid = data.removeprefix("sched_toggle_")
-            s = schedules_mgr.get(sid)
-            if s and s.get("user_id") == uid:
-                schedules_mgr.set_enabled(sid, uid, not s.get("enabled"))
-            items = schedules_mgr.list(uid)
-            await query.edit_message_text(
-                _schedule_panel_text(items),
-                reply_markup=kb_schedules(items) if items else kb_back(),
-            )
-
-        elif data.startswith("sched_del_"):
-            sid = data.removeprefix("sched_del_")
-            schedules_mgr.remove(sid, uid)
-            items = schedules_mgr.list(uid)
-            await query.answer("🗑 Deleted")
-            await query.edit_message_text(
-                _schedule_panel_text(items),
-                reply_markup=kb_schedules(items) if items else kb_back(),
-            )
-
-        elif data.startswith("sched_run_"):
-            sid = data.removeprefix("sched_run_")
-            s = schedules_mgr.get(sid)
-            if s and s.get("user_id") == uid:
-                await query.answer("▶️ Running now…")
-                asyncio.create_task(_run_now(context.application, s))
-            else:
-                await query.answer("Not found.", show_alert=True)
-
-        # ── Cancel active request ──
-        elif data == "cancel_active":
-            cancel_ev = _active_cancel.get(chat_id)
-            if cancel_ev and not cancel_ev.is_set():
-                cancel_ev.set()
-                await query.edit_message_text("🛑 Canceling…")
-            else:
-                await query.edit_message_text("Nothing to cancel.")
-
-        # ── Users (owner only) ──
-        elif data == "menu_users":
-            if not auth.is_owner(uid):
-                await query.answer("Owner only.", show_alert=True)
-                return
-            users = auth.list_users()
-            await query.edit_message_text(
-                f"👥 Users ({len(users)})\nTap to manage.",
-                reply_markup=kb_users(users),
-            )
-
-        elif data == "user_list":
-            if not auth.is_owner(uid):
-                return
-            users = auth.list_users()
-            await query.edit_message_text(
-                f"👥 Users ({len(users)})",
-                reply_markup=kb_users(users),
-            )
-
-        elif data.startswith("user_detail_"):
-            if not auth.is_owner(uid):
-                return
-            target_id = int(data.removeprefix("user_detail_"))
-            users = auth.list_users()
-            info = users.get(target_id, {})
-            name = info.get("name") or f"User {target_id}"
-            role = info.get("role", "user")
-            added = info.get("added_at", "unknown")
-            await query.edit_message_text(
-                f"👤 {name}\n══════════════════\n"
-                f"ID: {target_id}\n"
-                f"Role: {role}\n"
-                f"Added: {added}",
-                reply_markup=kb_user_detail(target_id, role),
-            )
-
-        elif data.startswith("user_remove_"):
-            if not auth.is_owner(uid):
-                return
-            target_id = int(data.removeprefix("user_remove_"))
-            users = auth.list_users()
-            info = users.get(target_id, {})
-            name = info.get("name") or f"User {target_id}"
-            await query.edit_message_text(
-                f"🗑️ Remove {name} ({target_id}) and deny their access?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Yes, remove", callback_data=f"user_confirm_remove_{target_id}"),
-                     InlineKeyboardButton("❌ Cancel", callback_data=f"user_detail_{target_id}")],
-                ]),
-            )
-
-        elif data.startswith("user_confirm_remove_"):
-            if not auth.is_owner(uid):
-                return
-            target_id = int(data.removeprefix("user_confirm_remove_"))
-            if auth.remove_user(target_id):
-                users = auth.list_users()
-                await query.edit_message_text(
-                    f"🗑️ User {target_id} removed.",
-                    reply_markup=kb_users(users),
-                )
-            else:
-                await query.edit_message_text("User not found.")
-
-        elif data == "user_add_start":
-            if not auth.is_owner(uid):
-                return
-            context.user_data["adduser_flow"] = {"step": "awaiting_id"}
-            await query.edit_message_text(
-                "➕ Add User\n══════════\n\n"
-                "Send the new user's Telegram ID (a number).\n"
-                "Type /cancel to abort.",
-                reply_markup=None,
-            )
-
-        # ── Error recovery ──
-        elif data == "err_retry":
-            await query.edit_message_text(
-                "🔄 Send your message again.",
-                reply_markup=kb_back(),
-            )
-
-        elif data == "err_model":
-            if not _can_change_model(uid):
-                await query.answer("Model changes are disabled by the owner.", show_alert=True)
-                return
-            current = get_model()
-            await query.edit_message_text(
-                f"🤖 Try a different model?\nCurrent: {current}",
-                reply_markup=kb_model(current),
-            )
-
+        if data == "menu_sessions" or data.startswith("sess_"):
+            await _cb_sessions(query, context, data, uid, chat_id)
+        elif data == "menu_model" or data.startswith("model_") or data.startswith("err_"):
+            await _cb_model(query, context, data, uid, chat_id)
+        elif data == "menu_settings" or data.startswith("set_"):
+            await _cb_settings(query, context, data, uid, chat_id)
+        elif data == "menu_inbox" or data.startswith("ibx_"):
+            await _cb_inbox(query, context, data, uid, chat_id)
+        elif data == "menu_outbox" or data.startswith("obx_"):
+            await _cb_outbox(query, context, data, uid, chat_id)
+        elif data == "menu_schedules" or data.startswith("sched_"):
+            await _cb_schedules(query, context, data, uid, chat_id)
+        elif data == "menu_users" or data.startswith("user_"):
+            await _cb_users(query, context, data, uid, chat_id)
         else:
-            # Unknown — restore the menu rather than replacing with an error
-            await query.edit_message_text(
-                "⚡ Zilla — Control Panel\n════════════════════════",
-                reply_markup=kb_menu(uid),
-            )
-
+            await _cb_misc(query, context, data, uid, chat_id)
     except Exception as e:
         logger.error(f"Callback error: {e}", exc_info=True)
         try:
