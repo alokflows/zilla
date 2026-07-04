@@ -144,6 +144,27 @@ for _ln in ("", "httpx", "telegram", "telegram.ext", "telegram.request"):
 logger = logging.getLogger(__name__)
 
 
+def _prune_old_logs(max_age_days: int = 30) -> None:
+    """Delete daily log files older than max_age_days. Logs carry no secrets
+    (the token is redacted) but do accumulate chat/user/conversation ids, so we
+    don't keep them forever. Best-effort; never fatal."""
+    try:
+        if not os.path.isdir(LOG_DIR):
+            return
+        cutoff = time.time() - max_age_days * 86400
+        for name in os.listdir(LOG_DIR):
+            if not (name.startswith("bot_") and name.endswith(".log")):
+                continue
+            fp = os.path.join(LOG_DIR, name)
+            try:
+                if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _harden_file_perms() -> None:
     """Best-effort chmod 600 on secret/state files (no-op on Windows)."""
     if os.name == "nt":
@@ -208,6 +229,37 @@ def _get_user_lock(uid: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _user_cli_locks[uid] = lock
     return lock
+
+
+# ── Floodguard ─────────────────────────────────────────────
+# Per-user turns already serialize (one CLI run at a time via the lock above),
+# so this only stops a *burst* — a runaway script or a compromised client firing
+# hundreds of messages. Generous enough that a fast human never trips it.
+_RATE_WINDOW = 10.0     # seconds
+_RATE_MAX = 8           # messages allowed per window
+_user_msg_times: dict[int, list[float]] = {}
+_rate_notice_at: dict[int, float] = {}
+
+
+def _rate_ok(uid: int) -> bool:
+    """True if this user is under the burst limit; records the message if so."""
+    now = time.monotonic()
+    times = [t for t in _user_msg_times.get(uid, ()) if now - t <= _RATE_WINDOW]
+    if len(times) >= _RATE_MAX:
+        _user_msg_times[uid] = times
+        return False
+    times.append(now)
+    _user_msg_times[uid] = times
+    return True
+
+
+def _rate_should_notify(uid: int, min_gap: float = _RATE_WINDOW) -> bool:
+    """Throttle the 'slow down' notice so we don't spam it during a flood."""
+    now = time.monotonic()
+    if now - _rate_notice_at.get(uid, 0.0) < min_gap:
+        return False
+    _rate_notice_at[uid] = now
+    return True
 
 
 def _conv_for_run(uid: int, sname: str):
@@ -596,7 +648,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_count = len(sessions.list_sessions(uid))
     model = get_model()
     inbox = get_inbox_stats()
-    role = "owner" if auth.is_owner(uid) else auth._users.get(uid, {}).get("role", "user")
+    role = "owner" if auth.is_owner(uid) else auth._users.get(uid, {}).get("role", "admin")
 
     await update.message.reply_text(
         f"⚡ Zilla v{BOT_VERSION}\n"
@@ -1093,7 +1145,7 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     name = " ".join(context.args[1:]) if len(context.args) > 1 else ""
     if auth.add_user(new_id, name):
-        await update.message.reply_text(f"✅ User {new_id} ({name or 'unnamed'}) added as user.")
+        await update.message.reply_text(f"✅ User {new_id} ({name or 'unnamed'}) added as admin.")
     else:
         await update.message.reply_text(f"User {new_id} already exists.")
 
@@ -1129,7 +1181,7 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"👥 Users ({len(users)})\n"]
     for u_id, info in users.items():
         name = info.get("name") or f"User {u_id}"
-        role = info.get("role", "user")
+        role = info.get("role", "admin")
         added = info.get("added_at", "")[:10]
         lines.append(f"  [{role}] {name} — {u_id} ({added})")
     await update.message.reply_text("\n".join(lines), reply_markup=kb_users(users))
@@ -1531,12 +1583,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # Floodguard: drop bursts (runaway script / compromised client). A human
+    # never trips 8 msgs / 10s; when tripped, say so at most once per window.
+    if not _rate_ok(uid):
+        if _rate_should_notify(uid):
+            await safe_send(context.bot, chat_id,
+                            "🐢 Slow down a moment — too many messages at once. "
+                            "I'll catch up; try again in a few seconds.")
+        return
+
     # Human-in-the-loop bridge: if the agent asked this chat for an OTP / phone /
     # password / confirmation, this message IS the answer — hand it back to the
     # waiting CLI turn instead of starting a new one.
     pending = _pending_bridge.get(chat_id)
     if pending:
-        ask_id, ann_ts = pending
+        ask_id, ann_ts = pending[0], pending[1]
+        # Older entries were 2-tuples; treat a missing flag as non-secret.
+        is_secret = pending[2] if len(pending) > 2 else False
         if time.time() - ann_ts > _BRIDGE_PENDING_TTL:
             # Orphaned/stale ask — release the chat and process this message
             # normally instead of swallowing it as an answer.
@@ -1547,7 +1610,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 interactive.write_answer(ask_id, text)
                 _pending_bridge.pop(chat_id, None)
-                await update.message.reply_text("✅ Got it — continuing.")
+                if is_secret:
+                    # An OTP / password must not linger in the chat. In a private
+                    # chat a bot may delete the user's own incoming message; if
+                    # that's ever refused, tell them to remove it themselves.
+                    try:
+                        await update.message.delete()
+                        await safe_send(
+                            context.bot, chat_id,
+                            "✅ Got it — continuing. I removed that message so the "
+                            "code isn't left in the chat.")
+                    except Exception:
+                        await update.message.reply_text(
+                            "✅ Got it — continuing.\n"
+                            "⚠️ Please delete your last message — it holds a "
+                            "sensitive value and I wasn't allowed to remove it.")
+                else:
+                    await update.message.reply_text("✅ Got it — continuing.")
             except Exception as e:
                 await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
             return
@@ -2126,7 +2205,7 @@ async def _cb_users(query, context, data, uid, chat_id):
         users = auth.list_users()
         info = users.get(target_id, {})
         name = info.get("name") or f"User {target_id}"
-        role = info.get("role", "user")
+        role = info.get("role", "admin")
         added = info.get("added_at", "unknown")
         await query.edit_message_text(
             f"👤 {name}\n══════════════════\n"
@@ -2258,7 +2337,7 @@ async def bridge_watcher(application):
                         parse_mode="HTML",
                     )
                     _bridge_announced.add(ask.id)
-                    _pending_bridge[target] = (ask.id, time.time())
+                    _pending_bridge[target] = (ask.id, time.time(), ask.is_secret)
                     log_event("bridge_ask", kind=ask.kind, chat=target)
                 except Exception as e:
                     logger.error(f"[BRIDGE] could not DM ask {ask.id}: {e}")
@@ -2430,6 +2509,7 @@ def main():
     # SECURITY: keep secrets/state owner-only (the bot token lives in .env; state
     # files carry conversation ids + auto-titled message snippets).
     _harden_file_perms()
+    _prune_old_logs()
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)

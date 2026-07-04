@@ -23,6 +23,7 @@
 import os
 import sys
 import shutil
+import getpass
 import platform
 import subprocess
 
@@ -47,6 +48,21 @@ def bad(m):      print(f"  ❌ {m}")
 def info(m):     print(f"  • {m}")
 def ask(p, d=""):
     s = input(f"{p}" + (f" [{d}]" if d else "") + ": ").strip()
+    return s or d
+
+
+def ask_secret(p, d=""):
+    """Like ask(), but the typed value is NOT echoed to the terminal — for the
+    bot token, which must not end up in scrollback or a screen recording. Press
+    Enter to keep the existing value (if any)."""
+    suffix = " [press Enter to keep the current value]" if d else ""
+    try:
+        s = getpass.getpass(f"{p}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except Exception:
+        # No TTY (e.g. piped input) — fall back to a visible prompt.
+        s = input(f"{p}: ").strip()
     return s or d
 
 
@@ -171,7 +187,20 @@ def write_env(values: dict):
     tmp = ENV_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    # Lock it down BEFORE it lands at its final name, so the token is never
+    # world-readable — not even for the moment before the bot's own startup
+    # hardening runs. No-op on Windows (which lacks Unix perms).
+    if os.name != "nt":
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
     os.replace(tmp, ENV_PATH)
+    if os.name != "nt":
+        try:
+            os.chmod(ENV_PATH, 0o600)
+        except OSError:
+            pass
     ok(f".env written ({ENV_PATH})")
 
 
@@ -322,7 +351,7 @@ def main():
         auto = "--no-autostart" not in sys.argv
     else:
         print()
-        token = ask("  Paste your bot token from @BotFather", env.get("TELEGRAM_BOT_TOKEN", ""))
+        token = ask_secret("  Paste your bot token from @BotFather (hidden as you type)", env.get("TELEGRAM_BOT_TOKEN", ""))
         owner = ask("  Paste your Telegram numeric ID from @userinfobot", env.get("TELEGRAM_OWNER_ID", ""))
         auto = ask("  Start automatically every time you log in? (y/n)", "y").lower().startswith("y")
 

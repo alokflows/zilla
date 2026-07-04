@@ -180,6 +180,7 @@ Zilla runs your AI CLI with permissions to read/write files and run commands **o
 - **Anyone you authorize (owner or admin) can effectively run code on that machine** through chat. There is no safe "limited user" — the AI CLI executes tools regardless. **Only add people you trust with that computer.**
 - Only the **owner** (you) can add/remove admins.
 - Your bot **token** and your **.env** are secrets — they're git-ignored; never share them.
+- **If your token ever leaks** (posted a screenshot, pasted it somewhere public), revoke it: message **@BotFather → /revoke**, pick the bot, and put the new token in your `.env`, then restart. A leaked token doesn't let someone control your computer, but they could disrupt the bot or message you *as* it — so rotate it to be safe.
 - Each person who wants their own safe setup should run their **own** bot on their **own** PC (Sharing → option B).
 
 ---
