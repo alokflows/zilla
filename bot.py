@@ -717,7 +717,7 @@ async def _run_approved_request(context, req: dict):
             None, uid, chat_id, prompt, cancel_event,
             auto_title=True, skip_permissions=True)
     except Exception as e:
-        response = f"Error: {str(e)}"
+        response = _friendly_error(e)
         logger.error(f"[APPROVAL] run failed: {e}", exc_info=True)
     finally:
         stop_typing.set()
@@ -752,6 +752,21 @@ async def _cb_approvals(query, context, data, uid, chat_id):
                         "🚫 The owner declined your request.")
 
 
+def _friendly_error(e: Exception) -> str:
+    """Turn an internal exception into a calm, plain-language message for the
+    user. The full traceback still goes to the logs — this is just what they see."""
+    msg = str(e).lower()
+    if "timed out" in msg or "timeout" in msg:
+        return ("⏱️ That took too long, so I stopped it. Try again, or break it "
+                "into a smaller step.")
+    if "not logged in" in msg or "not installed" in msg or "auth" in msg:
+        return ("🔌 I couldn't reach the AI on this computer. Make sure your CLI "
+                "is installed and logged in (run it once in a terminal), then try "
+                "again. /help has the setup steps.")
+    return ("⚠️ Something went wrong while running that. Please try again — if it "
+            "keeps happening, check your AI CLI is set up and logged in (/help).")
+
+
 async def _block_media_for_limited(update, context) -> bool:
     """Limited users route through text approval; politely refuse media for now."""
     if auth.is_limited(update.effective_user.id):
@@ -771,6 +786,29 @@ async def _block_media_for_limited(update, context) -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
+    # First time the owner ever runs /start: a warm, plain-language welcome
+    # instead of the status dashboard. Shown once, then we flip a flag.
+    if auth.is_owner(uid) and not get_setting("owner_welcomed", False):
+        set_setting("owner_welcomed", True)
+        await update.message.reply_text(
+            "👋 Welcome to Zilla — you're the owner.\n"
+            "══════════════════════\n\n"
+            "I connect this Telegram chat to the AI on your computer. "
+            "Just type what you want in plain English and I'll do it.\n\n"
+            "Try one now, for example:\n"
+            "  • “what files are on my desktop?”\n"
+            "  • “summarise the PDF I'm about to send”\n\n"
+            "A few things to know:\n"
+            "  • /menu — buttons for sessions, model, settings, schedules\n"
+            "  • You can send voice notes, photos and files too.\n"
+            "  • Adding people: anyone you add as *admin* can run anything on this "
+            "computer — only do that for people you fully trust. Not sure? Add them "
+            "in *Approval mode* so every request waits for your ✅.\n\n"
+            "Send /help anytime. Go ahead — type your first message. 🚀"
+        )
+        return
+
     active = sessions.get_active_name(uid)
     conv_id = sessions.get_conversation_id(user_id=uid)
     session_count = len(sessions.list_sessions(uid))
@@ -1899,7 +1937,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await _run_cli_turn(
             update, uid, chat_id, user_message, cancel_event, auto_title=True)
     except Exception as e:
-        response = f"Error: {str(e)}"
+        response = _friendly_error(e)
         logger.error(f"Handler error: {e}", exc_info=True)
     finally:
         stop_typing.set()
