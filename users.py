@@ -21,12 +21,19 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# Capability → roles allowed. Every authorized non-owner is an admin.
+# Capability → roles allowed.
+#   limited — may CHAT, but every request is held for owner approval (see bot.py
+#             Approval mode). Cannot change settings, browse, schedule, etc.
+#   admin   — full, unattended access (chat + settings/browse/file_gen/execution).
+#   owner   — everything admins can, PLUS user management.
 _CAPS = {
-    "chat":     {"admin", "owner"},
+    "chat":     {"limited", "admin", "owner"},
     "admin":    {"admin", "owner"},   # settings, browse, file_gen, agy execution
     "users":    {"owner"},            # add/remove admins — owner only
 }
+
+# Roles an owner may assign to a stored account.
+VALID_ROLES = ("admin", "limited")
 
 
 class AuthManager:
@@ -46,10 +53,11 @@ class AuthManager:
                 with open(self.users_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self._users = {int(k): v for k, v in data.items()}
-                # Migrate: the old "user" tier no longer exists — every stored
-                # (owner-added) account is an admin now.
+                # Normalize roles: "admin" (full) and "limited" (approval-gated)
+                # are the only valid tiers. Any legacy/unknown value (e.g. the old
+                # "user") becomes "admin" — the historical default.
                 for info in self._users.values():
-                    if info.get("role") != "admin":
+                    if info.get("role") not in VALID_ROLES:
                         info["role"] = "admin"
                 try:
                     self._mtime_users = os.path.getmtime(self.users_file)
@@ -110,6 +118,18 @@ class AuthManager:
     def is_admin(self, user_id: int) -> bool:
         return self.can(user_id, "admin")
 
+    def role_of(self, user_id: int) -> str:
+        """'owner' | 'admin' | 'limited' | 'none'."""
+        if user_id == self.owner_id:
+            return "owner"
+        if user_id in self._denied or user_id not in self._users:
+            return "none"
+        return self._users[user_id].get("role", "admin")
+
+    def is_limited(self, user_id: int) -> bool:
+        """Authorized, but every request must be approved by the owner."""
+        return self.role_of(user_id) == "limited"
+
     def can(self, user_id: int, capability: str) -> bool:
         """Check if user has the given capability."""
         if user_id == self.owner_id:
@@ -136,8 +156,7 @@ class AuthManager:
     # ── CRUD ──────────────────────────────────────────────
 
     def add_user(self, user_id: int, name: str = "", role: str = "admin") -> bool:
-        # Only admins exist now (besides the owner).
-        role = "admin"
+        role = role if role in VALID_ROLES else "admin"
         with self._lock:
             if user_id in self._users:
                 return False
@@ -150,6 +169,18 @@ class AuthManager:
             self._save()
             self._save_denied()
         logger.info(f"[USERS] Added {user_id} ({name}) as {role}")
+        return True
+
+    def set_role(self, user_id: int, role: str) -> bool:
+        """Change a stored user's role between 'admin' and 'limited'."""
+        if role not in VALID_ROLES:
+            return False
+        with self._lock:
+            if user_id not in self._users:
+                return False
+            self._users[user_id]["role"] = role
+            self._save()
+        logger.info(f"[USERS] Set {user_id} role -> {role}")
         return True
 
     def remove_user(self, user_id: int) -> bool:

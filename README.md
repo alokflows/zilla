@@ -177,9 +177,11 @@ Then restart (Windows: `STOP_BACKGROUND.bat` then `START_BACKGROUND.bat`; macOS/
 
 Zilla runs your AI CLI with permissions to read/write files and run commands **on the computer it's installed on**. That power is the point (it can actually do tasks) — but it means:
 
-- **Anyone you authorize (owner or admin) can effectively run code on that machine** through chat. There is no safe "limited user" — the AI CLI executes tools regardless. **Only add people you trust with that computer.**
-- Only the **owner** (you) can add/remove admins.
+- **An admin can effectively run code on that machine** through chat — the AI CLI executes tools on your behalf. **Only give full (admin) access to people you trust with that computer.**
+- **Not sure you trust them that much? Use Approval mode.** Add them as a *limited* user and every request they send waits for you to tap ✅ Approve before anything runs. Good for a student/helper. (Pick the tier when adding them, or toggle it later in the Users panel.)
+- Only the **owner** (you) can add/remove users.
 - Your bot **token** and your **.env** are secrets — they're git-ignored; never share them.
+- **If your token ever leaks** (posted a screenshot, pasted it somewhere public), revoke it: message **@BotFather → /revoke**, pick the bot, and put the new token in your `.env`, then restart. A leaked token doesn't let someone control your computer, but they could disrupt the bot or message you *as* it — so rotate it to be safe.
 - Each person who wants their own safe setup should run their **own** bot on their **own** PC (Sharing → option B).
 
 ---

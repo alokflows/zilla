@@ -280,6 +280,43 @@ def test_can_change_model():
     check("model-gate: stranger False", not a.can_change_model(9999, True))
 
 
+def test_auth_limited_role():
+    a = _auth(owner=1000)
+    a.add_user(4000, "Student", role="limited")
+    check("limited: stored as limited", a.list_users()[4000]["role"] == "limited")
+    check("limited: is authorized", a.is_authorized(4000))
+    check("limited: is_limited True", a.is_limited(4000))
+    check("limited: has chat cap", a.can(4000, "chat"))
+    check("limited: lacks admin cap", not a.can(4000, "admin"))
+    check("limited: lacks users cap", not a.can(4000, "users"))
+    check("limited: can't change model even if admins allowed",
+          not a.can_change_model(4000, True))
+    check("limited: role_of == limited", a.role_of(4000) == "limited")
+    check("limited: owner is not limited", not a.is_limited(1000))
+    check("limited: stranger is not limited", not a.is_limited(9999))
+
+
+def test_auth_set_role_toggle():
+    a = _auth(owner=1000)
+    a.add_user(4001, "Ada")                       # default admin
+    check("toggle: starts admin", a.role_of(4001) == "admin")
+    check("toggle: -> limited ok", a.set_role(4001, "limited"))
+    check("toggle: now limited + no admin cap",
+          a.is_limited(4001) and not a.can(4001, "admin"))
+    check("toggle: -> admin ok", a.set_role(4001, "admin"))
+    check("toggle: admin cap restored", a.can(4001, "admin"))
+    check("toggle: invalid role rejected", not a.set_role(4001, "superuser"))
+    check("toggle: unknown user rejected", not a.set_role(123456, "limited"))
+
+
+def test_auth_limited_role_persists():
+    path = os.path.join(_tmpdir, f"lim_{os.urandom(4).hex()}.json")
+    a = AuthManager(path, owner_id=1000)
+    a.add_user(4002, "Sam", role="limited")
+    b = AuthManager(path, owner_id=1000)          # reload from disk
+    check("limited: survives reload", b.is_limited(4002))
+
+
 # ════════════════════════════════════════════════════════════
 #  INBOX — classification, filtering, counts
 # ════════════════════════════════════════════════════════════
@@ -774,6 +811,9 @@ def main():
         test_auth_owner_has_everything,
         test_auth_old_user_role_migrates,
         test_can_change_model,
+        test_auth_limited_role,
+        test_auth_set_role_toggle,
+        test_auth_limited_role_persists,
         test_inbox_classifies_video_by_extension,
         test_inbox_counts,
         test_inbox_filter_returns_only_category,

@@ -8,7 +8,7 @@ Everything you need, explained simply. Read the part you need:
 4. [Turn it on](#4-turn-it-on)
 5. [Run it quietly in the background](#5-run-it-quietly-in-the-background)
 6. [Everyday use — talking to Zilla](#6-everyday-use--talking-to-zilla)
-7. [Sessions — separate notebooks](#7-sessions--separate-notebooks)
+7. [Sessions, memory & file delivery](#7-sessions-memory--file-delivery)
 8. [Owner & admin powers](#8-owner--admin-powers)
 9. [Connecting a DIFFERENT AI (another CLI)](#9-connecting-a-different-ai-another-cli)
 10. [Sharing with a friend](#10-sharing-with-a-friend)
@@ -157,16 +157,44 @@ If the AI makes a file for you (like a PDF), Zilla **sends it to you automatical
 
 ---
 
-## 7. Sessions — separate notebooks
+## 7. Sessions, memory & file delivery
 
-A **session** is like a separate notebook for a separate topic. They don't mix. 📓
+### Sessions — separate notebooks 📓
+
+A **session** is like a separate notebook for a separate topic. They don't mix. Everything you say inside one session **shares memory** — Zilla remembers the earlier messages in *that* notebook and keeps building on them. Start a new notebook and it begins **blank**.
 
 | Command            | What it does                          |
 |--------------------|---------------------------------------|
-| `/new homework`    | Start a fresh notebook called "homework" |
-| `/sessions`        | See all your notebooks                |
-| `/switch recipes`  | Jump to your "recipes" notebook       |
+| `/new homework`    | Start a fresh notebook called "homework" (blank memory) |
+| `/sessions`        | See all your notebooks (tap to switch, 🗑 to delete) |
+| `/switch recipes`  | Jump to your "recipes" notebook (resumes its memory) |
 | `/end`             | Close the current notebook            |
+
+> 🖲️ Same thing with buttons: `/menu` → **📁 Sessions**.
+
+### The one thing to remember: use `/new` for new topics
+
+If you **never** send `/new`, every message keeps going into the **same** notebook. That's perfect for a continuing conversation — but if you run lots of *unrelated* tasks back-to-back without `/new`, they all pile into one giant notebook. The AI then starts dragging in old stuff, which can feel like it's "mixing things up" or repeating the whole chat.
+
+**Rule of thumb:**
+- Same topic / follow-up question → just keep typing (stay in the notebook).
+- New, unrelated task → send **`/new`** first. Clean slate, sharper answers.
+
+This isn't a bug — one thread just got too long.
+
+### Files: Inbox and Outbox 📥📤
+
+- Files **you** send to Zilla land in the **Inbox** (`/menu` → **📥 Inbox**).
+- Files the **AI makes** for you go to the **Outbox**, and Zilla attaches the fresh ones to the chat **automatically** so you can download them on your phone. 🎁
+- It auto-sends up to **10** files per reply, and only ones it **just made** (older files stay in the Outbox so they don't get re-sent).
+- To grab anything not auto-sent: `/menu` → **📤 Outbox** → browse → 📤 to send, 🗑 to delete.
+
+> Remember: **Inbox = stuff you sent in. Outbox = stuff the bot produced.**
+
+### If a reply looks wrong
+
+- Replies feel like they're **dragging in old context** → send **`/new`**.
+- Want a **specific earlier file** → `/menu` → **📤 Outbox**, rather than asking the AI to re-send it.
 
 ---
 

@@ -46,6 +46,7 @@ import logging
 import threading
 import time
 import json
+import secrets
 from datetime import datetime
 
 from telegram import (
@@ -144,6 +145,27 @@ for _ln in ("", "httpx", "telegram", "telegram.ext", "telegram.request"):
 logger = logging.getLogger(__name__)
 
 
+def _prune_old_logs(max_age_days: int = 30) -> None:
+    """Delete daily log files older than max_age_days. Logs carry no secrets
+    (the token is redacted) but do accumulate chat/user/conversation ids, so we
+    don't keep them forever. Best-effort; never fatal."""
+    try:
+        if not os.path.isdir(LOG_DIR):
+            return
+        cutoff = time.time() - max_age_days * 86400
+        for name in os.listdir(LOG_DIR):
+            if not (name.startswith("bot_") and name.endswith(".log")):
+                continue
+            fp = os.path.join(LOG_DIR, name)
+            try:
+                if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _harden_file_perms() -> None:
     """Best-effort chmod 600 on secret/state files (no-op on Windows)."""
     if os.name == "nt":
@@ -210,6 +232,65 @@ def _get_user_lock(uid: int) -> asyncio.Lock:
     return lock
 
 
+# ── Floodguard ─────────────────────────────────────────────
+# Per-user turns already serialize (one CLI run at a time via the lock above),
+# so this only stops a *burst* — a runaway script or a compromised client firing
+# hundreds of messages. Generous enough that a fast human never trips it.
+_RATE_WINDOW = 10.0     # seconds
+_RATE_MAX = 8           # messages allowed per window
+_user_msg_times: dict[int, list[float]] = {}
+_rate_notice_at: dict[int, float] = {}
+
+
+def _rate_ok(uid: int) -> bool:
+    """True if this user is under the burst limit; records the message if so."""
+    now = time.monotonic()
+    times = [t for t in _user_msg_times.get(uid, ()) if now - t <= _RATE_WINDOW]
+    if len(times) >= _RATE_MAX:
+        _user_msg_times[uid] = times
+        return False
+    times.append(now)
+    _user_msg_times[uid] = times
+    return True
+
+
+def _rate_should_notify(uid: int, min_gap: float = _RATE_WINDOW) -> bool:
+    """Throttle the 'slow down' notice so we don't spam it during a flood."""
+    now = time.monotonic()
+    if now - _rate_notice_at.get(uid, 0.0) < min_gap:
+        return False
+    _rate_notice_at[uid] = now
+    return True
+
+
+# ── Approval mode (limited users) ──────────────────────────
+# A "limited" user may chat, but nothing they send runs until the OWNER taps
+# Approve. Each pending request is held here keyed by a short random id.
+_pending_approvals: dict[str, dict] = {}
+_APPROVAL_TTL = 3600.0     # forget un-actioned requests after an hour
+_APPROVAL_MAX = 50         # hard cap so a spammer can't grow this unbounded
+
+
+def _prune_approvals() -> None:
+    now = time.time()
+    for rid in [r for r, v in _pending_approvals.items()
+                if now - v.get("ts", 0) > _APPROVAL_TTL]:
+        _pending_approvals.pop(rid, None)
+
+
+def _make_approval(uid: int, chat_id: int, prompt: str, name: str) -> str | None:
+    """Register a pending request; returns its id, or None if the queue is full."""
+    _prune_approvals()
+    if len(_pending_approvals) >= _APPROVAL_MAX:
+        return None
+    rid = secrets.token_hex(6)
+    _pending_approvals[rid] = {
+        "uid": uid, "chat_id": chat_id, "prompt": prompt,
+        "name": name, "ts": time.time(),
+    }
+    return rid
+
+
 def _conv_for_run(uid: int, sname: str):
     """The conversation id to resume — but only if it was created by the CURRENT
     backend. agy brain-dir ids and claude session ids aren't interchangeable, so
@@ -225,7 +306,7 @@ async def _acquire_turn(uid: int, update: Update) -> asyncio.Lock:
     previous message is still running, send one calm heads-up so the new message
     doesn't feel ignored while it waits its turn."""
     lock = _get_user_lock(uid)
-    if lock.locked():
+    if lock.locked() and update is not None:
         try:
             await update.effective_message.reply_text(
                 "⏳ One sec — finishing your previous message first, then I'll get to this."
@@ -585,18 +666,155 @@ async def send_response(update, context, response: str, user_id: int, chat_id: i
             await safe_send(context.bot, chat_id, note)
 
 
+# ── Approval mode: submit / approve / run ──────────────────
+
+async def _submit_for_approval(update, context, uid: int, chat_id: int, prompt: str):
+    """Hold a limited user's request and ask the owner to approve it."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return
+    name = auth._users.get(uid, {}).get("name") or f"User {uid}"
+    rid = _make_approval(uid, chat_id, prompt, name)
+    if not rid:
+        await safe_send(context.bot, chat_id,
+                        "⚠️ Too many requests are waiting for approval right now. "
+                        "Please try again in a bit.")
+        return
+    await safe_send(context.bot, chat_id,
+                    "📨 Sent to the owner for approval. I'll post the answer here "
+                    "once they approve it.")
+    preview = prompt if len(prompt) <= 500 else prompt[:500] + "…"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve & run", callback_data=f"appr_ok_{rid}"),
+        InlineKeyboardButton("❌ Deny", callback_data=f"appr_no_{rid}"),
+    ]])
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=(f"🔔 Approval needed\n\n"
+                  f"{name} (limited) wants to run:\n\n"
+                  f"“{preview}”\n\n"
+                  f"Approving runs it on THIS computer and sends them the result."),
+            reply_markup=kb,
+        )
+    except Exception as e:
+        logger.error(f"[APPROVAL] could not notify owner: {e}")
+        _pending_approvals.pop(rid, None)
+        await safe_send(context.bot, chat_id,
+                        "⚠️ Couldn't reach the owner right now. Please try again later.")
+
+
+async def _run_approved_request(context, req: dict):
+    """Execute an owner-approved limited-user request and deliver it to them."""
+    uid, chat_id, prompt = req["uid"], req["chat_id"], req["prompt"]
+    stop_typing = asyncio.Event()
+    cancel_event = threading.Event()
+    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+    response = ""
+    try:
+        # The owner vetted the whole request, so let the agent act (skip prompts).
+        response = await _run_cli_turn(
+            None, uid, chat_id, prompt, cancel_event,
+            auto_title=True, skip_permissions=True)
+    except Exception as e:
+        response = _friendly_error(e)
+        logger.error(f"[APPROVAL] run failed: {e}", exc_info=True)
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+        if _active_cancel.get(chat_id) is cancel_event:
+            _active_cancel.pop(chat_id, None)
+    await send_response(None, context, response, uid, chat_id)
+
+
+async def _cb_approvals(query, context, data, uid, chat_id):
+    """Owner-only: approve or deny a held limited-user request."""
+    if not auth.is_owner(uid):
+        return
+    if data.startswith("appr_ok_"):
+        req = _pending_approvals.pop(data.removeprefix("appr_ok_"), None)
+        if not req:
+            await query.edit_message_text("⏳ That request expired or was already handled.")
+            return
+        await query.edit_message_text(f"✅ Approved — running {req['name']}'s request…")
+        await _run_approved_request(context, req)
+        try:
+            await safe_send(context.bot, OWNER_CHAT_ID, f"✅ Sent {req['name']} the result.")
+        except Exception:
+            pass
+    elif data.startswith("appr_no_"):
+        req = _pending_approvals.pop(data.removeprefix("appr_no_"), None)
+        if not req:
+            await query.edit_message_text("⏳ That request expired or was already handled.")
+            return
+        await query.edit_message_text(f"❌ Denied {req['name']}'s request.")
+        await safe_send(context.bot, req["chat_id"],
+                        "🚫 The owner declined your request.")
+
+
+def _friendly_error(e: Exception) -> str:
+    """Turn an internal exception into a calm, plain-language message for the
+    user. The full traceback still goes to the logs — this is just what they see."""
+    msg = str(e).lower()
+    if "timed out" in msg or "timeout" in msg:
+        return ("⏱️ That took too long, so I stopped it. Try again, or break it "
+                "into a smaller step.")
+    if "not logged in" in msg or "not installed" in msg or "auth" in msg:
+        return ("🔌 I couldn't reach the AI on this computer. Make sure your CLI "
+                "is installed and logged in (run it once in a terminal), then try "
+                "again. /help has the setup steps.")
+    return ("⚠️ Something went wrong while running that. Please try again — if it "
+            "keeps happening, check your AI CLI is set up and logged in (/help).")
+
+
+async def _block_media_for_limited(update, context) -> bool:
+    """Limited users route through text approval; politely refuse media for now."""
+    if auth.is_limited(update.effective_user.id):
+        try:
+            await update.message.reply_text(
+                "🔒 You're in Approval mode — please send your request as text so "
+                "the owner can approve it. (Media isn't supported yet.)")
+        except Exception:
+            pass
+        return True
+    return False
+
+
 # ══════════════════════════════════════════════════════════
 #  COMMAND HANDLERS
 # ══════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+
+    # First time the owner ever runs /start: a warm, plain-language welcome
+    # instead of the status dashboard. Shown once, then we flip a flag.
+    if auth.is_owner(uid) and not get_setting("owner_welcomed", False):
+        set_setting("owner_welcomed", True)
+        await update.message.reply_text(
+            "👋 Welcome to Zilla — you're the owner.\n"
+            "══════════════════════\n\n"
+            "I connect this Telegram chat to the AI on your computer. "
+            "Just type what you want in plain English and I'll do it.\n\n"
+            "Try one now, for example:\n"
+            "  • “what files are on my desktop?”\n"
+            "  • “summarise the PDF I'm about to send”\n\n"
+            "A few things to know:\n"
+            "  • /menu — buttons for sessions, model, settings, schedules\n"
+            "  • You can send voice notes, photos and files too.\n"
+            "  • Adding people: anyone you add as *admin* can run anything on this "
+            "computer — only do that for people you fully trust. Not sure? Add them "
+            "in *Approval mode* so every request waits for your ✅.\n\n"
+            "Send /help anytime. Go ahead — type your first message. 🚀"
+        )
+        return
+
     active = sessions.get_active_name(uid)
     conv_id = sessions.get_conversation_id(user_id=uid)
     session_count = len(sessions.list_sessions(uid))
     model = get_model()
     inbox = get_inbox_stats()
-    role = "owner" if auth.is_owner(uid) else auth._users.get(uid, {}).get("role", "user")
+    role = "owner" if auth.is_owner(uid) else auth._users.get(uid, {}).get("role", "admin")
 
     await update.message.reply_text(
         f"⚡ Zilla v{BOT_VERSION}\n"
@@ -1092,10 +1310,15 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid user ID.")
         return
     name = " ".join(context.args[1:]) if len(context.args) > 1 else ""
-    if auth.add_user(new_id, name):
-        await update.message.reply_text(f"✅ User {new_id} ({name or 'unnamed'}) added as user.")
-    else:
+    if new_id in auth.list_users():
         await update.message.reply_text(f"User {new_id} already exists.")
+        return
+    # Don't add on the spot — require an explicit YES after the danger warning
+    # (handled by _handle_adduser_flow's awaiting_confirm step).
+    context.user_data["adduser_flow"] = {
+        "step": "awaiting_confirm", "target_id": new_id, "name": name,
+    }
+    await update.message.reply_text(_adduser_warning(name or f"ID {new_id}"))
 
 
 async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1129,7 +1352,7 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"👥 Users ({len(users)})\n"]
     for u_id, info in users.items():
         name = info.get("name") or f"User {u_id}"
-        role = info.get("role", "user")
+        role = info.get("role", "admin")
         added = info.get("added_at", "")[:10]
         lines.append(f"  [{role}] {name} — {u_id} ({added})")
     await update.message.reply_text("\n".join(lines), reply_markup=kb_users(users))
@@ -1268,14 +1491,21 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  MEDIA HANDLERS
 # ══════════════════════════════════════════════════════════
 
-async def _run_cli_turn(update, uid, chat_id, prompt, cancel_event, *, auto_title=False):
+async def _run_cli_turn(update, uid, chat_id, prompt, cancel_event, *,
+                        auto_title=False, skip_permissions=None):
     """Run one CLI turn against the user's active session and return the response.
 
     Acquires the per-user lock, pins the session that is active the moment we
     start (the user may /switch while queued), resumes/tracks its conversation,
     optionally auto-titles a fresh session, and keeps the message bookkeeping in
     sync. Shared by the text, voice, photo and document handlers.
+
+    skip_permissions: None → derive from the user's role (admins skip prompts).
+    Owner-approved Approval-mode runs pass True explicitly (the owner already
+    vetted the whole request), and `update` may be None (no live message).
     """
+    if skip_permissions is None:
+        skip_permissions = auth.can(uid, "admin")
     async with await _acquire_turn(uid, update):
         # Pin the session to whatever is active the moment WE start running, and
         # write every result back to that same session — never the now-active one.
@@ -1291,7 +1521,7 @@ async def _run_cli_turn(update, uid, chat_id, prompt, cancel_event, *, auto_titl
         response, detected_id = await run_cli_async(
             prompt, conv_id,
             cancel_event=cancel_event,
-            skip_permissions=auth.can(uid, "admin"),
+            skip_permissions=skip_permissions,
         )
 
         if detected_id and detected_id != conv_id:
@@ -1305,6 +1535,8 @@ async def _run_cli_turn(update, uid, chat_id, prompt, cancel_event, *, auto_titl
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _block_media_for_limited(update, context):
+        return
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     stop_typing = asyncio.Event()
@@ -1343,6 +1575,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _block_media_for_limited(update, context):
+        return
     chat_id = update.effective_chat.id
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
@@ -1366,6 +1600,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _block_media_for_limited(update, context):
+        return
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     caption = update.message.caption or ""
@@ -1407,6 +1643,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save document. If caption provided, analyze it via CLI."""
+    if await _block_media_for_limited(update, context):
+        return
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     caption = update.message.caption or ""
@@ -1463,6 +1701,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _block_media_for_limited(update, context):
+        return
     try:
         filepath = await save_video(context.bot, update.message.video)
         await update.message.reply_text(
@@ -1475,6 +1715,28 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 #  ADD-USER INLINE FLOW (owner only)
 # ══════════════════════════════════════════════════════════
+
+def _adduser_warning(who: str, role: str = "admin") -> str:
+    """The confirmation notice shown before anyone is granted access. For an
+    admin this is an unmissable danger warning; for a limited user it explains
+    that every request is owner-approved."""
+    if role == "limited":
+        return (
+            f"You're adding {who} in Approval mode.\n\n"
+            "They can send requests, but NOTHING runs until you approve each one. "
+            "They can't change settings, browse, schedule, or add users.\n\n"
+            "Type YES to add them, or /cancel to stop."
+        )
+    return (
+        f"⚠️ Read this before adding {who} with full access.\n\n"
+        "This makes them an ADMIN. Through the bot they can run ANY command on "
+        "THIS computer, read and change your files, and use apps you're already "
+        "logged into — unattended, no approval needed.\n\n"
+        "Only do this for someone you'd hand your unlocked laptop to.\n"
+        "(For less trust, cancel and choose Approval mode instead.)\n\n"
+        "Type YES to add them, or /cancel to stop."
+    )
+
 
 async def _handle_adduser_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: dict):
     """Process multi-step add-user input from owner."""
@@ -1501,14 +1763,53 @@ async def _handle_adduser_flow(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif step == "awaiting_name":
         name = "" if text.lower() == "/skip" else text
+        flow["name"] = name
+        flow["step"] = "awaiting_role"
+        context.user_data["adduser_flow"] = flow
+        await update.message.reply_text(
+            "What access should they have?\n\n"
+            "1 — Full access (admin): full control, unattended. Only for people "
+            "you fully trust.\n"
+            "2 — Approval mode (limited): they can chat, but you approve every "
+            "request first.\n\n"
+            "Send 1 or 2 (or /cancel)."
+        )
+
+    elif step == "awaiting_role":
+        choice = text.strip().lower()
+        if choice in ("1", "admin", "full"):
+            role = "admin"
+        elif choice in ("2", "limited", "approval"):
+            role = "limited"
+        else:
+            await update.message.reply_text("Please send 1 (full) or 2 (approval), or /cancel.")
+            return
+        flow["role"] = role
+        flow["step"] = "awaiting_confirm"
+        context.user_data["adduser_flow"] = flow
+        who = flow.get("name") or f"ID {flow.get('target_id')}"
+        await update.message.reply_text(_adduser_warning(who, role))
+
+    elif step == "awaiting_confirm":
         target_id = flow.get("target_id")
+        name = flow.get("name", "")
+        role = flow.get("role", "admin")
         context.user_data.pop("adduser_flow", None)
-        # Everyone added is an admin (full access, owner-trusted).
-        if target_id and auth.add_user(target_id, name, "admin"):
+        if text.strip().upper() != "YES":
             await update.message.reply_text(
-                f"✅ Added {name or target_id} as [admin].\n"
-                f"They have full access (chat, sessions, media, files). "
-                f"Only you (owner) can manage users.",
+                "Add-user canceled — nobody was added.",
+                reply_markup=kb_users(auth.list_users()),
+            )
+            return
+        if target_id and auth.add_user(target_id, name, role):
+            if role == "limited":
+                blurb = ("in Approval mode — they can chat, but every request "
+                         "waits for your approval.")
+            else:
+                blurb = ("with full access (chat, sessions, media, files). "
+                         "Only you (owner) can manage users.")
+            await update.message.reply_text(
+                f"✅ Added {name or target_id} as [{role}] — {blurb}",
                 reply_markup=kb_users(auth.list_users()),
             )
         else:
@@ -1531,12 +1832,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # Floodguard: drop bursts (runaway script / compromised client). A human
+    # never trips 8 msgs / 10s; when tripped, say so at most once per window.
+    if not _rate_ok(uid):
+        if _rate_should_notify(uid):
+            await safe_send(context.bot, chat_id,
+                            "🐢 Slow down a moment — too many messages at once. "
+                            "I'll catch up; try again in a few seconds.")
+        return
+
     # Human-in-the-loop bridge: if the agent asked this chat for an OTP / phone /
     # password / confirmation, this message IS the answer — hand it back to the
     # waiting CLI turn instead of starting a new one.
     pending = _pending_bridge.get(chat_id)
     if pending:
-        ask_id, ann_ts = pending
+        ask_id, ann_ts = pending[0], pending[1]
+        # Older entries were 2-tuples; treat a missing flag as non-secret.
+        is_secret = pending[2] if len(pending) > 2 else False
         if time.time() - ann_ts > _BRIDGE_PENDING_TTL:
             # Orphaned/stale ask — release the chat and process this message
             # normally instead of swallowing it as an answer.
@@ -1547,7 +1859,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 interactive.write_answer(ask_id, text)
                 _pending_bridge.pop(chat_id, None)
-                await update.message.reply_text("✅ Got it — continuing.")
+                if is_secret:
+                    # An OTP / password must not linger in the chat. In a private
+                    # chat a bot may delete the user's own incoming message; if
+                    # that's ever refused, tell them to remove it themselves.
+                    try:
+                        await update.message.delete()
+                        await safe_send(
+                            context.bot, chat_id,
+                            "✅ Got it — continuing. I removed that message so the "
+                            "code isn't left in the chat.")
+                    except Exception:
+                        await update.message.reply_text(
+                            "✅ Got it — continuing.\n"
+                            "⚠️ Please delete your last message — it holds a "
+                            "sensitive value and I wasn't allowed to remove it.")
+                else:
+                    await update.message.reply_text("✅ Got it — continuing.")
             except Exception as e:
                 await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
             return
@@ -1574,6 +1902,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_message = update.message.text
+
+    # Approval mode: a limited user's request is held for the owner to approve —
+    # nothing runs until they tap Approve.
+    if auth.is_limited(uid):
+        await _submit_for_approval(update, context, uid, chat_id, user_message or "")
+        return
 
     # Natural-language schedule? Offer to create it instead of running it now.
     if auth.can(uid, "admin"):
@@ -1603,7 +1937,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await _run_cli_turn(
             update, uid, chat_id, user_message, cancel_event, auto_title=True)
     except Exception as e:
-        response = f"Error: {str(e)}"
+        response = _friendly_error(e)
         logger.error(f"Handler error: {e}", exc_info=True)
     finally:
         stop_typing.set()
@@ -2126,7 +2460,7 @@ async def _cb_users(query, context, data, uid, chat_id):
         users = auth.list_users()
         info = users.get(target_id, {})
         name = info.get("name") or f"User {target_id}"
-        role = info.get("role", "user")
+        role = info.get("role", "admin")
         added = info.get("added_at", "unknown")
         await query.edit_message_text(
             f"👤 {name}\n══════════════════\n"
@@ -2164,6 +2498,28 @@ async def _cb_users(query, context, data, uid, chat_id):
         else:
             await query.edit_message_text("User not found.")
 
+    elif data.startswith("user_role_"):
+        if not auth.is_owner(uid):
+            return
+        rest = data.removeprefix("user_role_")   # "admin_<id>" or "limited_<id>"
+        new_role, _, tid = rest.partition("_")
+        try:
+            target_id = int(tid)
+        except ValueError:
+            return
+        auth.set_role(target_id, new_role)
+        users = auth.list_users()
+        info = users.get(target_id, {})
+        name = info.get("name") or f"User {target_id}"
+        role = info.get("role", "admin")
+        await query.edit_message_text(
+            f"👤 {name}\n══════════════════\n"
+            f"ID: {target_id}\n"
+            f"Role: {role}\n"
+            f"Added: {info.get('added_at','unknown')}",
+            reply_markup=kb_user_detail(target_id, role),
+        )
+
     elif data == "user_add_start":
         if not auth.is_owner(uid):
             return
@@ -2198,6 +2554,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_schedules(query, context, data, uid, chat_id)
         elif data == "menu_users" or data.startswith("user_"):
             await _cb_users(query, context, data, uid, chat_id)
+        elif data.startswith("appr_"):
+            await _cb_approvals(query, context, data, uid, chat_id)
         else:
             await _cb_misc(query, context, data, uid, chat_id)
     except Exception as e:
@@ -2258,7 +2616,7 @@ async def bridge_watcher(application):
                         parse_mode="HTML",
                     )
                     _bridge_announced.add(ask.id)
-                    _pending_bridge[target] = (ask.id, time.time())
+                    _pending_bridge[target] = (ask.id, time.time(), ask.is_secret)
                     log_event("bridge_ask", kind=ask.kind, chat=target)
                 except Exception as e:
                     logger.error(f"[BRIDGE] could not DM ask {ask.id}: {e}")
@@ -2430,6 +2788,7 @@ def main():
     # SECURITY: keep secrets/state owner-only (the bot token lives in .env; state
     # files carry conversation ids + auto-titled message snippets).
     _harden_file_perms()
+    _prune_old_logs()
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)
