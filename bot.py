@@ -1144,10 +1144,15 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid user ID.")
         return
     name = " ".join(context.args[1:]) if len(context.args) > 1 else ""
-    if auth.add_user(new_id, name):
-        await update.message.reply_text(f"✅ User {new_id} ({name or 'unnamed'}) added as admin.")
-    else:
+    if new_id in auth.list_users():
         await update.message.reply_text(f"User {new_id} already exists.")
+        return
+    # Don't add on the spot — require an explicit YES after the danger warning
+    # (handled by _handle_adduser_flow's awaiting_confirm step).
+    context.user_data["adduser_flow"] = {
+        "step": "awaiting_confirm", "target_id": new_id, "name": name,
+    }
+    await update.message.reply_text(_adduser_warning(name or f"ID {new_id}"))
 
 
 async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1528,6 +1533,19 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  ADD-USER INLINE FLOW (owner only)
 # ══════════════════════════════════════════════════════════
 
+def _adduser_warning(who: str) -> str:
+    """The unmissable danger notice shown before anyone is granted access.
+    Adding a user = handing them this computer, so make that impossible to miss."""
+    return (
+        f"⚠️ Read this before adding {who}.\n\n"
+        "This makes them an ADMIN. Through the bot they can run ANY command on "
+        "THIS computer, read and change your files, and use apps you're already "
+        "logged into. There is no limited/guest mode.\n\n"
+        "Only do this for someone you'd hand your unlocked laptop to.\n\n"
+        "Type YES to add them, or /cancel to stop."
+    )
+
+
 async def _handle_adduser_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: dict):
     """Process multi-step add-user input from owner."""
     text = update.message.text.strip()
@@ -1553,8 +1571,22 @@ async def _handle_adduser_flow(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif step == "awaiting_name":
         name = "" if text.lower() == "/skip" else text
+        flow["name"] = name
+        flow["step"] = "awaiting_confirm"
+        context.user_data["adduser_flow"] = flow
+        who = name or f"ID {flow.get('target_id')}"
+        await update.message.reply_text(_adduser_warning(who))
+
+    elif step == "awaiting_confirm":
         target_id = flow.get("target_id")
+        name = flow.get("name", "")
         context.user_data.pop("adduser_flow", None)
+        if text.strip().upper() != "YES":
+            await update.message.reply_text(
+                "Add-user canceled — nobody was added.",
+                reply_markup=kb_users(auth.list_users()),
+            )
+            return
         # Everyone added is an admin (full access, owner-trusted).
         if target_id and auth.add_user(target_id, name, "admin"):
             await update.message.reply_text(
