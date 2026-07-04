@@ -4,7 +4,32 @@ All notable changes, newest first. Versions are git tags (e.g. `v2.2.0`).
 
 ---
 
-## 🎯 Installer picks the backend that's actually installed *(latest)*
+## 🔐 Security hardening + Approval mode *(latest)*
+
+A security-review pass (safe to hand to a non-technical person, self-hosted) plus
+a new safety tier so you don't have to fully trust everyone you add.
+
+**Approval mode (new).** You can now add someone as **limited** instead of admin:
+they can send requests, but *nothing runs until you tap Approve*. On approval the
+request runs and the result is delivered back to them; deny and they're told. Media
+from limited users is asked to come as text. Pick the tier when adding a user, or
+toggle it later from the user's panel. (Full admins are unchanged.)
+
+**Security fixes.**
+- **OTP/password replies are wiped** from the chat after they're used (with a
+  fallback asking you to delete it if Telegram won't let the bot).
+- **Adding a user now requires an explicit `YES`** after a plain-language warning
+  that admin = full control of this computer.
+- **Installer** writes `.env` already locked (`chmod 600`) and reads your bot token
+  **hidden** (no terminal echo).
+- **Log retention** (old daily logs pruned after 30 days) and a **burst floodguard**.
+- Docs: how to **rotate a leaked token** via @BotFather.
+
+All 192 tests pass.
+
+---
+
+## 🎯 Installer picks the backend that's actually installed
 
 Built for shared/office machines where only ONE backend is present and you have
 no admin rights. Setup now follows reality instead of asking blindly:
