@@ -199,7 +199,7 @@ def kb_users(users: dict):
     buttons = []
     for uid_int, info in users.items():
         name = info.get("name") or f"User {uid_int}"
-        role = info.get("role", "user")
+        role = info.get("role", "admin")
         buttons.append([InlineKeyboardButton(
             f"[{role}] {name}", callback_data=f"user_detail_{uid_int}",
         )])
@@ -212,8 +212,16 @@ def kb_users(users: dict):
 
 
 def kb_user_detail(target_id: int, role: str = "admin"):
-    # Everyone added is an admin — no role toggle anymore.
+    # Role toggle: admins have full unattended access; "limited" users can chat
+    # but every request waits for the owner's approval (Approval mode).
+    if role == "limited":
+        toggle = InlineKeyboardButton(
+            "🔓 Give full access", callback_data=f"user_role_admin_{target_id}")
+    else:
+        toggle = InlineKeyboardButton(
+            "🔒 Put in Approval mode", callback_data=f"user_role_limited_{target_id}")
     return InlineKeyboardMarkup([
+        [toggle],
         [InlineKeyboardButton("🗑️ Remove", callback_data=f"user_remove_{target_id}"),
          InlineKeyboardButton("◀ Back", callback_data="user_list")],
     ])
