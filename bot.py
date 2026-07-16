@@ -404,10 +404,18 @@ async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
 
 
 async def safe_send(bot, chat_id: int, text: str, parse_mode: str = None):
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+    # Flaky links (hotspot, sleep-wake) time out on a single attempt; the CLI's
+    # answer must not be lost to one bad send, so retry with backoff.
+    for attempt in range(4):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            return
+        except Exception as e:
+            if attempt == 3:
+                logger.error(f"Failed to send message after 4 attempts: {e}")
+            else:
+                logger.warning(f"send_message attempt {attempt + 1} failed ({e}); retrying")
+                await asyncio.sleep(2 * (attempt + 1))
 
 
 async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None,
@@ -2715,6 +2723,12 @@ def main():
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .concurrent_updates(True)
+        # PTB defaults are 5s — too tight on slow links (hotspot); a timed-out
+        # send here is how replies silently vanish.
+        .connect_timeout(15)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(10)
         .build()
     )
 

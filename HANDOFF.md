@@ -534,10 +534,16 @@ everything comes back by itself.
 
 **Current phase:** Phase 0 ✅ done → Phase 1 in progress (turn pipeline + scheduler runtime, PARTS A+B, extracted to `zilla/core.py`/`zilla/schedules.py`; bridge/approvals/health seams + live Telegram round-trip remain)
 **Working branch:** `claude/zilla-harness-review-0v96bs`
-**Last session:** 2026-07-16 (PART B re-implementation, MacBook) — scheduler
-seam PART B (retry ladder + payload_type/session/backend-pin schema) is now
-IN THE TREE and green: `test_schedules_seam.py` 57/57. 298 tests green total
-(196 + 16 + 29 + 57).
+**Last session:** 2026-07-16 late night (MacBook) — LIVE SMOKE STARTED with
+owner's new token (`.env` now exists on this Mac, git-ignored; bot =
+@Mangomangos_bot, owner id 8740189938). First live turn exposed a delivery
+bug: CLI answered fine but the final `send_message` timed out once (owner on
+hotspot) and `safe_send` swallowed it — reply silently vanished. FIXED:
+`safe_send` now retries 4× with backoff; PTB network timeouts raised from 5s
+defaults (connect 15 / read 30 / write 30 / pool 10). Verified live: real-CLI
+pipeline PONG via `core.handle_message` + real DM delivered to owner. 298
+tests green. Remaining smoke: text re-try, voice/photo/doc, cancel, schedule
+fire — owner mid-test.
 
 ### Checklist
 
