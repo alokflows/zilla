@@ -553,7 +553,14 @@ create a reminder/timer/alarm; in/after/for N min; bare timer → "Time's up!"),
 +5 tests (196→201). Latency reality check from live logs: every turn = full
 Gemini CLI call, 17s–2m34s — the P1.5 orchestration router is THE fix, this
 is now the owner's top complaint. Bot running on this Mac, PID via
-`pgrep -f "Python bot.py"`, log in the session scratchpad.
+`pgrep -f "Python bot.py"`, log in the session scratchpad. LATER SAME NIGHT
+(owner decrees, all shipped+pushed): (a) one-off reminders create INSTANTLY,
+no confirm buttons — only recurring schedules ask; (b) remind/timer/alarm-cued
+requests are `payload_type=system_event` (verbatim delivery, zero model call
+at fire time — the "Siri" behavior) while "schedule <task>" stays a `message`
+agent run, via new `payload_hint` from `parse_schedule`; (c) scheduler loop
+sleeps until the soonest `next_run` (capped at the 20s tick) so timers fire
+on time, via new `ScheduleManager.next_due_at()`. 204+16+29+57 = 306 green.
 
 ### Checklist
 
