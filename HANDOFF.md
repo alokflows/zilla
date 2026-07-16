@@ -488,16 +488,16 @@ everything comes back by itself.
 > **Update this section and commit after EVERY completed step.** This is
 > what lets a fresh session (or a different account) resume instantly.
 
-**Current phase:** Phase 0 ✅ done → Phase 1 (core API design, needs owner approval)
+**Current phase:** Phase 0 ✅ done → Phase 1 in progress (modules moved; turn-pipeline extraction next)
 **Working branch:** `claude/zilla-harness-review-0v96bs`
-**Last session:** 2026-07-16 (MacBook) — Phase 0 verified; findings in
-`docs/dev/PHASE0_FINDINGS.md`; 208 tests green.
+**Last session:** 2026-07-16 (MacBook) — moved core modules into `zilla/`
+package with legacy shims; 208 tests green.
 
 ### Checklist
 
 - [x] **P0** Verify reality (flags, GEMINI.md/AGENTS.md, sandbox test, logins, tests on macOS) → `docs/dev/PHASE0_FINDINGS.md`
 - [ ] **P1** Core extraction: design core API (owner-approved)
-- [ ] **P1** Move modules into `zilla/` package (tests green)
+- [x] **P1** Move modules into `zilla/` package (tests green)
 - [ ] **P1** Extract turn pipeline / scheduler / bridge / health from `bot.py`
 - [ ] **P2** `zilla` entrypoint + `config`/`doctor`/`start`/`stop`/`status`/`logs`
 - [ ] **P2** Full-screen TUI (chat + settings + skills + health)
@@ -520,6 +520,7 @@ everything comes back by itself.
 |---|---|---|
 | 2026-07-16 | Full codebase analysis; handoff written and pushed. | agy/opencode were NOT installed in that environment — nothing in "traps" is verified yet. Do Phase 0 first. Older repo docs conflict with this vision; this file wins. |
 | 2026-07-16 (later, MacBook) | Phase 0 complete: all 3 CLIs probed live, 208 tests green, `docs/dev/PHASE0_FINDINGS.md` committed. Trap #1 refuted (agy `--model` validates, hard error). Trap #2 split: claude blocks headless writes without permission; agy+opencode execute unattended. agy does NOT read GEMINI.md/AGENTS.md; opencode DOES read AGENTS.md. opencode runs free with 0 credentials. claude = Pro subscription. | Nothing blocks Phase 1. Next: orchestrator designs the core API on paper and gets owner approval BEFORE coding (P1 step 1). Local checkout is `~/Documents/repos/zilla`. |
+| 2026-07-16 (P1 step 2, MacBook) | Pure move (no logic edits): `platform_compat, config, users, sessions, schedules, schedule_parse, verify, autoharness, interactive, harness, cli_engine, backends, media, formatter` → `zilla/` via `git mv` (history preserved). Cross-module imports inside `zilla/` rewritten to `from zilla.<mod> import ...`. Root-level shim files (`import zilla.<mod> as _mod; sys.modules[__name__] = _mod`) alias the old names so `bot.py`, `keyboards.py`, `install.py`, and both test suites are unchanged. `config.BASE_DIR` and `harness._HERE` (both `__file__`-derived) bumped one directory level up — they now point one level deeper than before the move, fixed with a one-line comment each. 192+16 tests green; `zilla.cli_engine/backends/harness/media` import clean; `import bot`/`import keyboards` fail ONLY on missing `telegram` package (not installed in this env — expected, not an import-path bug); `import install` clean. | `bot.py` and `keyboards.py` still import the OLD top-level names (`from config import ...` etc.) via the shims — that's intentional for this step. Next P1 step extracts the turn pipeline out of `bot.py` into `core.handle_message`; once bot.py is rewritten to use `zilla.*` directly (or the shim strategy is revisited) the root-level shim files can be deleted. `telegram` package is not installed in system `python3` on this machine — install it (or use whatever venv the bot normally runs in) before attempting a live Telegram smoke test. |
 
 ### Notes / open concerns
 
