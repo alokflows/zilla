@@ -1020,7 +1020,19 @@ def _kb_confirm_schedule():
 
 
 async def _offer_schedule(update, context, parsed: dict):
-    """Stash a parsed schedule and ask the user to confirm creating it."""
+    """One-off reminders are created instantly, Siri-style (owner decree
+    2026-07-17: asking permission for a 2-minute timer is worse than useless).
+    Only RECURRING schedules — which keep firing until removed — get a
+    confirm step."""
+    if parsed["kind"] == "once":
+        uid = update.effective_user.id
+        chat_id = update.effective_chat.id
+        _make_schedule(uid, chat_id, parsed)
+        await update.effective_message.reply_text(
+            f"⏰ {describe_schedule(parsed['kind'], parsed['spec'])} — "
+            f"{parsed['title']} ✓"
+        )
+        return
     context.user_data["pending_schedule"] = parsed
     await update.effective_message.reply_text(
         "📅 Create this schedule?\n"
