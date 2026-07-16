@@ -598,6 +598,15 @@ def test_parse_schedule_forms():
     check("parse: alarm cue", p and p["kind"] == "once" and "leave for class" in p["title"], str(p))
     check("parse: bare 'for 2 minutes' without cue is NOT a schedule",
           parse_schedule("for 2 minutes nothing happened", fixed) is None)
+    # Reminder-style requests deliver their text verbatim at fire time
+    # (payload_hint system_event, zero model call); "schedule <task>" still
+    # means "run this task through the agent".
+    p = parse_schedule("put a reminder for 2 minutes to drink water", fixed)
+    check("parse: reminder hints system_event", p and p.get("payload_hint") == "system_event", str(p))
+    p = parse_schedule("remind me in 2 minutes to drink water", fixed)
+    check("parse: remind-me hints system_event", p and p.get("payload_hint") == "system_event", str(p))
+    p = parse_schedule("schedule in 30 minutes summarise my inbox", fixed)
+    check("parse: schedule-task hints message", p and p.get("payload_hint") == "message", str(p))
     # Spelled-out numbers must parse like digits (the "every three minutes"
     # failure: without this the whole message fell through to the agent and a
     # trivial request spun for many minutes instead of becoming a schedule).

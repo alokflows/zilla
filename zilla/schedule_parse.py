@@ -136,7 +136,25 @@ def parse_schedule_command(argstr: str, now: datetime | None = None) -> dict | N
     return parse_schedule(s, now)
 
 
+# A message that *starts* as a reminder/timer/alarm request wants its text
+# DELIVERED at fire time, not executed by the agent — payload_type
+# "system_event" (zero model call, fires instantly). "schedule <task>" keeps
+# meaning "run this task": payload_type "message".
+_REMIND_CUE_RE = re.compile(
+    r"^\s*(please\s+)?(can\s+you\s+)?"
+    r"(remind\b|(?:put|keep|set|add|create)\s+(?:a\s+|an\s+)?(?:reminder|timer|alarm))",
+    re.IGNORECASE)
+
+
 def parse_schedule(text: str, now: datetime | None = None) -> dict | None:
+    parsed = _parse_schedule_impl(text, now)
+    if parsed:
+        parsed["payload_hint"] = (
+            "system_event" if _REMIND_CUE_RE.match(text or "") else "message")
+    return parsed
+
+
+def _parse_schedule_impl(text: str, now: datetime | None = None) -> dict | None:
     if not text or not text.strip():
         return None
     now = now or datetime.now()

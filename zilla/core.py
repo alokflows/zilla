@@ -592,4 +592,14 @@ class ZillaCore:
                 raise
             except Exception as e:
                 logger.error(f"[SCHED] loop error: {e}", exc_info=True)
-            await asyncio.sleep(self._SCHED_TICK)
+            # Sleep only until the next pending job (capped at the tick, so a
+            # job added mid-sleep waits at most one tick) — a 2-minute timer
+            # fires at 2:00, not 2:00 + tick drift.
+            delay = self._SCHED_TICK
+            try:
+                soonest = self.schedules.next_due_at()
+                if soonest is not None:
+                    delay = max(0.5, min(self._SCHED_TICK, soonest - _time.time()))
+            except Exception:
+                pass
+            await asyncio.sleep(delay)

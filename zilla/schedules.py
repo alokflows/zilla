@@ -320,6 +320,12 @@ class ScheduleManager:
         return [s for s in self.schedules.values()
                 if s.get("enabled") and s.get("next_run") and s["next_run"] <= now]
 
+    def next_due_at(self) -> float | None:
+        """Earliest next_run among enabled schedules (None if none pending)."""
+        pending = [s["next_run"] for s in self.schedules.values()
+                   if s.get("enabled") and s.get("next_run")]
+        return min(pending) if pending else None
+
     def reconcile_startup(self, now: float | None = None, catchup: bool = True):
         """
         At boot, decide what to do with schedules whose time passed while the

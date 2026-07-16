@@ -1074,9 +1074,16 @@ def _make_schedule(uid: int, chat_id: int, parsed: dict):
     # drifted by fire time. session defaults to "isolated": every schedule
     # made through this path always has, and keeps having, a fresh
     # conversation each run.
+    payload_type = parsed.get("payload_hint", "message")
+    prompt = parsed["prompt"]
+    if payload_type == "system_event":
+        # Delivered verbatim at fire time (no model call) — phrase it as the
+        # reminder the user will read, not as an instruction.
+        prompt = f"Reminder: {parsed['title']}"
     return schedules_mgr.add(
-        user_id=uid, chat_id=chat_id, prompt=parsed["prompt"],
+        user_id=uid, chat_id=chat_id, prompt=prompt,
         kind=parsed["kind"], spec=parsed["spec"], title=parsed["title"],
+        payload_type=payload_type,
         backend=get_backend(), model=get_model(),
         is_owner=auth.is_owner(uid) if auth else False,
     )
