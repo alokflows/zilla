@@ -26,6 +26,63 @@ logger = logging.getLogger(__name__)
 
 VALID_KINDS = ("once", "interval", "daily", "weekly")
 
+# payload_type: what firing a schedule actually does.
+#   message      — full CLI turn (default; every pre-Part-B schedule is this).
+#   system_event — deliver the stored prompt text verbatim, ZERO model call.
+#   command      — run the prompt as a subprocess, ZERO model call. Owner-only
+#                  at creation (enforced in ScheduleManager.add(), not a
+#                  comment — a command schedule is unattended shell execution).
+VALID_PAYLOAD_TYPES = ("message", "system_event", "command")
+
+# Self-healing retry backoff: 30s, 1m, 5m, 15m, 60m. mark_failure() walks
+# this ladder before giving up on the current occurrence — giving up NEVER
+# permanently disables a schedule, it resets and advances to the next normal
+# occurrence (a daily job that fails today still runs tomorrow).
+RETRY_LADDER = (30, 60, 300, 900, 3600)
+
+
+def resolve_session_mode(sched: dict) -> str:
+    """The conversation-continuity mode a schedule runs with.
+
+    'isolated'   — fresh conversation every run (today's real, discovered
+                   default: no existing schedule has ever set session_name).
+    'main'       — the user's currently-active named session.
+    'named:<x>'  — a specific named session, always the same one.
+
+    An explicit 'session' field always wins. Falls back to the legacy
+    'session_name' field (pre-Part-B schedules) mapped to 'named:<x>'.
+    Missing both -> 'isolated'.
+    """
+    session = sched.get("session")
+    if session:
+        return session
+    sname = sched.get("session_name")
+    if sname:
+        return f"named:{sname}"
+    return "isolated"
+
+
+def backend_pin_mismatch(sched: dict, current_backend: str, current_model) -> bool:
+    """True if a schedule's pinned backend/model has drifted from what's
+    active right now AND the owner hasn't already been told once.
+
+    No pinned backend (pre-Part-B schedules, or never set) -> never
+    mismatches. A pinned model of None means "any model on that backend" —
+    only the backend is compared. Once `backend_pin_notified` is set, this
+    always returns False (one-time note, never repeats).
+    """
+    if sched.get("backend_pin_notified"):
+        return False
+    pinned_backend = sched.get("backend")
+    if not pinned_backend:
+        return False
+    if pinned_backend != current_backend:
+        return True
+    pinned_model = sched.get("model")
+    if pinned_model is None:
+        return False
+    return pinned_model != current_model
+
 
 def _slot_today(now_dt: datetime, hh: int, mm: int) -> datetime:
     return now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -127,8 +184,16 @@ class ScheduleManager:
 
     def add(self, user_id: int, chat_id: int, prompt: str, kind: str, spec: dict,
             title: str = "", session_name: str | None = None,
-            now: float | None = None) -> dict | None:
+            session: str | None = None, payload_type: str = "message",
+            backend: str | None = None, model: str | None = None,
+            is_owner: bool = False, now: float | None = None) -> dict | None:
         if kind not in VALID_KINDS:
+            return None
+        if payload_type not in VALID_PAYLOAD_TYPES:
+            return None
+        if payload_type == "command" and not is_owner:
+            # Unattended shell execution: creation is owner-only, enforced
+            # here (not left to a UI-level comment).
             return None
         now = now if now is not None else time.time()
         next_run = compute_next_run(kind, spec, now)
@@ -140,7 +205,14 @@ class ScheduleManager:
             "prompt": prompt, "title": (title or prompt)[:60],
             "kind": kind, "spec": spec, "enabled": True,
             "created": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
-            "last_run": None, "next_run": next_run, "session_name": session_name,
+            "last_run": None, "next_run": next_run,
+            # Legacy field, kept for back-compat reads of pre-Part-B schedules
+            # (see resolve_session_mode). New code should use "session".
+            "session_name": session_name,
+            "session": session if session is not None else "isolated",
+            "payload_type": payload_type,
+            "backend": backend, "model": model,
+            "backend_pin_notified": False,
         }
         self.schedules[sid] = sched
         self._save()
@@ -198,14 +270,15 @@ class ScheduleManager:
             s["fail_count"] = 0
         self.touch_run(sid, now)
 
-    def mark_failure(self, sid: str, retry_delay: float, max_retries: int,
-                     now: float | None = None) -> tuple[str, int]:
-        """A run failed. Returns (outcome, attempt):
-          • ('retry', n)  — schedule a soon retry (next_run = now + retry_delay)
-                            while attempts ≤ max_retries.
-          • ('gaveup', n) — exhausted retries for THIS occurrence; reset the
+    def mark_failure(self, sid: str, now: float | None = None) -> tuple[str, int]:
+        """A run failed. Walks RETRY_LADDER. Returns (outcome, attempt):
+          • ('retry', n)  — schedule a retry at now + RETRY_LADDER[n-1] while
+                            attempts ≤ len(RETRY_LADDER).
+          • ('gaveup', n) — exhausted the ladder for THIS occurrence; reset the
                             counter and advance to the next normal occurrence
-                            (so a daily job that fails today still runs tomorrow).
+                            (so a daily job that fails today still runs tomorrow —
+                            giving up NEVER permanently disables a schedule,
+                            except a one-off with no future occurrence).
           • ('gone', 0)   — schedule no longer exists.
         The schedule is NEVER silently dropped: it always has a future next_run
         (unless it's a finished one-off), so a missed/failed job recovers.
@@ -217,11 +290,11 @@ class ScheduleManager:
         attempt = int(s.get("fail_count", 0)) + 1
         s["fail_count"] = attempt
         s["last_run"] = now
-        if attempt <= max_retries:
-            s["next_run"] = now + retry_delay
+        if attempt <= len(RETRY_LADDER):
+            s["next_run"] = now + RETRY_LADDER[attempt - 1]
             self._save()
             return ("retry", attempt)
-        # Exhausted: reset and move to the next normal occurrence.
+        # Ladder exhausted: reset and move to the next normal occurrence.
         s["fail_count"] = 0
         nxt = compute_next_run(s["kind"], s["spec"], now)
         if nxt is None:                 # finished one-off that kept failing
@@ -231,6 +304,14 @@ class ScheduleManager:
             s["next_run"] = nxt
         self._save()
         return ("gaveup", attempt)
+
+    def mark_backend_pin_notified(self, sid: str):
+        """Record that the owner was told once about a backend/model pin
+        drift (see backend_pin_mismatch) — suppresses further Alerts."""
+        s = self.schedules.get(sid)
+        if s is not None:
+            s["backend_pin_notified"] = True
+            self._save()
 
     # ── Runtime selection ─────────────────────────────────
 
