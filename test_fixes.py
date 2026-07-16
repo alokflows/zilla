@@ -437,7 +437,7 @@ def test_detect_file_paths_posix():
 
 from datetime import datetime, timedelta  # noqa: E402
 import schedules as sched_mod  # noqa: E402
-from schedules import ScheduleManager, compute_next_run  # noqa: E402
+from schedules import ScheduleManager, compute_next_run, RETRY_LADDER  # noqa: E402
 from schedule_parse import parse_schedule, parse_schedule_command  # noqa: E402
 from cli_engine import detect_limit  # noqa: E402
 
@@ -527,27 +527,32 @@ def test_schedule_failure_retry():
     now = _epoch(2026, 6, 2, 8, 0)
     s = sm.add(1, 1, "x", "daily", {"hh": 9, "mm": 0}, now=now)
     sid = s["id"]
-    # First 3 failures → retry soon (next_run = now + retry_delay).
-    for i in (1, 2, 3):
-        outcome, attempt = sm.mark_failure(sid, retry_delay=120, max_retries=3, now=now)
+    # Walk the full retry ladder (30s/60s/5m/15m/60m) → retry soon each time,
+    # next_run = now + that rung's delay.
+    for i, delay in enumerate(RETRY_LADDER, start=1):
+        outcome, attempt = sm.mark_failure(sid, now=now)
         check(f"sched: failure {i} → retry", outcome == "retry" and attempt == i, f"{outcome},{attempt}")
-        check(f"sched: retry {i} sets soon next_run",
-              abs(sm.get(sid)["next_run"] - (now + 120)) < 5)
-    # 4th failure exhausts retries → give up THIS occurrence, advance, reset.
-    outcome, attempt = sm.mark_failure(sid, 120, 3, now=now)
-    check("sched: exhausted → gaveup", outcome == "gaveup" and attempt == 4, f"{outcome},{attempt}")
+        check(f"sched: retry {i} sets next_run to ladder delay {delay}s",
+              abs(sm.get(sid)["next_run"] - (now + delay)) < 5)
+    # One more failure exhausts the ladder → give up THIS occurrence, advance, reset.
+    outcome, attempt = sm.mark_failure(sid, now=now)
+    check("sched: exhausted ladder → gaveup",
+          outcome == "gaveup" and attempt == len(RETRY_LADDER) + 1, f"{outcome},{attempt}")
     check("sched: gaveup resets fail_count", sm.get(sid).get("fail_count") == 0)
     check("sched: gaveup advances to a future run", sm.get(sid)["next_run"] > now)
     # Success resets the counter and advances normally.
     s2 = sm.add(2, 2, "y", "interval", {"seconds": 3600}, now=now)
-    sm.mark_failure(s2["id"], 120, 3, now=now)
+    sm.mark_failure(s2["id"], now=now)
     sm.mark_success(s2["id"], now=now)
     check("sched: success resets fail_count", sm.get(s2["id"]).get("fail_count") == 0)
     check("sched: success advances ~interval",
           abs(sm.get(s2["id"])["next_run"] - (now + 3600)) < 5)
-    # A one-off that keeps failing gives up AND disables (no future occurrence).
+    # A one-off that keeps failing gives up AND disables (no future occurrence)
+    # once the full ladder is exhausted.
     s3 = sm.add(3, 3, "z", "once", {"run_at": now + 60}, now=now)
-    o, _ = sm.mark_failure(s3["id"], 120, 0, now=now + 61)
+    for _ in range(len(RETRY_LADDER)):
+        sm.mark_failure(s3["id"], now=now + 61)  # walk the ladder, not yet exhausted
+    o, _ = sm.mark_failure(s3["id"], now=now + 61)
     check("sched: failed one-off gives up + disables",
           o == "gaveup" and sm.get(s3["id"])["enabled"] is False)
 

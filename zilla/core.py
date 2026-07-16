@@ -38,6 +38,7 @@ from zilla.cli_engine import run_cli_async, get_latest_step, detect_limit
 from zilla.config import get_backend, get_model, get_setting
 from zilla.formatter import detect_file_paths
 from zilla.harness import log_event
+from zilla.schedules import resolve_session_mode, backend_pin_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,8 @@ class ScheduledResult:
     as one event instead of two so delivery order can't race. response is ""
     when the failed run produced no usable output at all (warning-only
     delivery); otherwise it carries whatever partial output there was.
+    session/conv_id: carried for a future "continue this conversation" UX —
+    no reply-routing is built on top of them yet.
     """
     title: str
     response: str
@@ -114,6 +117,8 @@ class ScheduledResult:
     user_id: int = None
     schedule_id: str = None
     warning: str = ""
+    session: str = None
+    conv_id: str = None
 
 
 # ══════════════════════════════════════════════════════════
@@ -377,30 +382,25 @@ class ZillaCore:
     #                         advances the schedule.
 
     _SCHED_TICK = 20          # seconds between due-checks
-    _SCHED_RETRY_DELAY = 120  # wait this long before retrying a failed run
-    _SCHED_MAX_RETRIES = 3    # attempts per occurrence before giving up (and notifying)
 
     # Response shapes that mean "the run did not really succeed".
     _SCHED_FAIL_PREFIXES = ("Error:", "Claude error:", "⏱️", "⚠️ Stopped")
 
-    async def _execute_schedule(self, s: dict) -> tuple:
-        """Run one schedule's prompt. Returns (ok, response, detail). No
-        delivery, no schedule mutation (touch_run/mark_*) — pure execution +
-        outcome classification."""
-        uid = s["user_id"]
+    def _sname_for_mode(self, uid: int, mode: str) -> str | None:
+        """Map a resolved session mode (see zilla.schedules.resolve_session_mode)
+        to the session name to run under. 'isolated' -> None (fresh
+        conversation every run — today's discovered default behavior)."""
+        if mode.startswith("named:"):
+            return mode.split("named:", 1)[1]
+        if mode == "main":
+            return "main"
+        return None  # "isolated" (or any unrecognized mode, safest default)
 
-        # SECURITY: a schedule is a stored prompt that runs the agentic CLI
-        # with full host privileges. If the owning user was de-authorized
-        # after creating it, the schedule must NOT keep firing (otherwise
-        # removal isn't really revocation — it's a persistent backdoor).
-        # Disable + skip any schedule whose owner is no longer authorized.
-        if not (self.auth and (self.auth.is_owner(uid) or self.auth.is_authorized(uid))):
-            logger.warning(f"[SCHED] skip {s['id']}: user {uid} no longer authorized — disabling")
-            try:
-                self.schedules.set_enabled(s["id"], uid, False)
-            except Exception:
-                pass
-            return False, "", "owner deauthorized"
+    async def _execute_message_schedule(self, s: dict) -> tuple:
+        """payload_type == 'message': a full CLI turn, same as a live chat
+        turn — pinned session, per-user lock, response-level failure
+        classification. Returns (ok, response, detail, meta)."""
+        uid = s["user_id"]
 
         # A frontend-supplied fast path gets first refusal (e.g. Telegram's
         # screenshot-via-WebBridge shortcut, which must bypass the CLI agent
@@ -408,14 +408,16 @@ class ZillaCore:
         if self.schedule_pre_run is not None:
             hook_result = await self.schedule_pre_run(s)
             if hook_result is not None:
-                return hook_result
+                ok, response, detail = hook_result
+                return ok, response, detail, {"conv_id": None}
 
-        ok, detail, response = True, "", ""
+        pin_mismatch = backend_pin_mismatch(s, get_backend(), get_model())
+        mode = resolve_session_mode(s)
+        ok, detail, response, conv_id = True, "", "", None
         self._scheduled_running.add(uid)
         try:
             async with self.get_user_lock(uid):
-                conv_id = None
-                sname = s.get("session_name")
+                sname = self._sname_for_mode(uid, mode)
                 if sname:
                     conv_id = self._conv_for_run(uid, sname)
                 response, detected = await run_cli_async(
@@ -425,6 +427,7 @@ class ZillaCore:
                 if sname and detected and detected != conv_id:
                     self.sessions.set_conversation_id(
                         detected, user_id=uid, session_name=sname, backend=get_backend())
+                conv_id = detected or conv_id
         except Exception as e:
             ok, detail, response = False, str(e), f"Error: {e}"
             logger.error(f"[SCHED] run {s['id']} failed: {e}", exc_info=True)
@@ -439,27 +442,100 @@ class ZillaCore:
                 ok, detail = False, f"model limited: {detect_limit(response)}"
             elif response.lstrip().startswith(self._SCHED_FAIL_PREFIXES):
                 ok, detail = False, response.strip()[:200]
-        return ok, response, detail
+        return ok, response, detail, {
+            "conv_id": conv_id, "session": mode, "pin_mismatch": pin_mismatch,
+        }
+
+    async def _execute_command_schedule(self, s: dict) -> tuple:
+        """payload_type == 'command': run the stored prompt as a subprocess.
+        ZERO model call — owner-only at creation (ScheduleManager.add()).
+        Returns (ok, response, detail, meta)."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                s["prompt"],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await proc.communicate()
+            text = (out or b"").decode("utf-8", errors="replace")
+            if proc.returncode == 0:
+                return True, text, "", {"conv_id": None}
+            return False, text, f"exit {proc.returncode}", {"conv_id": None}
+        except Exception as e:
+            logger.error(f"[SCHED] command {s['id']} failed: {e}", exc_info=True)
+            return False, "", str(e), {"conv_id": None}
+
+    async def _execute_schedule(self, s: dict) -> tuple:
+        """Run one schedule's prompt according to its payload_type. Returns
+        (ok, response, detail, meta). No delivery, no schedule mutation
+        (touch_run/mark_*) — pure execution + outcome classification.
+
+        meta is at least {"conv_id": ...}; message-payload runs also carry
+        "session" (the resolved mode) and "pin_mismatch" (bool)."""
+        uid = s["user_id"]
+
+        # SECURITY: a schedule is a stored prompt that can run with full
+        # host privileges (message → agentic CLI, command → raw shell). If
+        # the owning user was de-authorized after creating it, the schedule
+        # must NOT keep firing (otherwise removal isn't really revocation —
+        # it's a persistent backdoor). Disable + skip.
+        if not (self.auth and (self.auth.is_owner(uid) or self.auth.is_authorized(uid))):
+            logger.warning(f"[SCHED] skip {s['id']}: user {uid} no longer authorized — disabling")
+            try:
+                self.schedules.set_enabled(s["id"], uid, False)
+            except Exception:
+                pass
+            return False, "", "owner deauthorized", {"conv_id": None}
+
+        payload_type = s.get("payload_type", "message")
+
+        if payload_type == "system_event":
+            # Deliver the stored text verbatim. ZERO CLI/model call.
+            return True, s.get("prompt", ""), "", {"conv_id": None}
+
+        if payload_type == "command":
+            return await self._execute_command_schedule(s)
+
+        return await self._execute_message_schedule(s)
+
+    def _maybe_notify_backend_pin(self, s: dict) -> None:
+        """One-time owner Alert when a schedule's pinned backend/model has
+        drifted from what's active at fire time. Runs on the CURRENT
+        backend regardless — no per-call backend override exists in
+        cli_engine, so this is an FYI, never a block. Tracked via
+        backend_pin_notified so it fires at most once per schedule."""
+        current_backend, current_model = get_backend(), get_model()
+        text = (
+            f"Scheduled job \"{s.get('title', '')}\" was pinned to "
+            f"{s.get('backend')}/{s.get('model')} but ran on "
+            f"{current_backend}/{current_model} (backend/model changed since "
+            f"creation). It will keep using whatever backend is active."
+        )
+        self._broadcast(Alert(text=text))
+        try:
+            self.schedules.mark_backend_pin_notified(s["id"])
+        except Exception:
+            pass
 
     async def _run_and_record(self, s: dict) -> None:
         """Tick-loop path: run a due schedule, broadcast the result, and
-        record the outcome with retry. A failed run is retried
-        (_SCHED_MAX_RETRIES × _SCHED_RETRY_DELAY) before the schedule
-        advances — and the owner's chat is told if it ultimately couldn't
-        complete."""
+        record the outcome with retry. A failed run is retried along
+        RETRY_LADDER before the schedule advances — and the owner's chat is
+        told if it ultimately couldn't complete."""
         sid = s["id"]
         title = s.get("title", "")
-        ok, response, detail = await self._execute_schedule(s)
+        ok, response, detail, meta = await self._execute_schedule(s)
+        if meta.get("pin_mismatch"):
+            self._maybe_notify_backend_pin(s)
         if ok:
             self.schedules.mark_success(sid)
             log_event("schedule_ok", id=sid, title=title[:40])
             self._broadcast(ScheduledResult(
                 title=title, response=response, chat_id=s["chat_id"], user_id=s["user_id"],
-                schedule_id=sid,
+                schedule_id=sid, session=meta.get("session"), conv_id=meta.get("conv_id"),
             ))
             return
-        outcome, attempt = self.schedules.mark_failure(
-            sid, self._SCHED_RETRY_DELAY, self._SCHED_MAX_RETRIES)
+        outcome, attempt = self.schedules.mark_failure(sid)
         log_event("schedule_failed", id=sid, title=title[:40],
                   attempt=attempt, outcome=outcome, detail=(detail or "")[:200])
         if outcome == "gaveup":
@@ -467,12 +543,13 @@ class ZillaCore:
             # over any partial output.
             warning = (
                 f"⚠️ Scheduled job couldn't complete: <b>{title}</b>\n"
-                f"Tried {attempt}× over a few minutes. I'll run it again at its next "
-                f"scheduled time.\nLast issue: {(detail or 'unknown')[:200]}"
+                f"Tried {attempt}× over the retry window. I'll run it again at "
+                f"its next scheduled time.\nLast issue: {(detail or 'unknown')[:200]}"
             )
             self._broadcast(ScheduledResult(
                 title=title, response=(response if response and response.strip() else ""),
                 chat_id=s["chat_id"], user_id=s["user_id"], schedule_id=sid, warning=warning,
+                session=meta.get("session"), conv_id=meta.get("conv_id"),
             ))
         # 'retry' / 'gone' → stay quiet; it will run again on its own.
 
@@ -482,11 +559,13 @@ class ZillaCore:
         s = self.schedules.get(sid) if self.schedules else None
         if not s:
             return
-        ok, response, detail = await self._execute_schedule(s)
+        ok, response, detail, meta = await self._execute_schedule(s)
+        if meta.get("pin_mismatch"):
+            self._maybe_notify_backend_pin(s)
         text = response if (response and response.strip()) else (detail or "(no output)")
         self._broadcast(ScheduledResult(
             title=s.get("title", ""), response=text, chat_id=s["chat_id"], user_id=s["user_id"],
-            schedule_id=sid,
+            schedule_id=sid, session=meta.get("session"), conv_id=meta.get("conv_id"),
         ))
 
     async def _scheduler_loop(self) -> None:
