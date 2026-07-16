@@ -117,6 +117,13 @@ Settings the app must expose (single source of truth = the same
 | Telegram connector | off / token + owner ID |
 | Autostart | on/off |
 
+**Explicit non-goals (owner decision 2026-07-16, each backed by a real
+OpenClaw incident — see `docs/dev/RESEARCH_OPENCLAW_HERMES.md` §5):** no web
+UI (their 1-click-RCE CVE), no listening network gateway (40k exposed
+instances), no skills marketplace / auto-install (341 malware skills). If any
+of these is ever proposed, that section is the counterargument. Any socket
+Zilla ever does open: auth required + loopback bind from day one.
+
 **Environment adaptation:** at startup Zilla detects OS (macOS / Linux /
 Windows / headless server), GUI presence, which CLIs are installed and
 logged in, ffmpeg, WebBridge reachability — and adapts. GUI present →
@@ -269,6 +276,15 @@ Steps:
 3. Extract from `bot.py` into the core, one seam at a time: turn pipeline
    (locks, approval hold, run, verify, deliver), scheduler runtime, bridge
    watcher, health. `bot.py` shrinks to Telegram I/O + menus.
+   **Scheduler seam additions** (cheap now, painful later — RESEARCH §7
+   items 2–6): add schema fields `payload_type` (system-event = deliver
+   canned text with ZERO model call / message / command), per-job `session`
+   mode (isolated default / main / named), pinned `backend`+`model` at
+   creation (fallback + one-time owner note if gone at fire time); retry
+   backoff ladder 30s→60s→5m→15m→60m reset-on-success (keep Zilla's
+   still-fires-next-occurrence); atomic `schedules.json` writes; outbound
+   scheduled messages carry their session id so a reply can continue it;
+   a scheduled run may NOT create schedules (recursion guard).
 4. The core exposes the ask/answer bridge as events so ANY frontend
    (terminal included) can relay OTP/confirm prompts.
 
@@ -286,6 +302,10 @@ Steps:
    `status`, `logs`. These wrap what `install.py --doctor`,
    `start.sh`/`stop.sh`, and the pid/lock files already do — promote, don't
    duplicate. `install.py` becomes a thin alias or is absorbed.
+   Add `zilla doctor --security` (RESEARCH §5.3): file perms on home/config
+   (600/700), secrets not in argv/logs, no unexpected listening sockets,
+   WebBridge loopback-only, pending-skill gate intact, owner ID set, token
+   rotated; `--fix` auto-remediates the safe items.
 2. `zilla config`: plain numbered-menu terminal settings editor covering
    the full settings table in §3. Reads/writes the SAME `.env` +
    `settings.json` the core uses. Works over SSH.
@@ -327,6 +347,11 @@ Steps:
 1. `wiki/` = hierarchical Markdown + YAML frontmatter. The harness injects
    a one-line-per-page INDEX every turn (mirror `skills_summary()`);
    bodies are read on demand by the agent's own file tools. No vector DB.
+   Injection char budgets per page (Hermes starting points: ~2,200 chars
+   for durable agent memory, ~1,375 for the user profile) — truncate in
+   context, never on disk. Add `wiki/journal/YYYY-MM-DD.md` daily notes:
+   harness injects today+yesterday; distill-journal-into-pages happens
+   during heartbeats (RESEARCH §7 items 10–14).
 2. Preamble instruction: the agent creates/updates wiki pages autonomously
    when it learns something durable (people, processes, preferences,
    domain facts), and consults the index before asking the user something
@@ -349,7 +374,15 @@ Steps:
 1. Preamble instruction: when the user asks to make something a skill, the
    agent authors a `SKILL.md` (+ code files if IT decides code is better —
    the agent chooses the form) into the active backend's skills dir.
-2. Code-type skills are written to `skills/pending/` instead. Zilla (not
+   Authoring template (Hermes): When to Use / Procedure / Pitfalls /
+   Verification. Autonomous-creation triggers (verbatim from Hermes):
+   after a 5+-tool-call task succeeds; after errors led to a working path;
+   after a user corrects the approach. Frontmatter gains OpenClaw-style
+   gating (`requires.bins/env/config`, `os`) — skills whose gates fail are
+   silently omitted from the index, viewer shows why (pairs with P6).
+2. Code-type skills are written to `skills/pending/` instead — and edits,
+   patches, and deletes of existing code skills are staged the same way
+   (Hermes granularity), not just creation. Zilla (not
    the model) detects pending skills and raises an approval request —
    reuse the Approval-mode UI in Telegram AND an equivalent prompt in the
    TUI. One owner tap moves it live. Instruction-only skills go live
@@ -405,6 +438,17 @@ Steps:
    condition changes.
 4. Usage/quota counters (per backend+model per day, from trust_log) shown
    on demand in Health screens; anomaly = a one-time owner note, not spam.
+5. **Heartbeat** (OpenClaw semantics, fully specified in RESEARCH §3.1):
+   every 30–60m start a FRESH conversation (never resume the main one —
+   that's what keeps a beat at ~2–5K tokens) whose context is only the
+   heartbeat prompt + `wiki/heartbeat.md` (owner-editable checklist,
+   "small, stable, safe to consider every 30 minutes"). Prompt near-verbatim
+   theirs, incl. "Do not infer or repeat old tasks from prior chats. If
+   nothing needs attention, reply HEARTBEAT_OK." Strip the token; drop
+   replies ≤300 chars. Run deterministic pre-checks FIRST and only wake the
+   agent if they found something (Hermes `wakeAgent:false`). Quota-aware
+   interval: back off when trust_log shows the day running hot. Skip while
+   the user's lock is busy.
 
 **Acceptance:** kill the CLI login (log out) → within one health interval
 the owner gets ONE plain-language alert with recovery steps, and no
@@ -542,4 +586,11 @@ everything comes back by itself.
   card, one tap stores it in `schedules.json` — fold into the P1 bridge
   extraction or P5. Also steal OpenClaw's "heartbeat" idea for Phase 7: the
   health tick can periodically hand the agent a tiny checklist review, not
-  just probe logins.
+  just probe logins. (Now formalized: P7 step 5 + the RESEARCH doc.)
+- **Reference designs (owner decision, 2026-07-16):** OpenClaw + Hermes
+  Agent are the explicit reference products — "exact replica is fine", with
+  API keys swapped for CLI logins (the niche neither covers: they support
+  Gemini CLI but not Antigravity/Claude Code). The vetted 30-item steal list
+  with per-phase mapping lives in `docs/dev/RESEARCH_OPENCLAW_HERMES.md` §7
+  — consult it at the START of each phase (P2 pairing-code onboarding, P4
+  memory/journal/BOOTSTRAP ritual, P5 skills, P7 heartbeat, P8 pinning).
