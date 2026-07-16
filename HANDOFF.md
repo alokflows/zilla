@@ -542,8 +542,18 @@ hotspot) and `safe_send` swallowed it — reply silently vanished. FIXED:
 `safe_send` now retries 4× with backoff; PTB network timeouts raised from 5s
 defaults (connect 15 / read 30 / write 30 / pool 10). Verified live: real-CLI
 pipeline PONG via `core.handle_message` + real DM delivered to owner. 298
-tests green. Remaining smoke: text re-try, voice/photo/doc, cancel, schedule
-fire — owner mid-test.
+tests green. SMOKE ROUND 2 results: text ✅ photo ✅ document ✅ cancel ✅.
+Voice ❌ → FIXED: `speech_recognition`'s bundled flac binary is Intel-only,
+this Mac is Apple Silicon ("Bad CPU type") — `brew install flac` (SR prefers
+PATH); add a `doctor` check for this in P2. Reminder ⚠️ → root cause: "put a
+reminder for 2 minutes" didn't match `parse_schedule` (only "remind me in
+N…"), fell through to the CLI agent which SLEPT 2 min inside the turn and
+replied late with no confirmation → parser cues broadened (put/keep/set/add/
+create a reminder/timer/alarm; in/after/for N min; bare timer → "Time's up!"),
++5 tests (196→201). Latency reality check from live logs: every turn = full
+Gemini CLI call, 17s–2m34s — the P1.5 orchestration router is THE fix, this
+is now the owner's top complaint. Bot running on this Mac, PID via
+`pgrep -f "Python bot.py"`, log in the session scratchpad.
 
 ### Checklist
 

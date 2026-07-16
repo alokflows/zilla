@@ -585,6 +585,19 @@ def test_parse_schedule_forms():
     check("parse: remind-me cue", p and p["kind"] == "once" and "call mom" in p["title"], str(p))
     check("parse: plain text is not a schedule",
           parse_schedule("what is the weather today", fixed) is None)
+    # Spoken cue variants (live-smoke failure 2026-07-17: "put a reminder for
+    # 2 minutes" fell through to the agent, which slept 2 minutes and replied —
+    # no schedule, no confirmation).
+    p = parse_schedule("put a reminder for 2 minutes to drink water", fixed)
+    check("parse: put-a-reminder for-N", p and p["kind"] == "once" and "drink water" in p["title"], str(p))
+    p = parse_schedule("keep a reminder for me in 5 minutes check the stove", fixed)
+    check("parse: keep-a-reminder", p and p["kind"] == "once" and "stove" in p["title"], str(p))
+    p = parse_schedule("set a timer for 2 minutes", fixed)
+    check("parse: bare timer gets default task", p and p["kind"] == "once" and p["title"] == "Time's up!", str(p))
+    p = parse_schedule("set an alarm for 10 minutes to leave for class", fixed)
+    check("parse: alarm cue", p and p["kind"] == "once" and "leave for class" in p["title"], str(p))
+    check("parse: bare 'for 2 minutes' without cue is NOT a schedule",
+          parse_schedule("for 2 minutes nothing happened", fixed) is None)
     # Spelled-out numbers must parse like digits (the "every three minutes"
     # failure: without this the whole message fell through to the agent and a
     # trivial request spun for many minutes instead of becoming a schedule).

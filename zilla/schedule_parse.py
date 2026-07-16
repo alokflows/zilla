@@ -144,9 +144,17 @@ def parse_schedule(text: str, now: datetime | None = None) -> dict | None:
     low = raw.lower()
 
     # Optional leading cue we can drop before matching the timing clause.
-    body = re.sub(r"^\s*(please\s+)?(schedule|remind\s+me)\b[:,]?\s*",
-                  "", raw, flags=re.IGNORECASE).strip()
+    # Covers spoken phrasings: "put/keep/set/add/create a reminder/timer/alarm".
+    body = re.sub(
+        r"^\s*(please\s+)?(can\s+you\s+)?"
+        r"(schedule|remind\s+me|"
+        r"(?:put|keep|set|add|create)\s+(?:a\s+|an\s+)?"
+        r"(?:reminder|timer|alarm)(?:\s+for\s+me)?)\b[:,]?\s*",
+        "", raw, flags=re.IGNORECASE).strip()
     had_cue = body != raw
+    had_timer_cue = had_cue and bool(
+        re.search(r"\b(reminder|timer|alarm)\b", raw[:len(raw) - len(body)],
+                  flags=re.IGNORECASE))
     blow = body.lower()
 
     # 1) interval: "every N minute(s)/hour(s)/day(s)"
@@ -183,13 +191,17 @@ def parse_schedule(text: str, now: datetime | None = None) -> dict | None:
                     "spec": {"days": sorted(set(days)), "hh": hhmm[0], "mm": hhmm[1]},
                     "title": task, "prompt": task}
 
-    # 4) "in N minutes/hours <task>"  → one-off
-    m = re.match(r"in\s+(\d+)\s*(min(?:ute)?s?|hours?|hrs?)\b(.*)",
+    # 4) "in/after/for N minutes/hours <task>"  → one-off
+    #    ("for"/"after" only make sense once a cue like "set a timer" was
+    #    stripped — a bare "for 2 minutes ..." is not a schedule request)
+    m = re.match(r"(in|after|for)\s+(\d+)\s*(min(?:ute)?s?|hours?|hrs?)\b(.*)",
                  blow, flags=re.IGNORECASE)
-    if m:
-        n = int(m.group(1)); unit = m.group(2).lower()
+    if m and (m.group(1).lower() == "in" or had_cue):
+        n = int(m.group(2)); unit = m.group(3).lower()
         per = 60 if unit.startswith("min") else 3600
-        task = _clean_task(body[m.end(2):])
+        task = _clean_task(body[m.end(3):])
+        if not task and had_timer_cue:
+            task = "Time's up!"
         if n > 0 and task:
             run_at = (now + timedelta(seconds=n * per)).timestamp()
             return {"kind": "once", "spec": {"run_at": run_at},
