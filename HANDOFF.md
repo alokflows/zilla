@@ -488,14 +488,14 @@ everything comes back by itself.
 > **Update this section and commit after EVERY completed step.** This is
 > what lets a fresh session (or a different account) resume instantly.
 
-**Current phase:** Phase 0 — not started
+**Current phase:** Phase 0 ✅ done → Phase 1 (core API design, needs owner approval)
 **Working branch:** `claude/zilla-harness-review-0v96bs`
-**Last session:** 2026-07-16 — handoff written (remote session, no CLIs
-available there; all Phase 0 verification still pending on the MacBook).
+**Last session:** 2026-07-16 (MacBook) — Phase 0 verified; findings in
+`docs/dev/PHASE0_FINDINGS.md`; 208 tests green.
 
 ### Checklist
 
-- [ ] **P0** Verify reality (flags, GEMINI.md/AGENTS.md, sandbox test, logins, tests on macOS) → `docs/dev/PHASE0_FINDINGS.md`
+- [x] **P0** Verify reality (flags, GEMINI.md/AGENTS.md, sandbox test, logins, tests on macOS) → `docs/dev/PHASE0_FINDINGS.md`
 - [ ] **P1** Core extraction: design core API (owner-approved)
 - [ ] **P1** Move modules into `zilla/` package (tests green)
 - [ ] **P1** Extract turn pipeline / scheduler / bridge / health from `bot.py`
@@ -519,6 +519,7 @@ available there; all Phase 0 verification still pending on the MacBook).
 | Date | Session did | Warnings for next session |
 |---|---|---|
 | 2026-07-16 | Full codebase analysis; handoff written and pushed. | agy/opencode were NOT installed in that environment — nothing in "traps" is verified yet. Do Phase 0 first. Older repo docs conflict with this vision; this file wins. |
+| 2026-07-16 (later, MacBook) | Phase 0 complete: all 3 CLIs probed live, 208 tests green, `docs/dev/PHASE0_FINDINGS.md` committed. Trap #1 refuted (agy `--model` validates, hard error). Trap #2 split: claude blocks headless writes without permission; agy+opencode execute unattended. agy does NOT read GEMINI.md/AGENTS.md; opencode DOES read AGENTS.md. opencode runs free with 0 credentials. claude = Pro subscription. | Nothing blocks Phase 1. Next: orchestrator designs the core API on paper and gets owner approval BEFORE coding (P1 step 1). Local checkout is `~/Documents/repos/zilla`. |
 
 ### Notes / open concerns
 
