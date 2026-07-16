@@ -43,10 +43,10 @@ import sys
 import os
 import re
 import logging
-import threading
 import time
 import json
 import secrets
+from contextlib import aclosing
 from datetime import datetime
 
 from telegram import (
@@ -75,7 +75,8 @@ from config import (
     model_catalog, get_backend, set_backend,
 )
 from sessions import SessionManager
-from cli_engine import run_cli_async, get_latest_step, detect_limit, backend_status
+import zilla.core as zcore
+from zilla.cli_engine import run_cli_async, detect_limit, backend_status
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
@@ -195,9 +196,9 @@ BOT_START_TIME = time.time()
 sessions: SessionManager = None
 auth: AuthManager = None
 schedules_mgr: ScheduleManager = None
-
-# Per-chat cancel events — set to cancel the active CLI request for that chat
-_active_cancel: dict[int, threading.Event] = {}
+# The interface-agnostic core (zilla/core.py) — owns the turn pipeline,
+# per-user CLI locks and cancel events. Created in main().
+core: zcore.ZillaCore = None
 
 # Human-in-the-loop credential/OTP bridge: chat_id -> ask_id currently awaiting
 # that chat's reply, plus the set of ask ids we've already DMed (so the watcher
@@ -213,23 +214,12 @@ _BRIDGE_PENDING_TTL = 900.0
 # again (no stale session/menu collisions). The ✕ Close button clears it too.
 _active_menu: dict[int, int] = {}
 
-# Per-user CLI serialization. The agy CLI keeps ONE conversation per user, and
-# running two invocations against the same conversation at once corrupts its
-# transcript and makes each handler scoop up the other turn's steps (responses
-# bleed into the wrong reply). With concurrent_updates(True) the event loop can
-# enter several handlers for one user at once, so we gate every CLI run behind a
-# per-user asyncio.Lock — a user's messages run one at a time, different users
-# stay fully concurrent. Created lazily on the single-threaded event loop, so
-# get-or-create needs no lock of its own.
-_user_cli_locks: dict[int, asyncio.Lock] = {}
-
-
+# Per-user CLI serialization lives in zilla.core (moved with the turn
+# pipeline). The scheduler runtime below still runs CLI turns directly, so it
+# needs the SAME lock the core uses — this delegate goes away when the
+# scheduler seam moves into the core too.
 def _get_user_lock(uid: int) -> asyncio.Lock:
-    lock = _user_cli_locks.get(uid)
-    if lock is None:
-        lock = asyncio.Lock()
-        _user_cli_locks[uid] = lock
-    return lock
+    return core.get_user_lock(uid)
 
 
 # ── Floodguard ─────────────────────────────────────────────
@@ -292,28 +282,45 @@ def _make_approval(uid: int, chat_id: int, prompt: str, name: str) -> str | None
 
 
 def _conv_for_run(uid: int, sname: str):
-    """The conversation id to resume — but only if it was created by the CURRENT
-    backend. agy brain-dir ids and claude session ids aren't interchangeable, so
-    after switching backend we start a fresh conversation instead of mismatching."""
-    cid = sessions.get_conversation_id(user_id=uid, session_name=sname)
-    if cid and sessions.get_conv_backend(uid, sname) != get_backend():
-        return None
-    return cid
+    """Moved to zilla.core with the turn pipeline. The scheduler runtime below
+    still pins conversations directly; delegate until that seam moves too."""
+    return core._conv_for_run(uid, sname)
 
 
-async def _acquire_turn(uid: int, update: Update) -> asyncio.Lock:
-    """Return this user's CLI lock, ready to enter with `async with`. If a
-    previous message is still running, send one calm heads-up so the new message
-    doesn't feel ignored while it waits its turn."""
-    lock = _get_user_lock(uid)
-    if lock.locked() and update is not None:
+async def _notify_if_busy(uid: int, update: Update) -> None:
+    """If a previous message is still running (the core's per-user lock is
+    held), send one calm heads-up so the new message doesn't feel ignored
+    while it waits its turn."""
+    if core.is_busy(uid) and update is not None:
         try:
             await update.effective_message.reply_text(
                 "⏳ One sec — finishing your previous message first, then I'll get to this."
             )
         except Exception:
             pass
-    return lock
+
+
+async def _relay_cli_turn(update, uid, chat_id, prompt, *,
+                          auto_title=False, skip_permissions=None) -> str:
+    """Drive one core turn (zilla.core.handle_message) and return the final
+    response text. Shared by the text, voice, photo, document and approval
+    paths — the Telegram translation of the core's event stream.
+
+    Progress events are consumed silently this seam: the visible ⏳ Working
+    UI stays time-driven (keep_typing, started by each handler), exactly as
+    before the extraction. The Response event's text feeds the existing
+    send_response path in each handler."""
+    await _notify_if_busy(uid, update)
+    response = ""
+    # aclosing: if we die mid-stream (Telegram error), close the generator so
+    # the core releases its lock/cancel bookkeeping deterministically.
+    async with aclosing(core.handle_message(
+            uid, prompt, chat_key=chat_id,
+            auto_title=auto_title, skip_permissions=skip_permissions)) as stream:
+        async for event in stream:
+            if isinstance(event, zcore.Response):
+                response = event.text
+    return response
 
 
 # ══════════════════════════════════════════════════════════
@@ -708,13 +715,12 @@ async def _run_approved_request(context, req: dict):
     """Execute an owner-approved limited-user request and deliver it to them."""
     uid, chat_id, prompt = req["uid"], req["chat_id"], req["prompt"]
     stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
     response = ""
     try:
         # The owner vetted the whole request, so let the agent act (skip prompts).
-        response = await _run_cli_turn(
-            None, uid, chat_id, prompt, cancel_event,
+        response = await _relay_cli_turn(
+            None, uid, chat_id, prompt,
             auto_title=True, skip_permissions=True)
     except Exception as e:
         response = _friendly_error(e)
@@ -722,8 +728,6 @@ async def _run_approved_request(context, req: dict):
     finally:
         stop_typing.set()
         typing_task.cancel()
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
     await send_response(None, context, response, uid, chat_id)
 
 
@@ -894,9 +898,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.pop("awaiting_custom_model", None):
         await update.message.reply_text("Custom model entry cancelled.")
         return
-    cancel_ev = _active_cancel.get(chat_id)
-    if cancel_ev and not cancel_ev.is_set():
-        cancel_ev.set()
+    if core.cancel(chat_id):
         await update.message.reply_text("🛑 Canceling…")
     else:
         await update.message.reply_text("Nothing is running right now.")
@@ -1491,47 +1493,8 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  MEDIA HANDLERS
 # ══════════════════════════════════════════════════════════
 
-async def _run_cli_turn(update, uid, chat_id, prompt, cancel_event, *,
-                        auto_title=False, skip_permissions=None):
-    """Run one CLI turn against the user's active session and return the response.
-
-    Acquires the per-user lock, pins the session that is active the moment we
-    start (the user may /switch while queued), resumes/tracks its conversation,
-    optionally auto-titles a fresh session, and keeps the message bookkeeping in
-    sync. Shared by the text, voice, photo and document handlers.
-
-    skip_permissions: None → derive from the user's role (admins skip prompts).
-    Owner-approved Approval-mode runs pass True explicitly (the owner already
-    vetted the whole request), and `update` may be None (no live message).
-    """
-    if skip_permissions is None:
-        skip_permissions = auth.can(uid, "admin")
-    async with await _acquire_turn(uid, update):
-        # Pin the session to whatever is active the moment WE start running, and
-        # write every result back to that same session — never the now-active one.
-        _active_cancel[chat_id] = cancel_event
-        sname = sessions.get_active_name(uid)
-        conv_id = _conv_for_run(uid, sname)
-
-        if auto_title:
-            info = sessions.get_session_info(user_id=uid, session_name=sname)
-            if info and info.get("messages", 0) == 0:
-                sessions.auto_title(prompt, user_id=uid, session_name=sname)
-
-        response, detected_id = await run_cli_async(
-            prompt, conv_id,
-            cancel_event=cancel_event,
-            skip_permissions=skip_permissions,
-        )
-
-        if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
-
-        final_conv = detected_id or conv_id
-        if final_conv:
-            sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
-        sessions.increment_messages(user_id=uid, session_name=sname)
-    return response
+# _run_cli_turn moved to zilla/core.py (ZillaCore.handle_message) — the
+# handlers below drive it through _relay_cli_turn.
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1540,7 +1503,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
@@ -1554,8 +1516,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if transcript and not transcript.startswith("["):
             await update.message.reply_text(f'🎤 "{transcript}"')
-            response = await _run_cli_turn(
-                update, uid, chat_id, transcript, cancel_event, auto_title=True)
+            response = await _relay_cli_turn(
+                update, uid, chat_id, transcript, auto_title=True)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1569,9 +1531,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task.cancel()
         logger.error(f"Voice error: {e}", exc_info=True)
         await update.message.reply_text(f"Voice error: {str(e)[:200]}")
-    finally:
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1606,7 +1565,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     caption = update.message.caption or ""
     stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
@@ -1627,7 +1585,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        response = await _run_cli_turn(update, uid, chat_id, prompt, cancel_event)
+        response = await _relay_cli_turn(update, uid, chat_id, prompt)
         stop_typing.set()
         typing_task.cancel()
         await send_response(update, context, response, uid, chat_id)
@@ -1636,9 +1594,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task.cancel()
         logger.error(f"Photo error: {e}", exc_info=True)
         await update.message.reply_text(f"Photo error: {str(e)[:200]}")
-    finally:
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1663,7 +1618,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Caption present — extract text and send to CLI
         stop_typing = asyncio.Event()
-        cancel_event = threading.Event()
         typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
         try:
@@ -1682,7 +1636,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Read the file and respond."
                 )
 
-            response = await _run_cli_turn(update, uid, chat_id, prompt, cancel_event)
+            response = await _relay_cli_turn(update, uid, chat_id, prompt)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1691,9 +1645,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             typing_task.cancel()
             logger.error(f"Document analysis error: {e}", exc_info=True)
             await update.message.reply_text(f"Analysis error: {str(e)[:200]}")
-        finally:
-            if _active_cancel.get(chat_id) is cancel_event:
-                _active_cancel.pop(chat_id, None)
 
     except Exception as e:
         logger.error(f"Document save error: {e}", exc_info=True)
@@ -1926,7 +1877,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 
     stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     # Bind before the try so a BaseException (e.g. asyncio.CancelledError on
@@ -1934,16 +1884,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # unbound at the send_response call below.
     response = ""
     try:
-        response = await _run_cli_turn(
-            update, uid, chat_id, user_message, cancel_event, auto_title=True)
+        response = await _relay_cli_turn(
+            update, uid, chat_id, user_message, auto_title=True)
     except Exception as e:
         response = _friendly_error(e)
         logger.error(f"Handler error: {e}", exc_info=True)
     finally:
         stop_typing.set()
         typing_task.cancel()
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
 
     await send_response(update, context, response, uid, chat_id)
 
@@ -2006,9 +1954,7 @@ async def _cb_misc(query, context, data, uid, chat_id):
         await query.edit_message_text(await _health_panel(), reply_markup=kb_back())
 
     elif data == "cancel_active":
-        cancel_ev = _active_cancel.get(chat_id)
-        if cancel_ev and not cancel_ev.is_set():
-            cancel_ev.set()
+        if core.cancel(chat_id):
             await query.edit_message_text("🛑 Canceling…")
         else:
             await query.edit_message_text("Nothing to cancel.")
@@ -2748,7 +2694,7 @@ def _release_lock():
 
 
 def main():
-    global sessions, auth, schedules_mgr, _lock_file_handle
+    global sessions, auth, schedules_mgr, core, _lock_file_handle
 
     # Single-instance guard — cross-platform (msvcrt on Windows, fcntl on Unix).
     bot_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2792,6 +2738,7 @@ def main():
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)
+    core = zcore.ZillaCore(sessions=sessions, auth=auth)  # the turn pipeline
     keyboards.auth = auth  # the keyboard builders read auth for role-gated menus
 
     model = get_model()
