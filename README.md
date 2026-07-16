@@ -1,198 +1,123 @@
-# ⚡ Zilla — Your AI, inside Telegram
+# Zilla
 
-> Talk to a powerful AI right inside your Telegram chat — by text, voice, photos, or files.
-> It can also **run scheduled jobs** for you and message you the results automatically.
+**A self-hosted AI assistant that lives on your computer — your knowledge in plain files you own, the "brain" rented from whichever AI CLI you have today and swappable tomorrow.**
 
-Zilla is a **bridge**. Your message goes into Telegram → Zilla hands it to an AI command-line tool on your computer (**agy** or **Claude Code**) → the AI does the work → Zilla sends the answer back to your chat.
+Zilla is a harness over agentic AI CLIs (**Claude Code**, **agy**/Antigravity, **opencode**). The CLIs already know how to reason, run tools, browse, and remember conversations — Zilla's job is everything around that: shaping context, enforcing policy, managing sessions and schedules, keeping the system healthy, and giving you clean interfaces to talk through.
 
-- Works on **Windows, macOS, and Linux**.
-- Runs on **either** backend: **agy** (Gemini) **or** **Claude Code** (Opus/Sonnet/Haiku) — switch anytime.
-- **One-click installer.** Log into your AI tool, paste two values, done.
-
-> 📜 What's new: see **[CHANGELOG.md](CHANGELOG.md)** (latest **v4.0.0** — cross-platform + Claude Code backend).
+> **The knowledge is yours. The brain is rented.**
+> Access to any given model can vanish overnight — a login expires, a quota tightens, a product shuts down. Zilla is built so that surviving that is a settings change, not a migration. Your data never leaves your machine.
 
 ---
 
-## 🧸 Explain it like I'm 3
+## Design principles
 
-1. 📱 You **type into Telegram**.
-2. 📨 Zilla is the **messenger** that carries your words to the AI.
-3. 🧠 The **AI** (agy *or* Claude Code) thinks and writes the answer.
-4. 📨 Zilla brings the answer **back to your chat**.
-
-That's it. You only ever touch Telegram.
-
----
-
-## ✅ What you need first (prerequisites)
-
-You need **four** things. Don't worry — steps for each are below.
-
-1. **Python 3.10 or newer** — the language Zilla is written in.
-2. **An AI backend CLI** — pick ONE (you can install both and switch later):
-   - **agy** (antigravity CLI, Gemini), or
-   - **Claude Code** (`claude`).
-3. **A Telegram bot token** — a secret password for your bot, from **@BotFather**.
-4. **Your Telegram numeric ID** — so the bot knows *you* are the owner, from **@userinfobot**.
-
-### 1) Install Python
-- **Windows:** download from <https://python.org> → run installer → **tick "Add Python to PATH"**.
-- **macOS:** `brew install python` (or from python.org).
-- **Linux (Ubuntu/Debian):** `sudo apt update && sudo apt install python3 python3-pip`.
-- Check it works: open a terminal and run `python --version` (or `python3 --version`).
-
-### 2) Install your AI backend and LOG IN (very important)
-**Option A — agy (Gemini):**
-- Install the antigravity CLI (`agy`).
-- Run `agy` once in a terminal and **sign in** when it asks. Close it after.
-
-**Option B — Claude Code (`claude`):**
-- Install Claude Code (see Anthropic's docs).
-- Run `claude` once in a terminal and **sign in** (it opens a browser). Close it after.
-
-> 🔑 **The login is what makes it work.** Zilla cannot log in for you — you log into the CLI once on that computer, and Zilla reuses that login forever.
-
-### 3) Get a bot token (@BotFather)
-1. In Telegram, open a chat with **@BotFather**.
-2. Send `/newbot`, pick a name and a username ending in `bot`.
-3. BotFather replies with a **token** like `123456:ABC-DEF...`. Copy it. Keep it secret.
-
-### 4) Get your Telegram ID (@userinfobot)
-1. Open **@userinfobot** in Telegram and send any message.
-2. It replies with your **numeric ID** (e.g. `8740189938`). Copy it.
+- **Self-hosted, single-owner.** Runs entirely on your computer with your own CLI logins. No central server, no account with us, no telemetry. Zero paid dependencies — CLI logins only, no API keys.
+- **A harness, not another agent.** Zilla never reimplements what the backend CLI already does (tools, memory, skills, browsing). It routes, configures, and supervises.
+- **Backend-agnostic.** Switch between Claude Code, agy, and (soon) opencode from the settings — mid-conversation histories stay correctly separated per backend.
+- **Deterministic safety.** Every security decision (who may run what, what needs approval) is enforced by Zilla's own code, never delegated to a model's judgment.
+- **Plain files.** Configuration is `.env` + `settings.json`. State is human-readable JSON. Nothing is locked in.
 
 ---
 
-## 🚀 Install (one click)
+## What works today
 
-1. Download/clone this folder onto the computer that will run the bot.
-2. Run the installer for your OS:
+The current interface is **Telegram** — a private bot that bridges your chat to the AI CLI on your machine:
 
-| OS | Do this |
-|----|---------|
-| **Windows** | **Double-click `install.bat`** |
-| **macOS** | **Double-click `install.command`** (first time: right-click → Open) |
-| **Linux** | In a terminal: `bash install.sh` |
+- **Converse naturally** — text, voice notes, photos, and documents.
+- **Named sessions** — parallel conversations with separate memories (`/new`, `/sessions`, `/switch`).
+- **Scheduled automation** — "every day at 9am summarise my inbox" becomes a recurring job that messages you the result; missed jobs catch up on startup.
+- **Human-in-the-loop** — when a task needs a credential or an OTP, the agent pauses, you're asked in chat, your reply is used once and wiped.
+- **Approval mode** — add a second user as *limited*: they can ask, but nothing runs until the owner taps ✅ Approve.
+- **Backend & model switching** from the settings menu, live catalogs included.
+- **Cross-platform** — macOS, Linux, and Windows, with a guided installer and a `--doctor` self-check.
 
-3. The installer will:
-   - install the Python pieces,
-   - ask **which backend** (agy or Claude Code),
-   - ask for your **bot token** and **your Telegram ID**,
-   - ask **"auto-start at login? (y/n)"**,
-   - remind you to **log into your CLI** if you haven't,
-   - **start the bot**.
+## Where it's headed
 
-4. Open Telegram, message your bot — you should get a **"⚡ Zilla is online"** message. Send **`/menu`**. 🎉
+Zilla is being rebuilt as a **terminal-first application** (work in progress, tracked in [`HANDOFF.md`](HANDOFF.md)):
 
-> 🩺 **Something off?** Run `python install.py --doctor` — it checks Python, dependencies, your CLI + login, token, and ID, and prints a green/red report.
-
----
-
-## 🔀 Choosing & switching the backend (agy ⇄ Claude Code)
-
-Two easy ways:
-
-- **From Telegram:** `/settings` → tap **🧠 Backend** to toggle agy ⇄ claude. Takes effect on your next message.
-- **In the `.env` file:** set `BACKEND=claude` (or `BACKEND=agy`) and restart.
-
-**Pick the model** for whichever backend is active: `/model` (or **🤖 Model** in `/menu`).
-- agy shows Gemini models × Low/Med/High thinking.
-- Claude Code shows **Opus / Sonnet / Haiku**.
-- **✏️ Custom** lets you type any exact model name the CLI supports.
-
-> Want a *different* `claude`/`agy` binary? Set `CLAUDE_PATH=` or `CLI_PATH=` in `.env`. (Also documented in `config.py` and `backends.py`.)
+- **`zilla`** — a full-screen terminal UI: chat with the AI directly, settings, skills, and health screens. Telegram becomes an optional connector you enable in one sentence ("connect to my Telegram").
+- **A personal wiki** — the assistant's persistent knowledge as portable Markdown on your disk, built up from conversation. It outlives every model swap.
+- **Fallback chain** — if the primary backend errors out or hits a limit, the same request retries on the next backend in your priority order. You get one clean answer.
+- **Silent self-healing** — background health checks that fix what a program can fix and alert you only when a human is genuinely needed, with plain-language recovery steps.
+- **Skills from chat** — "make that into a skill" produces a reusable skill; code-bearing skills need one owner approval before first run.
+- **Offline voice** — a local Whisper option alongside the current online transcription.
 
 ---
 
-## 👥 Sharing it with a friend
+## Quick start (Telegram interface)
 
-There are two ways:
+**Prerequisites**
 
-**A) Add them to YOUR bot (no install for them).**
-- `/menu` → **👥 Users** → **➕ Add User** → paste their Telegram ID → name. They become an **admin**.
-- ⚠️ Anyone you add can run commands/files on **your** computer (see Security). Only add people you trust.
+1. **Python 3.10+**
+2. **One AI backend, logged in** — [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) or agy. Run it once in a terminal and sign in; Zilla reuses that login.
+3. **A Telegram bot token** — from [@BotFather](https://t.me/BotFather) (`/newbot`).
+4. **Your Telegram numeric ID** — from [@userinfobot](https://t.me/userinfobot).
 
-**B) Give them their OWN bot on THEIR PC (recommended for a friend).**
-- They install Python + their backend CLI (agy or Claude Code) and **log in**.
-- They make their own bot token (@BotFather) and get their own ID (@userinfobot).
-- They copy this folder and run the installer. Done — a fully independent bot on their machine.
+**Install**
 
----
+| OS | Run |
+|----|-----|
+| Windows | `install.bat` |
+| macOS | `install.command` |
+| Linux | `bash install.sh` |
 
-## ⏰ Schedules (automation)
+The installer sets up dependencies, detects which backend is installed, asks for your token and ID, and starts the bot. Message your bot on Telegram, send `/menu`, and you're in.
 
-Make the bot do things on a timer and message you the result.
+Something off? `python install.py --doctor` prints a full green/red health report (Python, dependencies, CLI login, token, ID).
 
-- Command: `/schedule`
-  - `/schedule daily 09:00 summarise my inbox`
-  - `/schedule every 5h check the news`
-  - `/schedule once 2026-06-10 18:30 wish happy birthday`
-  - `/schedule mon,wed,fri 09:00 stand-up notes`
-- Or just say it: **"every day at 9am summarise my inbox"** → confirm card → done.
-- Manage: pause/resume, ▶️ run-now, 🗑 delete from the `/schedule` panel.
-- **Catch-up:** if the PC was off when a job was due, it runs once on startup. Toggle in `/settings` → **⏰ Catch up missed schedules**.
-
----
-
-## 💬 Commands (also in the `/` menu)
-
-| Command | What it does |
-|---------|--------------|
-| *(just type)* | Ask the AI anything |
-| `/menu` | Buttons for everything |
-| `/schedule` | Add / manage scheduled jobs |
-| `/model` | Pick the AI model |
-| `/settings` | Backend, schedules catch-up, etc. |
-| `/new`, `/sessions`, `/switch`, `/end` | Separate conversations (memories) |
-| `/brain` | Inbox stats |
-| `/browse <url>` | Control a browser (WebBridge) |
-| `/cancel` | Stop a running request |
-| `/ping`, `/help` | Status / help |
-| `/adduser`, `/removeuser`, `/listusers` | Owner only: manage admins |
-
----
-
-## 🔄 Updating
+**Operate**
 
 ```
-git pull
-python install.py --doctor   # confirm everything still green
+./start.sh / ./stop.sh          # macOS, Linux
+START_BACKGROUND.bat / STOP_BACKGROUND.bat   # Windows
 ```
-Then restart (Windows: `STOP_BACKGROUND.bat` then `START_BACKGROUND.bat`; macOS/Linux: `./stop.sh` then `./start.sh`).
+
+Full command reference and day-to-day usage: **[MANUAL.md](MANUAL.md)**. Release notes: **[CHANGELOG.md](CHANGELOG.md)**.
 
 ---
 
-## 🛟 Troubleshooting
+## Security model
 
-- **No "online" message / bot silent** → `python install.py --doctor`. Most often: CLI not logged in, or wrong token.
-- **"not logged in" / model errors** → run your CLI (`agy` or `claude`) in a terminal and sign in again.
-- **Menus feel slow** → make sure only ONE copy is running (the installer enforces a single instance).
-- **Logs** are in the `logs/` folder (newest file).
-- **Stop the bot:** Windows `STOP_BACKGROUND.bat`; macOS/Linux `./stop.sh`.
-- **Start it:** Windows `START_BACKGROUND.bat`; macOS/Linux `./start.sh`.
+Read this before adding anyone but yourself.
 
----
-
-## 🔐 Security — read this
-
-Zilla runs your AI CLI with permissions to read/write files and run commands **on the computer it's installed on**. That power is the point (it can actually do tasks) — but it means:
-
-- **An admin can effectively run code on that machine** through chat — the AI CLI executes tools on your behalf. **Only give full (admin) access to people you trust with that computer.**
-- **Not sure you trust them that much? Use Approval mode.** Add them as a *limited* user and every request they send waits for you to tap ✅ Approve before anything runs. Good for a student/helper. (Pick the tier when adding them, or toggle it later in the Users panel.)
-- Only the **owner** (you) can add/remove users.
-- Your bot **token** and your **.env** are secrets — they're git-ignored; never share them.
-- **If your token ever leaks** (posted a screenshot, pasted it somewhere public), revoke it: message **@BotFather → /revoke**, pick the bot, and put the new token in your `.env`, then restart. A leaked token doesn't let someone control your computer, but they could disrupt the bot or message you *as* it — so rotate it to be safe.
-- Each person who wants their own safe setup should run their **own** bot on their **own** PC (Sharing → option B).
+- The backend CLI executes real tools — files, shell — on the host machine. That capability is the product, and it means **a full (admin) user can effectively run code on that computer through chat**. Only grant admin to someone you'd trust with the keyboard.
+- **Approval mode** exists for everyone else: limited users' requests are held until the owner approves each one.
+- Only the owner can manage users. Secrets (`.env`, token) are git-ignored and written with owner-only permissions; OTP/password replies are wiped from chat after use.
+- A leaked bot token can't control your computer, but rotate it anyway: @BotFather → `/revoke`, update `.env`, restart.
+- The hard security boundary is the operating system, not the model. For exposed deployments, run Zilla under a dedicated OS user (hardening guide ships with the Linux deployment phase).
 
 ---
 
-## 🗂️ How it's built (for the curious)
+## Architecture
 
-- `bot.py` — Telegram handlers, menus, scheduler loop.
-- `backends.py` — chooses & runs the AI CLI (**agy** or **Claude Code**). *Comments explain how to switch/add a backend.*
-- `platform_compat.py` — the only OS-specific code (lock, window-hiding, PTY) for Windows/macOS/Linux.
-- `cli_engine.py` — runs the agy CLI via a pseudo-terminal; delegates to the chosen backend.
-- `schedules.py` / `schedule_parse.py` — the automation engine + natural-language parser.
-- `config.py` — all settings (reads `.env`); platform-aware paths; backend-aware model handling.
-- `install.py` — the cross-platform installer + `--doctor` self-check.
-- `test_fixes.py` — 90+ unit tests (`python test_fixes.py`).
+```
+You (Telegram today, terminal UI next)
+        │
+        ▼
+   Zilla core ── context shaping · policy · sessions · schedules · health
+        │
+        ▼
+ Agentic CLI (claude / agy / opencode) ── reasoning · tools · memory
+```
+
+| Component | Role |
+|---|---|
+| `bot.py` | Telegram interface: handlers, menus, delivery |
+| `cli_engine.py` / `backends.py` | Backend contract; runs agy under a real PTY, Claude Code via JSON pipe |
+| `harness.py` | Per-turn context injection: trust contract, style, skills index |
+| `sessions.py` / `schedules.py` | Named conversations; the automation engine + natural-language schedule parser |
+| `interactive.py` | The human-in-the-loop ask/answer bridge (OTP, confirmations) |
+| `users.py` | Owner / admin / limited tiers, approval queue |
+| `config.py` | Single source of truth: `.env`, `settings.json`, backend-aware model catalog |
+| `platform_compat.py` | The only OS-specific code (locks, PTY, window hiding) |
+| `install.py` | Guided installer + `--doctor` |
+
+Core modules are being consolidated into the `zilla/` package as part of the terminal-app rebuild — see [`HANDOFF.md`](HANDOFF.md) and `docs/dev/` for the engineering plan, invariants, and current status.
+
+**Tests:** `python test_fixes.py` and `python test_interactive.py` (208 tests, no framework required).
+
+---
+
+## Project status
+
+Actively developed. The Telegram interface is stable and in daily use; the terminal application is under construction on the current working branch. If you try Zilla and something doesn't behave as documented, the `--doctor` report plus the newest file in `logs/` tells most of the story.

@@ -496,7 +496,7 @@ package with legacy shims; 208 tests green.
 ### Checklist
 
 - [x] **P0** Verify reality (flags, GEMINI.md/AGENTS.md, sandbox test, logins, tests on macOS) → `docs/dev/PHASE0_FINDINGS.md`
-- [ ] **P1** Core extraction: design core API (owner-approved)
+- [x] **P1** Core extraction: design core API (owner-approved) → `docs/dev/CORE_API.md`
 - [x] **P1** Move modules into `zilla/` package (tests green)
 - [ ] **P1** Extract turn pipeline / scheduler / bridge / health from `bot.py`
 - [ ] **P2** `zilla` entrypoint + `config`/`doctor`/`start`/`stop`/`status`/`logs`
@@ -530,3 +530,15 @@ package with legacy shims; 208 tests green.
 - Orchestrator liberty: if Phase 0 findings contradict this plan, argue it
   with the owner BEFORE proceeding — do not silently comply with a stale
   plan.
+- **Scheduling policy (owner decision, 2026-07-16):** Zilla's own scheduler
+  (`schedules.json` + core ticker) is the ONLY scheduling authority — same
+  architecture OpenClaw/Hermes-class agents use (daemon-held job list firing
+  prompts at the agent). Two additions to the plan: (a) harness rule — the
+  agent must NEVER create OS timers (cron/launchd/Task Scheduler); recurring
+  work goes through Zilla (add when the harness preamble is next touched);
+  (b) a schedule-request bridge (same file pattern as the OTP bridge): the
+  agent writes a schedule request, Zilla shows the owner the normal confirm
+  card, one tap stores it in `schedules.json` — fold into the P1 bridge
+  extraction or P5. Also steal OpenClaw's "heartbeat" idea for Phase 7: the
+  health tick can periodically hand the agent a tiny checklist review, not
+  just probe logins.

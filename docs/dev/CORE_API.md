@@ -1,6 +1,6 @@
 # ZILLA CORE API — design (P1 step 1)
 
-Status: DRAFT — awaiting owner approval. No code until approved.
+Status: APPROVED by owner, 2026-07-16.
 
 ## Shape
 
