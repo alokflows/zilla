@@ -551,8 +551,9 @@ fire — owner mid-test.
 - [x] **P1** Core extraction: design core API (owner-approved) → `docs/dev/CORE_API.md`
 - [x] **P1** Move modules into `zilla/` package (tests green)
 - [ ] **P1** Extract turn pipeline / scheduler / bridge / health from `bot.py`
+- [ ] **P1.5** Orchestration router (OWNER DECREE 2026-07-17): a cheap first pass on EVERY incoming message decides complexity + intent BEFORE the heavy CLI turn — (a) small-talk/simple → answer fast (small model or short-circuit), complex → full CLI agent turn; (b) if the user is *sharing* something (a fact about their life, a preference, something they did) → immediately append it to the wiki journal (`wiki/journal/YYYY-MM-DD.md`), structure matures over time via heartbeat distillation (steal-list #12/#13). This also attacks LATENCY, the owner's other complaint: today every "hi" pays full CLI cold-start (~10s spin-up + model time). Also add an instant ack reaction (👀 or typing starts <1s) so the bot never feels dead. Design this seam into CORE_API alongside the bridge/approvals/health extraction.
 - [ ] **P2** `zilla` entrypoint + `config`/`doctor`/`start`/`stop`/`status`/`logs`
-- [ ] **P2** Full-screen TUI (chat + settings + skills + health)
+- [ ] **P2** Full-screen TUI (chat + settings + skills + health; OWNER 2026-07-17: ASCII-art Zilla logo centered on the home screen + a visible prompt box — the terminal app should look like a real product the moment it opens)
 - [ ] **P2** Conversational onboarding + Telegram-as-connector
 - [ ] **P3** New Zilla home layout + git-init + migration shim
 - [ ] **P4** Wiki: index injection + autonomous read/write instructions
