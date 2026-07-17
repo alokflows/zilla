@@ -436,6 +436,16 @@ Steps:
    full, token revoked) — one message, plain language, with exact recovery
    steps (a runbook readable at 3am), and no repeat alert until the
    condition changes.
+   **ASSISTED RE-LOGIN (owner decree 2026-07-17):** on CLI login expiry
+   (agy, claude, later opencode) the bot must never go stale/dumb. The
+   alert itself carries the login link/URL for that CLI; the owner replies
+   with the token/code **in the same chat**; Zilla feeds it to the CLI's
+   login flow and confirms recovery — the owner never has to touch the
+   machine. Build it on the existing ask/answer bridge (`Ask` kind
+   `password`/`text`, secrets masked + wiped after use — the plumbing
+   already exists and is tested). Deterministic detection first
+   (`agy_reachable()`, `claude_identity()` auth_error), then drive the
+   CLI's own login command; never store the token anywhere.
 4. Usage/quota counters (per backend+model per day, from trust_log) shown
    on demand in Health screens; anomaly = a one-time owner note, not spam.
 5. **Heartbeat** (OpenClaw semantics, fully specified in RESEARCH §3.1):
@@ -533,12 +543,16 @@ everything comes back by itself.
 > LIGHT (owner decree 2026-07-17): current state, one line per session,
 > only notes a future session actually needs. History lives in git log.
 
-**Current phase:** Phase 1 — core extraction. Turn pipeline, scheduler
-runtime (payload types / session modes / backend pins / retry ladder), and
-the credential/OTP bridge all live in `zilla/core.py`; **next: approvals
-seam (CORE_API step 5), then health stub (step 6), then P1.5 router.**
+**Current phase:** Phase 1 core extraction is **DONE** — turn pipeline,
+scheduler runtime, credential/OTP bridge, Approval mode, and the
+`health_report()` snapshot all live in `zilla/core.py` (CORE_API steps 2–6);
+`bot.py` is a Telegram renderer. **NEXT SESSION STARTS AT: P1.5
+orchestration router** — implement per the checklist item below +
+`docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` (the `review()` seam design,
+harness self-heal clause, and Progress-into-⏳-bubble are already specced
+there; start from its "What to build" section).
 **Working branch:** `claude/zilla-harness-review-0v96bs`
-**Tests:** 204+16+75+57 = **352 green** — `.venv/bin/python test_fixes.py /
+**Tests:** 204+16+102+57 = **379 green** — `.venv/bin/python test_fixes.py /
 test_interactive.py / test_core.py / test_schedules_seam.py` (the last is a
 frozen acceptance spec — never edit it) + `import bot; import zilla.core`.
 **Bot:** live on the owner's MacBook (@Mangomangos_bot; `.env` exists here,
@@ -551,7 +565,7 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 - [x] **P0** Verify reality (flags, GEMINI.md/AGENTS.md, sandbox test, logins, tests on macOS) → `docs/dev/PHASE0_FINDINGS.md`
 - [x] **P1** Core extraction: design core API (owner-approved) → `docs/dev/CORE_API.md`
 - [x] **P1** Move modules into `zilla/` package (tests green)
-- [ ] **P1** Extract turn pipeline / scheduler / bridge / health from `bot.py`
+- [x] **P1** Extract turn pipeline / scheduler / bridge / approvals / health-stub from `bot.py` (FOR ALOK: live Telegram smoke of Approval mode — have a limited user send a request, tap ✅ and ❌ once each)
 - [ ] **P1.5** Orchestration router (OWNER DECREE 2026-07-17): a cheap first pass on EVERY incoming message decides complexity + intent BEFORE the heavy CLI turn — (a) small-talk/simple → answer fast (small model or short-circuit), complex → full CLI agent turn; (b) if the user is *sharing* something (a fact about their life, a preference, something they did) → immediately append it to the wiki journal (`wiki/journal/YYYY-MM-DD.md`), structure matures over time via heartbeat distillation (steal-list #12/#13). This also attacks LATENCY, the owner's other complaint: today every "hi" pays full CLI cold-start (~10s spin-up + model time). Also add an instant ack reaction (👀 or typing starts <1s) so the bot never feels dead. Design this seam into CORE_API alongside the bridge/approvals/health extraction. (c) EXPANDED (owner decree 2026-07-17, the "effortless" mandate): an orchestrator RESPONSE-REVIEW gate — every outbound response is inspected BEFORE delivery to the user (deterministic checks first: empty/error-garbage/limit; then bounded self-heal — on a tool/dependency failure, fix it (e.g. install the missing converter) and retry ONCE, never deliver error garbage, never loop silently). Owner's reference story: OpenClaw hit a missing OGG converter, installed it, transcribed, answered — zero errors shown. Spec: `docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` (deep-dive comparison of OpenClaw/Hermes source vs Zilla's pipeline).
 - [ ] **P2** `zilla` entrypoint + `config`/`doctor`/`start`/`stop`/`status`/`logs`
 - [ ] **P2** Full-screen TUI (chat + settings + skills + health; OWNER 2026-07-17: ASCII-art Zilla logo centered on the home screen + a visible prompt box — the terminal app should look like a real product the moment it opens)
@@ -563,7 +577,7 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 - [ ] **P5** Code-skill approval gate (pending/ + one tap)
 - [ ] **P5** Skills viewer + failure loop (one retry, then plain-language stop)
 - [ ] **P6** Environment detection + adaptation
-- [ ] **P7** Silent self-healing health + 3am alert + usage counters
+- [ ] **P7** Silent self-healing health + 3am alert (incl. ASSISTED RE-LOGIN — see Phase 7 step 3) + usage counters
 - [ ] **P8** opencode backend + fallback chain
 - [ ] **P9** Local Whisper + voice_mode setting
 - [ ] **P10** Ubuntu deployment hardening (LAST — on the client machine)
@@ -578,6 +592,8 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 | 2026-07-17 | Bridge seam → core (`Ask` events over `subscribe()`, `pending_ask_for`/`answer_ask`; bot.py renders only). 334 green; bot restarted live. |
 | 2026-07-17 | `docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` — verdict: OpenClaw/Hermes have NO reviewer LLM; "effortless" = in-loop tool self-heal + persistence system prompt + deterministic delivery filter. Zilla plan: harness self-heal clause, unify scattered checks into one `review()` seam at both delivery points, surface existing `Progress` events into the ⏳ bubble (free "feels alive" win), steal-list #31–40. |
 | 2026-07-17 | Health stub → `core.health_report(force=False)` snapshot from existing probes (agy/claude reachability, disk, scheduler/bridge attachment); loop itself stays Phase 7. 352 green (test_core 75). |
+| 2026-07-17 | Approvals seam → `core.approvals` (`submit`/`pending`/`approve`/`deny`, `ApprovalRequest` events; approved runs share the per-user lock via `handle_message`). **Phase 1 extraction COMPLETE — 379 green**, bot restarted live. Known deviation: owner-DM delivery of approval cards is fire-and-forget (logged on failure), same as the bridge seam. |
+| 2026-07-17 | README rewritten to the full vision (effortless orchestration, terminal-first, assisted re-login) and pushed to `main` so the GitHub front page shows it. Assisted re-login decree written into Phase 7 step 3. Session ended deliberately before P1.5 (owner: fresh session next). |
 
 ### Notes (only what a future session needs)
 
