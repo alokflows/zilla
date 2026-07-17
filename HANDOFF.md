@@ -547,9 +547,15 @@ everything comes back by itself.
 merged** — GOD MODE round 1 (2026-07-17 pm) landed the P1.5 router,
 `zilla/cli.py` + `doctor`/`security`/`configmenu`, and the Textual TUI
 (`zilla/tui/`) in parallel worktrees, merged serially with the full test
-gate. **NEXT SESSION STARTS AT: P2 conversational onboarding +
-Telegram-as-connector**, plus the FOR ALOK live smokes listed in the
-checklist (P1.5 smoke, TUI real-terminal launch, Approval mode taps).
+gate. **NEXT SESSION IS A PLANNING SESSION (Fable, no execution):** write
+numbered, self-contained SERIAL execution briefs into §"EXECUTION BRIEFS"
+below for: P7 (health + supervisor fix + assisted re-login), P2
+onboarding, P8 opencode+fallback, P9 whisper, P6 env detection, then P3.
+One brief = one Sonnet session's worth of work. After planning, a
+separate Sonnet terminal executes brief-by-brief ("dumb mode": follow the
+brief exactly, full test gate, tick the box, one-line session log, stop).
+FOR ALOK live smokes still pending (P1.5 smoke, TUI real-terminal launch,
+Approval mode taps).
 **Working branch (source of truth):** `claude/zilla-harness-review-0v96bs`
 **Tests:** 204+16+112+57 core + 71 review + 17 tui + 69 cli = **546 green**
 — `.venv/bin/python test_fixes.py / test_interactive.py / test_core.py /
@@ -599,6 +605,16 @@ in its log.
 | 2026-07-17 pm | GOD MODE round 1: TUI landed (`zilla/tui/`, Textual, +17 tests = 396 green, no existing files touched; needs a real-terminal launch by owner). P1.5 router + `zilla` CLI entrypoint executors running in parallel worktrees. Owner Q&A: OAuth≠replacement for CLI (CLI login IS OAuth; Hermes OAuth = their hosted paid inference) — stay the course, replica-of-Hermes rejected, steal-list stands. |
 | 2026-07-17 pm | `zilla` CLI landed (+69 tests = 465 green). Found the bot DEAD since 08:22 (httpx ConnectError killed PTB, no auto-restart — P7 evidence); restarted live via `zilla start` ✅. config.py gained per-backend model helpers (`get/set_model_for`, `model_catalog_for`). |
 | 2026-07-17 pm | P1.5 router merged (built in parallel worktree): `zilla/review.py` gate + triage, harness `_SELF_HEAL`, smalltalk fast path (`claude --model haiku`), share→wiki journal, steal #36, 👀 ack + Progress→⏳-bubble. Orchestrator patched `_SELF_HEAL` post-merge to restore the spec's destructive/irreversible/costs-money stop-condition. Bot restarted on merged code. Awaiting owner live smoke. |
+| 2026-07-17 eve | GOD MODE round 2 FAILED: 5 parallel Sonnet executors (P7/P2-onboarding/P8/P9/P6) killed by the shared usage limit in ~5 min, zero commits; worktrees deleted (only scrap: partial tui/wizard.py, discarded). Salvage: `faster-whisper` is already pip-installed in `.venv` (P9 can skip that step). Owner decree: parallel fan-out BANNED → serial Fable-plans/Sonnet-executes protocol (see Notes). Antigravity suggestions reviewed → verdicts in Notes; P11 WhatsApp connector parked. |
+
+### EXECUTION BRIEFS (planner writes, Sonnet executes serially)
+
+*(Empty — the next Fable PLANNING session fills this. Format per brief:
+number + title, files owned, exact steps, live-verification rules, test
+gate command list, done-criteria, explicit do-NOT-touch list. A brief must
+be executable by Sonnet with zero questions. Execute strictly in order:
+1=P7, 2=P2 onboarding, 3=P8, 4=P9, 5=P6, 6=P3. Raw material: Phase
+sections above + round-2 scoping in git history of this file.)*
 
 ### Notes (only what a future session needs)
 
@@ -614,9 +630,27 @@ in its log.
   `docs/dev/RESEARCH_OPENCLAW_HERMES.md` §7; consult at each phase start.
 - Orchestrator liberty: if findings contradict this plan, argue it with the
   owner before proceeding — never silently comply with a stale plan.
-- **Loop protocol (owner decree 2026-07-17): GOD MODE.** Each round fans out
-  ALL unchecked items that don't conflict on files to parallel Sonnet
-  executors in isolated git worktrees (+ Opus agents for research items) —
-  never one-at-a-time. The orchestrator reviews every diff, merges the
-  worktrees SERIALLY with the full test gate between merges (that is what
-  keeps parallel safe), restarts the bot when bot.py changed, pushes.
+- **Loop protocol (owner decree 2026-07-17 evening — REPLACES GOD MODE):
+  SERIAL ONLY.** Parallel fan-out is BANNED: round 2 launched 5 parallel
+  Sonnet worktree executors and the shared 5-hour usage window died in ~5
+  minutes with ZERO commits (the account limit counts every agent; 5×
+  repo-reading in parallel = instant burn). New flow, three terminals:
+  (1) Fable = PLANNER only — writes serial numbered briefs into
+  §EXECUTION BRIEFS, never executes, stays open to review; (2) Sonnet
+  terminal = executor — takes the next brief, follows it literally, full
+  test gate, ticks the box, one-line log, commits, stops; (3) repeat. One
+  brief at a time. Merge/review discipline unchanged.
+- **Antigravity-CLI suggestions reviewed (2026-07-17, orchestrator verdicts):**
+  1. *SQLite WAL pragmas* — correct engineering, wrong time: sessions are
+     small JSON files and one connector; adopt SQLite+WAL only when a
+     webhook-based connector (WhatsApp) creates real write concurrency.
+  2. *MemGPT-style core memory* — good cheap steal: our CLIs already edit
+     files, so "core memory" = a wiki page the harness preamble tells the
+     agent to keep updated. Fold into **P4 wiki**, no new library.
+  3. *FastAPI webhook + asyncio.Queue* — accurate and REQUIRED for a
+     future WhatsApp connector (Meta webhooks demand <3s ack). Parked as
+     **P11 — WhatsApp connector** (after P10; needs Meta business app +
+     number; check free-tier limits first).
+  4. *Instructor/Pydantic auto-retry* — REJECTED: we don't force JSON out
+     of CLIs (review() is deterministic on plain text), and silent model
+     retries burn the usage budget we just learned is scarce.
