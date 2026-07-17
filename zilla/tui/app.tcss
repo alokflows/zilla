@@ -1,0 +1,155 @@
+/* Zilla TUI — one consistent accent (Textual's $accent) across every
+   screen; theme-aware via Textual's built-in dark/light design tokens so
+   this looks right in both without any manual media queries. */
+
+Screen {
+    background: $surface;
+}
+
+/* ── Home ─────────────────────────────────────────────────── */
+
+#logo {
+    color: $accent;
+    text-style: bold;
+    width: auto;
+    content-align: center middle;
+}
+
+#tagline {
+    color: $text-muted;
+    margin-top: 1;
+    text-align: center;
+}
+
+#home-hint {
+    color: $warning;
+    margin-top: 1;
+    height: auto;
+    text-align: center;
+}
+
+#home-prompt {
+    width: 64;
+    margin-top: 2;
+    border: round $accent;
+}
+
+/* ── Chat ─────────────────────────────────────────────────── */
+
+#chat-log {
+    height: 1fr;
+    padding: 1 2;
+}
+
+.bubble {
+    height: auto;
+    margin-bottom: 1;
+    padding: 0 1;
+    border-left: thick $accent;
+    background: $panel;
+}
+
+.bubble-label {
+    text-style: bold;
+    color: $text-muted;
+    height: 1;
+}
+
+.bubble-body {
+    height: auto;
+}
+
+.bubble-user {
+    border-left: thick $primary;
+}
+
+.bubble-zilla {
+    border-left: thick $accent;
+}
+
+.bubble-system {
+    border-left: thick $warning;
+    color: $text-muted;
+}
+
+.bubble-error {
+    border-left: thick $error;
+}
+
+.bubble-error .bubble-body {
+    color: $error;
+}
+
+.bubble-approval {
+    border-left: thick $warning;
+}
+
+.approval-buttons {
+    height: auto;
+    margin-top: 1;
+}
+
+.approval-buttons Button {
+    margin-right: 1;
+}
+
+#status-line {
+    height: 1;
+    color: $accent;
+    padding: 0 2;
+    text-style: italic;
+}
+
+#chat-input {
+    margin: 0 1 1 1;
+    border: round $accent;
+}
+
+/* ── Settings / Skills / Health ──────────────────────────────── */
+
+.screen-title {
+    text-style: bold;
+    color: $accent;
+    padding: 1 2 0 2;
+}
+
+.settings-row {
+    height: auto;
+    padding: 0 2;
+    margin-bottom: 1;
+}
+
+.settings-label {
+    color: $text-muted;
+}
+
+.skill-row {
+    height: auto;
+    padding: 0 2;
+    margin-bottom: 1;
+    border-left: thick $accent;
+    background: $panel;
+}
+
+.skill-name {
+    text-style: bold;
+    color: $accent;
+}
+
+.health-section {
+    text-style: bold;
+    color: $accent;
+    padding: 1 2 0 2;
+}
+
+.health-row {
+    padding: 0 2;
+}
+
+.ok {
+    color: $success;
+}
+
+.bad {
+    color: $error;
+}
