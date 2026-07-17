@@ -128,6 +128,42 @@ def detect_backend(name: str) -> str | None:
     return None
 
 
+# ── doctor: DB checks (PLAN.md M1 step 4: exists, schema version, WAL,
+#    write probe) ───────────────────────────────────────────
+def doctor_db() -> int:
+    """Returns the number of problems found (0 = DB OK)."""
+    problems = 0
+    db_path = os.path.join(BASE, "zilla.db")
+    if not os.path.exists(db_path):
+        info("zilla.db not created yet (first bot start will create it)")
+        return 0
+
+    try:
+        sys.path.insert(0, BASE)
+        from zilla.store import get_store
+        db = get_store(db_path)
+
+        ver = db.schema_version()
+        if ver is None:
+            bad("zilla.db schema_version missing"); problems += 1
+        else:
+            ok(f"zilla.db schema version {ver}")
+
+        if db.is_wal_mode():
+            ok("zilla.db journal_mode = WAL")
+        else:
+            bad("zilla.db not in WAL mode"); problems += 1
+
+        if db.write_probe():
+            ok("zilla.db write probe succeeded")
+        else:
+            bad("zilla.db write probe failed"); problems += 1
+    except Exception as e:
+        bad(f"zilla.db check failed: {e}"); problems += 1
+
+    return problems
+
+
 # ── doctor (self-check) ───────────────────────────────────
 def doctor() -> int:
     hr(); print("  Zilla — environment check"); hr()
@@ -171,6 +207,8 @@ def doctor() -> int:
         ok(f"{cli} CLI found on PATH")
     else:
         bad(f"{cli} CLI not found — install it and run `{cli}` once to log in"); problems += 1
+
+    problems += doctor_db()
 
     hr()
     if problems == 0:
