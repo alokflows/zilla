@@ -160,8 +160,16 @@ demand) · recall buffer = `Journal/` (distilled nightly into Wiki, §5.M3).
 
 ## 4. Harness injection spec (exact contract)
 
-`harness.py` appends one block to every turn's instructions, built fresh each
-turn (cheap: file reads + one index scan):
+**Scope guard (privacy-critical):** memory is the OWNER's. The block below is
+injected **only for turns initiated by the owner** (including owner-created
+schedules, heartbeat, distillation). Turns from any other principal
+(admin/limited/approval-mode users) get NO memory injection, no memory
+protocol, and no journal instruction — their prompts must never contain the
+owner's MEMORY.md, wiki index, or skills index. Enforced deterministically in
+`harness.py` by uid, with a test proving a non-owner turn contains none of it.
+
+`harness.py` appends one block to every owner turn's instructions, built fresh
+each turn (cheap: file reads + one index scan):
 
 ```
 ## Your memory (persistent, yours to maintain)
@@ -198,14 +206,25 @@ fill it in."* The line disappears once the file diverges from the template.
    typed accessors: `get_setting/set_setting`, `sessions_*`, `schedules_*`,
    `users_*`, `usage_bump`, `fts_*`, `skill_approval_*`).
 2. Swap persistence in `sessions.py`, `schedules.py`, `users.py`,
-   `config.py` settings KV. Public APIs unchanged; `fsync`-on-event-loop
-   finding dies here (all I/O via `to_thread`).
+   `config.py` settings KV. Public APIs unchanged. Threading rule (realistic,
+   not dogmatic): **reads** may run inline on the event loop (WAL reads are
+   microseconds; existing call sites like `get_setting`/`get_backend` are
+   sync and stay sync); **writes** go through `asyncio.to_thread` from async
+   contexts — this kills the `fsync`-on-event-loop finding without a
+   whole-codebase call-site refactor.
 3. First-start migration from JSON + rename to `*.migrated`.
 4. `install.py --doctor`: add DB checks (exists, schema version, WAL, write
    probe).
+5. **Audit-debt burn-down** (open findings from `docs/dev/STATUS.md`, fixed
+   here while these modules are open anyway): `compute_next_run` becomes
+   timezone-aware via `zoneinfo` (local tz; DST-transition tests both
+   directions); `_active_cancel` keyed by `(chat_id, uid)` instead of
+   `chat_id` (kills cross-user cancel in groups); media ingest size cap
+   (setting `max_media_mb`, default 50, oversize → one friendly refusal).
    **Accept:** full suite green; migration round-trip test (seed JSON →
    migrate → API-identical reads); concurrent-mutation test (two tasks
-   mutate sessions 100×, no loss); doctor reports DB OK.
+   mutate sessions 100×, no loss); DST tests pass; cancel-keying and
+   media-cap tests pass; doctor reports DB OK.
 
 ### M2 — Memory layout + injection
 1. `memory.py`: ensure-tree-on-start with seeded templates (MEMORY.md
@@ -228,7 +247,10 @@ fill it in."* The line disappears once the file diverges from the template.
    right Wiki pages (create pages as needed), update MEMORY.md if a
    standing fact changed, then rewrite the journal entry down to its
    essentials. Reply HEARTBEAT_OK when done."* Created idempotently at
-   start; pausable in `/settings`, not deletable.
+   start; pausable in `/settings`, not deletable. Runs in a **throwaway
+   conversation** (fresh conv id, discarded after the run — never advances
+   any session's conv id); raw pre-distillation journal text stays
+   recoverable via memory git history (M4).
    **Accept:** index build/invalidation tests; memsearch finds a planted
    fact; distillation schedule exists exactly once after double restart.
 
@@ -238,8 +260,9 @@ fill it in."* The line disappears once the file diverges from the template.
    Failures log and never break replies. `git init` on first start if absent
    (author "Zilla <zilla@local>").
 2. **Quiet-run mechanism** in the scheduled-run delivery path: if the
-   response, stripped, equals `HEARTBEAT_OK` → deliver nothing, log only.
-   (Used by distillation now, heartbeat in Phase H.)
+   stripped response **is or ends with** a line equal to `HEARTBEAT_OK`
+   (case-insensitive) → deliver nothing, log only. (Exact-match-only is too
+   brittle — models pad. Used by distillation now, heartbeat in Phase H.)
 3. `/memory` command (owner): shows MEMORY.md, today's journal, last 5
    memory commits. Read-only.
    **Accept:** autocommit fires on change and not on no-change; git failure
@@ -275,8 +298,11 @@ Seeded template:
    only template headers → **skip entirely, zero AI calls**.
 2. Beat prompt: *"It is {now} ({tz}). Last beat: {last}. Read HEARTBEAT.md.
    Do anything due; update the file (stamps, checkoffs, prune stale items).
-   If nothing needs the owner, reply HEARTBEAT_OK."* Runs under the owner's
-   uid lock like any scheduled job; quiet-run suppresses OK beats; memory
+   If nothing needs the owner, reply HEARTBEAT_OK."* Beats **try-acquire**
+   the owner's uid lock and skip the beat if it's busy — proactive work
+   never queues behind (or delays) a live owner conversation; a skipped
+   beat just waits for the next tick. Beats run in throwaway conversations
+   (same rule as distillation). Quiet-run suppresses OK beats; memory
    autocommit picks up file edits.
 3. Harness gains one protocol line: *"When the owner asks you to keep an
    eye on / remind / follow up on something recurring, add it to
@@ -330,7 +356,10 @@ Seeded template:
 
 ### R2 — Fallback chain
 1. Setting `backend_chain` (ordered, default = active backend + others
-   detected on PATH). On `detect_limit`, hard error, or empty-after-retry:
+   detected on PATH). **A chain entry is eligible only if its last health
+   probe (H2) showed a fresh login** — a binary on PATH that isn't logged
+   in would burn the retry or hang on a login prompt; skip it and log why.
+   On `detect_limit`, hard error, or empty-after-retry:
    move to next chain entry, fresh conversation (I-CONV), prepend one
    primer line ("Context: the owner was just asking about: <last user
    message>"), deliver ONE clean answer with footnote `↷ answered via
@@ -365,13 +394,18 @@ Seeded template:
    (deterministic), strips it from the reply, renders ✅/❌ buttons. ✅ →
    next turn instructs the agent to write the skill files. ❌ → dropped,
    never re-proposed for that session-task.
-3. **Code approval gate (P5):** any skill dir containing non-`.md` files is
-   executable only after owner approval. Approval stores
-   `sha256(sorted script bytes)` in `skill_approvals`. Harness marks
-   unapproved/hash-changed skills `[code not approved — describe, don't
-   run]`, and the run prompt lists approved slugs. Hash mismatch ⇒
-   auto-revoke + one-line owner notice. Approval UI: `/skills` menu
-   (list, view, approve, disable).
+3. **Code approval gate — honest mechanics:** the CLI executes tools with
+   full host privileges and no in-CLI sandbox exists (AI_CONTEXT trust
+   model), so Zilla cannot *physically* stop a running agent from executing
+   a file. What Zilla CAN deterministically control is **what it
+   advertises**: skills whose dir contains non-`.md` files are simply **not
+   injected into the skill index at all** until approved — the agent is
+   never told they exist. Approval stores `sha256(sorted script bytes)` in
+   `skill_approvals`; hash mismatch ⇒ auto-revoke (drops from index) + a
+   one-line owner notice. Approved skills are listed in the index normally.
+   This is real enforcement of visibility, honestly documented as such —
+   not a pretend sandbox. Approval UI: `/skills` menu (list, view, approve,
+   disable).
    **Accept:** marker detect/strip tests; approval hash lifecycle tests
    (approve → run allowed; edit script → revoked); /skills flows; live
    smoke: solve task → proposal → ✅ → skill file exists, indexed,
@@ -402,9 +436,17 @@ Seeded template:
 2. Conversational onboarding: no `.env` → Chat opens with setup dialogue
    ("connect Telegram?" → token prompt → writes config → doctor).
    Telegram becomes optional: engine runs with zero connectors + TUI.
-3. TUI and bot share one process (TUI launches/attaches: if `zilla.pid`
-   live, connect via the existing WebBridge shims; else run engine
-   in-process). Single-instance lock respected.
+3. **Process model (specified, not hand-waved):** the engine process
+   exposes a local IPC endpoint — a Unix domain socket
+   (`AGI-Brain/zilla.sock`, mode 600) speaking newline-delimited JSON:
+   client sends `{op: "message"|"cancel"|"status"|..., ...}`, server
+   streams the §2 events serialized as JSON lines. `zilla` (TUI) is a thin
+   client: if the socket answers, attach to the running daemon/service;
+   otherwise start the engine in-process (single-instance lock still
+   guarantees exactly one engine). The existing WebBridge shims are NOT
+   the transport — they're status-only and stay untouched. Windows keeps
+   in-process mode only (no socket) — acceptable, Linux is the runtime
+   target.
    **Accept:** each screen has a snapshot/behavior test (Textual pilot);
    live smoke on Mac + Linux: chat round-trip with live progress, cancel,
    settings change reflected in Telegram side too.
@@ -444,7 +486,7 @@ Seeded template:
 - **Secrets:** existing redaction filter covers new logs; memory protocol
   forbids credentials in Markdown; relay answers keep their wipe behavior.
 
-## 12. Risk register (top 5, with mitigations already in the plan)
+## 12. Risk register (with mitigations already in the plan)
 
 1. **G1 refactor breaks invariants** → isolated phase, behavior-freeze
    smoke checklist, small commits.
@@ -455,7 +497,13 @@ Seeded template:
 4. **Agent bloats MEMORY.md / wiki** → hard injection caps + visible
    truncation marker + distillation job actively compacts.
 5. **Heartbeat spam** → quiet-run default, per-kind alert cooldowns,
-   deterministic empty-file skip.
+   deterministic empty-file skip, try-acquire (never blocks the owner).
+6. **Memory privacy leak to non-owner users** → §4 scope guard: injection
+   is owner-turn-only, enforced by uid with a negative test.
+7. **TUI↔daemon transport under-engineered** → §9 specifies the Unix-socket
+   JSONL protocol up front; WebBridge explicitly ruled out as transport.
+8. **Fallback to present-but-unauthenticated backend** → chain eligibility
+   gated on H2 login-freshness probes.
 
 ## 13. Execution order & progress
 
