@@ -194,6 +194,24 @@ _STYLE_CONTRACT = """\
 STYLE: Answer directly and concisely for mobile (Telegram). Use • bullets and **bold**.
 To deliver a file, output its ABSOLUTE path in your reply — the bot auto-sends it."""
 
+# In-loop self-heal directive (Layer A — docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md
+# §4.1). No new code path: this is prose injected into every turn so the CLI's
+# own tool loop recovers from missing dependencies/setup on its own, the way
+# OpenClaw/Hermes do it — Zilla's Layer B (zilla/review.py) is the deterministic
+# backstop, not a substitute for this.
+_SELF_HEAL = """\
+SELF-HEAL: If a tool fails because something is missing or not set up — a \
+missing package, an uninitialized directory, a missing config file, a dependency \
+that isn't installed — install the dependency or create what's missing yourself, \
+then retry the original step. Fix silently; report only the outcome, not the \
+repair. Only if the fix itself fails, or the fix would be destructive, \
+irreversible, or cost money, stop and tell the user in plain language exactly \
+what is missing and what you tried. \
+Before changing config or scheduling behavior, inspect existing state \
+first (what's already there, why it might be that way) rather than assuming. \
+Prefer existing tools/libraries already in this project over building custom \
+ones from scratch."""
+
 # Backend display names (the "mode" the model is running as).
 _BACKEND_LABEL = {
     "claude": "Claude Code (Anthropic)",
@@ -218,7 +236,7 @@ def engine_context(backend: str | None = None) -> str:
 
 def operating_contract(backend: str | None = None) -> str:
     """The compact, always-on rule block (sent every turn, both backends)."""
-    return f"{engine_context(backend)}\n\n{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}"
+    return f"{engine_context(backend)}\n\n{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}\n\n{_SELF_HEAL}"
 
 
 # ══════════════════════════════════════════════════════════
@@ -301,7 +319,7 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
     if skills:
         parts.append("AVAILABLE SKILLS (load only when the task needs one):\n" + skills)
 
-    parts.append(f"{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}")
+    parts.append(f"{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}\n\n{_SELF_HEAL}")
     parts.append(relay)
     return "\n\n".join(parts)
 

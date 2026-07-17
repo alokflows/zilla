@@ -543,21 +543,23 @@ everything comes back by itself.
 > LIGHT (owner decree 2026-07-17): current state, one line per session,
 > only notes a future session actually needs. History lives in git log.
 
-**Current phase:** Phase 1 core extraction is **DONE** — turn pipeline,
-scheduler runtime, credential/OTP bridge, Approval mode, and the
-`health_report()` snapshot all live in `zilla/core.py` (CORE_API steps 2–6);
-`bot.py` is a Telegram renderer. **NEXT SESSION STARTS AT: P1.5
-orchestration router** — implement per the checklist item below +
-`docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` (the `review()` seam design,
-harness self-heal clause, and Progress-into-⏳-bubble are already specced
-there; start from its "What to build" section).
-**Working branch:** `claude/zilla-harness-review-0v96bs`
-**Tests:** 204+16+102+57 = **379 green** — `.venv/bin/python test_fixes.py /
-test_interactive.py / test_core.py / test_schedules_seam.py` (the last is a
-frozen acceptance spec — never edit it) + `import bot; import zilla.core`.
+**Current phase:** Phase 1 + P1.5 + P2 (entrypoint, TUI) are **DONE and
+merged** — GOD MODE round 1 (2026-07-17 pm) landed the P1.5 router,
+`zilla/cli.py` + `doctor`/`security`/`configmenu`, and the Textual TUI
+(`zilla/tui/`) in parallel worktrees, merged serially with the full test
+gate. **NEXT SESSION STARTS AT: P2 conversational onboarding +
+Telegram-as-connector**, plus the FOR ALOK live smokes listed in the
+checklist (P1.5 smoke, TUI real-terminal launch, Approval mode taps).
+**Working branch (source of truth):** `claude/zilla-harness-review-0v96bs`
+**Tests:** 204+16+112+57 core + 71 review + 17 tui + 69 cli = **546 green**
+— `.venv/bin/python test_fixes.py / test_interactive.py / test_core.py /
+test_schedules_seam.py / test_review.py / test_tui.py / test_zilla_cli.py`
+(test_schedules_seam.py is a frozen acceptance spec — never edit it) +
+`import bot; import zilla.core; import zilla.cli; import zilla.tui.app`.
 **Bot:** live on the owner's MacBook (@Mangomangos_bot; `.env` exists here,
-git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
-`.venv/bin/python bot.py`, confirm "Application started" in its log.
+git-ignored). After changing `bot.py`: `zilla stop` + `zilla start` (or
+`.venv/bin/python -m zilla.cli stop/start`), confirm "Application started"
+in its log.
 
 ### Checklist
 
@@ -566,7 +568,7 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 - [x] **P1** Core extraction: design core API (owner-approved) → `docs/dev/CORE_API.md`
 - [x] **P1** Move modules into `zilla/` package (tests green)
 - [x] **P1** Extract turn pipeline / scheduler / bridge / approvals / health-stub from `bot.py` (FOR ALOK: live Telegram smoke of Approval mode — have a limited user send a request, tap ✅ and ❌ once each)
-- [ ] **P1.5** Orchestration router (OWNER DECREE 2026-07-17): a cheap first pass on EVERY incoming message decides complexity + intent BEFORE the heavy CLI turn — (a) small-talk/simple → answer fast (small model or short-circuit), complex → full CLI agent turn; (b) if the user is *sharing* something (a fact about their life, a preference, something they did) → immediately append it to the wiki journal (`wiki/journal/YYYY-MM-DD.md`), structure matures over time via heartbeat distillation (steal-list #12/#13). This also attacks LATENCY, the owner's other complaint: today every "hi" pays full CLI cold-start (~10s spin-up + model time). Also add an instant ack reaction (👀 or typing starts <1s) so the bot never feels dead. Design this seam into CORE_API alongside the bridge/approvals/health extraction. (c) EXPANDED (owner decree 2026-07-17, the "effortless" mandate): an orchestrator RESPONSE-REVIEW gate — every outbound response is inspected BEFORE delivery to the user (deterministic checks first: empty/error-garbage/limit; then bounded self-heal — on a tool/dependency failure, fix it (e.g. install the missing converter) and retry ONCE, never deliver error garbage, never loop silently). Owner's reference story: OpenClaw hit a missing OGG converter, installed it, transcribed, answered — zero errors shown. Spec: `docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` (deep-dive comparison of OpenClaw/Hermes source vs Zilla's pipeline).
+- [x] **P1.5** Orchestration router (OWNER DECREE 2026-07-17) — MERGED. `zilla/review.py`: `review()` (empty → limit → error-garbage/exit_reason → fabrication-retry-once → deliver, hooked into `handle_message` right before the Response yield and into `_execute_message_schedule`) + `classify_route()` (conservative smalltalk whitelist, explicit share-verb prefixes). `core.handle_message` triage: smalltalk → one-shot `claude -p --model haiku` call with a minimal persona+style preamble (live-verified ~4-6s vs 17s–2m34s full turn), reviewed before delivery, transparent fallback to the full path on stop/unreachable; share → verbatim timestamped append to `WIKI_JOURNAL_DIR/YYYY-MM-DD.md` (new `WIKI_DIR`/`WIKI_JOURNAL_DIR` config knobs, `.env`-overridable); every route decision logged to `trust_log.jsonl`. `harness.py`: `_SELF_HEAL` directive in every turn — `skip_permissions` untouched, still role-derived only. `cli_engine.py`: steal #36. `bot.py`: instant 👀 reaction ack + Progress→⏳-bubble (throttled ~3s edits). FOR ALOK: live Telegram smoke — say "hi" (fast path + 👀), "remember I like mango lassi" (journal), one heavy task (progress bubble).
 - [x] **P2** `zilla` entrypoint + `config`/`doctor`/`start`/`stop`/`status`/`logs` — `zilla/cli.py` (+`doctor.py`, `security.py`, `configmenu.py`, `pyproject.toml`); `doctor --security --fix` remediates perms; `start`/`status` proven live (restarted the real bot). NOT yet verified: `pip install -e .` data-file packaging (bot_instructions.md), real autostart toggle.
 - [x] **P2** Full-screen TUI (chat + settings + skills + health; ASCII logo home + prompt box) — `zilla/tui/`, `python -m zilla.tui`; Pilot-tested headless (FOR ALOK: launch it once in a real terminal). TUI runs standalone with `schedules=None` (no double-fire); Telegram-as-connector unification is the later P2 step.
 - [ ] **P2** Conversational onboarding + Telegram-as-connector
@@ -596,6 +598,7 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 | 2026-07-17 | README rewritten to the full vision (effortless orchestration, terminal-first, assisted re-login) and pushed to `main` so the GitHub front page shows it. Assisted re-login decree written into Phase 7 step 3. Session ended deliberately before P1.5 (owner: fresh session next). |
 | 2026-07-17 pm | GOD MODE round 1: TUI landed (`zilla/tui/`, Textual, +17 tests = 396 green, no existing files touched; needs a real-terminal launch by owner). P1.5 router + `zilla` CLI entrypoint executors running in parallel worktrees. Owner Q&A: OAuth≠replacement for CLI (CLI login IS OAuth; Hermes OAuth = their hosted paid inference) — stay the course, replica-of-Hermes rejected, steal-list stands. |
 | 2026-07-17 pm | `zilla` CLI landed (+69 tests = 465 green). Found the bot DEAD since 08:22 (httpx ConnectError killed PTB, no auto-restart — P7 evidence); restarted live via `zilla start` ✅. config.py gained per-backend model helpers (`get/set_model_for`, `model_catalog_for`). |
+| 2026-07-17 pm | P1.5 router merged (built in parallel worktree): `zilla/review.py` gate + triage, harness `_SELF_HEAL`, smalltalk fast path (`claude --model haiku`), share→wiki journal, steal #36, 👀 ack + Progress→⏳-bubble. Orchestrator patched `_SELF_HEAL` post-merge to restore the spec's destructive/irreversible/costs-money stop-condition. Bot restarted on merged code. Awaiting owner live smoke. |
 
 ### Notes (only what a future session needs)
 

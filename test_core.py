@@ -44,6 +44,9 @@ with open(_fake_agy, "w", encoding="utf-8") as f:
     json.dump({"model": "Gemini 3.1 Pro (High)"}, f)
 os.environ["AGY_SETTINGS_FILE"] = _fake_agy
 os.environ["BACKEND"] = "agy"
+# P1.5 'share' route writes into the wiki journal — point it at the same
+# throwaway tmpdir so a test run never touches the real ~/AGI-Brain.
+os.environ["WIKI_DIR"] = os.path.join(_tmpdir, "wiki")
 
 import zilla.config as config  # noqa: E402
 config.SETTINGS_FILE = os.path.join(_tmpdir, "bot_settings.json")
@@ -118,7 +121,9 @@ def test_event_sequence():
 
     async def run():
         with _patched(fake_run):
-            return await _collect(core, OWNER, "hi there", auto_title=True)
+            # NOT "hi there" — P1.5 triage would fast-path pure smalltalk
+            # before this ever reaches the (mocked) full pipeline under test.
+            return await _collect(core, OWNER, "read the report please", auto_title=True)
 
     events = asyncio.run(run())
     responses = [e for e in events if isinstance(e, Response)]
@@ -774,6 +779,97 @@ def test_approval_unknown_id_noop():
     check("pending() still empty", core.approvals.pending() == [])
 
 
+# ── 20. P1.5 triage — share route: zero-model journal append ──
+
+def test_triage_share_route_journals_and_zero_model_calls():
+    print("\n[20] Triage — 'share' route journals verbatim + acks, no CLI call")
+    core = _fresh_core("triage_share")
+    called = {"n": 0}
+
+    async def fake_run(prompt, conv_id, progress_callback=None,
+                       cancel_event=None, skip_permissions=False):
+        called["n"] += 1
+        return "SHOULD NOT BE CALLED", None
+
+    async def run():
+        with _patched(fake_run):
+            return await _collect(core, OWNER, "remember the wifi password is hunter2")
+
+    events = asyncio.run(run())
+    check("zero CLI invocations", called["n"] == 0)
+    responses = [e for e in events if isinstance(e, Response)]
+    check("exactly one Response", len(responses) == 1, f"{events}")
+    check("ack text", responses and responses[0].text == "📝 Noted.",
+          responses[0].text if responses else None)
+
+    journal_path = os.path.join(config.WIKI_JOURNAL_DIR,
+                                time.strftime("%Y-%m-%d.md"))
+    check("journal file created", os.path.isfile(journal_path), journal_path)
+    with open(journal_path, encoding="utf-8") as f:
+        content = f.read()
+    check("message appended verbatim", "remember the wifi password is hunter2" in content,
+          content)
+
+
+# ── 21. P1.5 triage — smalltalk fast path (mocked fast-claude) ──
+
+def test_triage_smalltalk_fast_path():
+    print("\n[21] Triage — 'smalltalk' route uses the fast path, not the full pipeline")
+    core = _fresh_core("triage_fast")
+    called = {"n": 0}
+
+    async def fake_run(prompt, conv_id, progress_callback=None,
+                       cancel_event=None, skip_permissions=False):
+        called["n"] += 1
+        return "SHOULD NOT BE CALLED", None
+
+    orig_fast = zcore._run_fast_claude
+    zcore._run_fast_claude = lambda prompt: "Hey! 👋"
+    try:
+        async def run():
+            with _patched(fake_run):
+                return await _collect(core, OWNER, "hey there")
+        events = asyncio.run(run())
+    finally:
+        zcore._run_fast_claude = orig_fast
+
+    check("full pipeline NOT invoked", called["n"] == 0)
+    responses = [e for e in events if isinstance(e, Response)]
+    check("exactly one Response", len(responses) == 1, f"{events}")
+    check("fast-path text delivered", responses and responses[0].text == "Hey! 👋",
+          responses[0].text if responses else None)
+
+
+# ── 22. P1.5 triage — smalltalk fast path falls back transparently ──
+
+def test_triage_smalltalk_fallback_to_full_path():
+    print("\n[22] Triage — smalltalk falls back to the full path when fast-claude fails")
+    core = _fresh_core("triage_fallback")
+    called = {"n": 0}
+
+    async def fake_run(prompt, conv_id, progress_callback=None,
+                       cancel_event=None, skip_permissions=False):
+        called["n"] += 1
+        return "full pipeline answered", "conv-fallback-1"
+
+    # Unreachable: _run_fast_claude returns None.
+    orig_fast = zcore._run_fast_claude
+    zcore._run_fast_claude = lambda prompt: None
+    try:
+        async def run():
+            with _patched(fake_run):
+                return await _collect(core, OWNER, "thanks")
+        events = asyncio.run(run())
+    finally:
+        zcore._run_fast_claude = orig_fast
+
+    check("fell back to the full pipeline", called["n"] == 1)
+    responses = [e for e in events if isinstance(e, Response)]
+    check("full-pipeline response delivered",
+          responses and responses[0].text == "full pipeline answered",
+          responses[0].text if responses else None)
+
+
 def main():
     tests = [
         test_event_sequence,
@@ -798,6 +894,9 @@ def main():
         test_approval_deny_clears,
         test_approval_shares_per_user_lock,
         test_approval_unknown_id_noop,
+        test_triage_share_route_journals_and_zero_model_calls,
+        test_triage_smalltalk_fast_path,
+        test_triage_smalltalk_fallback_to_full_path,
     ]
     print("Running zilla.core turn-pipeline tests...\n")
     for t in tests:

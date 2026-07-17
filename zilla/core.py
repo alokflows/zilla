@@ -44,13 +44,15 @@ from dataclasses import dataclass, field
 
 import zilla.interactive as interactive
 from zilla.backends import claude_identity
-from zilla.cli_engine import run_cli_async, get_latest_step, detect_limit
+from zilla.cli_engine import run_cli_async, get_latest_step
 from zilla.config import (
     get_backend, get_model, get_setting,
     agy_reachable, agy_models_live, BRAIN_DIR, HOME_DIR,
+    WIKI_JOURNAL_DIR,
 )
 from zilla.formatter import detect_file_paths
 from zilla.harness import log_event
+from zilla.review import review, classify_route
 from zilla.schedules import resolve_session_mode, backend_pin_mismatch
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,75 @@ BRIDGE_PENDING_TTL = 900.0
 # store unbounded. Same values/semantics as bot.py's old _APPROVAL_TTL/_MAX.
 APPROVAL_TTL = 3600.0
 APPROVAL_MAX = 50
+
+
+# ══════════════════════════════════════════════════════════
+#  P1.5 TRIAGE ROUTER — deterministic, zero-model-call classification
+#  BEFORE the heavy CLI turn (HANDOFF.md P1.5;
+#  docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md §4.3). classify_route()
+#  itself is pure (zilla/review.py); the two helpers below are the
+#  actual route ACTIONS, called from handle_message.
+# ══════════════════════════════════════════════════════════
+
+# Cheapest working Claude CLI model — live-verified (docs/dev/PHASE0_FINDINGS.md):
+# `claude -p ... --model haiku` resolves to claude-haiku-4-5 and returns clean
+# JSON in ~4s, dramatically faster than a full CLI turn. Fixed, not config-
+# driven: the fast path's whole point is a cheap, predictable turn — if the
+# owner wants a different model here later this becomes a config knob then.
+_FAST_MODEL = "haiku"
+
+# Minimal preamble: persona + style ONLY, deliberately NOT the full onboarding
+# (bot_instructions.md + skills + trust contract) smalltalk doesn't need any
+# of that, and backends.run_claude() can't be reused here because it always
+# forces harness.wrap_prompt's full onboarding when there's no conversation_id.
+_FAST_PREAMBLE = (
+    "You are Zilla, a terse personal assistant reachable over Telegram. "
+    "This message is pure small talk (a greeting/thanks/acknowledgment) — "
+    "reply in ONE short, warm sentence. No bullets, no lists, no follow-up "
+    "question."
+)
+
+
+def _run_fast_claude(prompt: str) -> str | None:
+    """Blocking (run via asyncio.to_thread). A dedicated, lightweight one-shot
+    Claude Code call for the smalltalk fast path — no --resume (always a fresh
+    turn; smalltalk carries no state worth keeping), pinned to _FAST_MODEL.
+    Returns the response text, or None if Claude Code could not be reached at
+    all (spawn failure, timeout, non-zero exit with no output) — the caller
+    falls back to the full path transparently on None."""
+    import subprocess
+    from zilla.config import CLAUDE_PATH, CLI_WORKING_DIR
+    full_prompt = f"{_FAST_PREAMBLE}\n\nUser: {prompt}"
+    cmd = [CLAUDE_PATH, "-p", full_prompt, "--output-format", "json", "--model", _FAST_MODEL]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=CLI_WORKING_DIR, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=25,
+        )
+    except Exception as e:
+        logger.warning(f"[TRIAGE] fast-path claude unreachable: {e}")
+        return None
+    if proc.returncode != 0 and not (proc.stdout or "").strip():
+        logger.warning(f"[TRIAGE] fast-path claude exit {proc.returncode}: "
+                       f"{(proc.stderr or '')[:200]}")
+        return None
+    from zilla.backends import _parse_claude_json
+    text, _sid = _parse_claude_json(proc.stdout, None)
+    return text
+
+
+def _append_to_journal(text: str) -> str:
+    """Zero-model-call 'share' route: append the message verbatim, timestamped,
+    to today's wiki journal file. Path comes from config ONLY
+    (zilla.config.WIKI_JOURNAL_DIR) — no hardcoded path here. Returns the
+    one-line ack to show the user."""
+    import datetime
+    now = datetime.datetime.now()
+    os.makedirs(WIKI_JOURNAL_DIR, exist_ok=True)
+    path = os.path.join(WIKI_JOURNAL_DIR, now.strftime("%Y-%m-%d.md"))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"- [{now.strftime('%H:%M')}] {text}\n")
+    return "📝 Noted."
 
 
 # ══════════════════════════════════════════════════════════
@@ -541,6 +612,39 @@ class ZillaCore:
         prompts). Owner-approved Approval-mode runs pass True explicitly (the
         owner already vetted the whole request).
         """
+        # ── P1.5 triage: deterministic, zero-model-call route decision BEFORE
+        # the heavy CLI turn / lock (HANDOFF.md P1.5). 'full' is the safe
+        # default and falls straight through to the unchanged pipeline below.
+        route = classify_route(text)
+
+        if route == "share":
+            ack = _append_to_journal(text)
+            log_event("route", route="share", user=user_id)
+            yield Response(text=ack, files=(),
+                           meta={"session": None, "conv_id": None, "canceled": False})
+            return
+
+        if route == "smalltalk":
+            fast_text = await asyncio.to_thread(_run_fast_claude, text)
+            if fast_text is not None:
+                result = review(text, fast_text)
+                if result.verdict != "stop":
+                    log_event("route", route="smalltalk", user=user_id, verdict=result.verdict)
+                    yield Response(
+                        text=fast_text,
+                        files=tuple(detect_file_paths(fast_text or "")),
+                        meta={"session": None, "conv_id": None, "canceled": False},
+                    )
+                    return
+                log_event("route", route="smalltalk_reviewed_out", user=user_id,
+                          reason=result.reason)
+            else:
+                log_event("route", route="smalltalk_unreachable", user=user_id)
+            # Fast path failed review or Claude was unreachable — fall back to
+            # the full path transparently (route falls through below).
+
+        log_event("route", route="full", user=user_id)
+
         if skip_permissions is None:
             skip_permissions = self.auth.can(user_id, "admin")
         key = user_id if chat_key is None else chat_key
@@ -610,9 +714,23 @@ class ZillaCore:
 
             # Lock released — deliver outside it (matches the old bot.py shape:
             # send_response ran after _run_cli_turn returned).
+            #
+            # Outbound gate (Layer B — zilla/review.py). Only 'stop' changes
+            # what ships: the fabrication retry already happened inline inside
+            # cli_engine._run_blocking, so 'retry' here means that retry still
+            # didn't resolve it — ship the (already-retried) text as-is rather
+            # than looping again. A user-canceled turn's own "🛑 Canceled…"
+            # text passes review() untouched (not empty, not a fail-prefix).
+            final_text = response
+            if not cancel_event.is_set():
+                result = review(text, response)
+                if result.verdict == "stop":
+                    final_text = result.user_note or response
+                log_event("review", verdict=result.verdict, reason=result.reason, user=user_id)
+
             yield Response(
-                text=response,
-                files=tuple(detect_file_paths(response or "")),
+                text=final_text,
+                files=tuple(detect_file_paths(final_text or "")),
                 meta={"session": sname, "conv_id": final_conv,
                       "canceled": cancel_event.is_set()},
             )
@@ -700,9 +818,6 @@ class ZillaCore:
 
     _SCHED_TICK = 20          # seconds between due-checks
 
-    # Response shapes that mean "the run did not really succeed".
-    _SCHED_FAIL_PREFIXES = ("Error:", "Claude error:", "⏱️", "⚠️ Stopped")
-
     def _sname_for_mode(self, uid: int, mode: str) -> str | None:
         """Map a resolved session mode (see zilla.schedules.resolve_session_mode)
         to the session name to run under. 'isolated' -> None (fresh
@@ -751,14 +866,16 @@ class ZillaCore:
         finally:
             self._scheduled_running.discard(uid)
 
-        # Response-level failure detection (empty / rate-limited / error text).
+        # Response-level failure detection (empty / rate-limited / error text) —
+        # same deterministic gate live chat uses (zilla/review.py). A schedule
+        # treats BOTH 'stop' and 'retry' verdicts as failure (feeding the retry
+        # ladder in mark_failure); live chat's handle_message treats only
+        # 'stop' that way since the fabrication retry already ran inline.
         if ok:
-            if not (response and response.strip()):
-                ok, detail = False, "empty response"
-            elif detect_limit(response):
-                ok, detail = False, f"model limited: {detect_limit(response)}"
-            elif response.lstrip().startswith(self._SCHED_FAIL_PREFIXES):
-                ok, detail = False, response.strip()[:200]
+            result = review(s["prompt"], response)
+            if result.verdict != "deliver":
+                ok = False
+                detail = (result.user_note or result.reason or "failed")[:200]
         return ok, response, detail, {
             "conv_id": conv_id, "session": mode, "pin_mismatch": pin_mismatch,
         }
