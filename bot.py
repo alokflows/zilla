@@ -257,16 +257,29 @@ async def _notify_if_busy(uid: int, update: Update) -> None:
             pass
 
 
+class _ProgressBubble:
+    """Shared, mutable slot between _relay_cli_turn's event-consuming loop and
+    keep_typing's edit loop, so the latest core.Progress text can render into
+    the SAME editable '⏳ Working…' status message (P1.5 deliverable 5) —
+    never a second message. Deliberately just a plain holder, not a queue:
+    keep_typing only ever cares about the latest value."""
+    __slots__ = ("text",)
+
+    def __init__(self):
+        self.text = ""
+
+
 async def _relay_cli_turn(update, uid, chat_id, prompt, *,
-                          auto_title=False, skip_permissions=None) -> str:
+                          auto_title=False, skip_permissions=None,
+                          progress: "_ProgressBubble | None" = None) -> str:
     """Drive one core turn (zilla.core.handle_message) and return the final
     response text. Shared by the text, voice, photo, document and approval
     paths — the Telegram translation of the core's event stream.
 
-    Progress events are consumed silently this seam: the visible ⏳ Working
-    UI stays time-driven (keep_typing, started by each handler), exactly as
-    before the extraction. The Response event's text feeds the existing
-    send_response path in each handler."""
+    progress: optional _ProgressBubble — when given, each Progress event's
+    text is written into it so keep_typing (running concurrently) can render
+    it into the visible ⏳ Working status message. The Response event's text
+    feeds the existing send_response path in each handler."""
     await _notify_if_busy(uid, update)
     response = ""
     # aclosing: if we die mid-stream (Telegram error), close the generator so
@@ -277,6 +290,8 @@ async def _relay_cli_turn(update, uid, chat_id, prompt, *,
         async for event in stream:
             if isinstance(event, zcore.Response):
                 response = event.text
+            elif isinstance(event, zcore.Progress) and progress is not None:
+                progress.text = event.text
     return response
 
 
@@ -300,17 +315,37 @@ def split_message(text: str, max_length: int = TELEGRAM_MAX_LENGTH) -> list[str]
     return chunks
 
 
-async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
+# Minimum gap between two edits driven purely by a Progress-text change (P1.5
+# deliverable 5) — separate from (and shorter than) the unconditional 60s
+# time-driven edit below, so Telegram's edit rate limit is respected even if
+# progress text changes rapidly.
+_PROGRESS_EDIT_MIN_GAP = 3.0
+
+
+async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event,
+                      progress: "_ProgressBubble | None" = None):
     """
     Non-spammy progress indicator.
     - 0–60s: native typing bubble only.
     - 60s: send ONE status message with a Cancel button.
     - Every 60s: EDIT that same message (never spam new messages).
+    - Also, once that message exists: if `progress` carries a new Progress
+      text from the core (e.g. "🌐 Reading web page"), edit it in — never a
+      new message — throttled to _PROGRESS_EDIT_MIN_GAP between edits.
     - On stop: delete the status message silently.
     """
-    start = asyncio.get_event_loop().time()
+    loop = asyncio.get_event_loop()
+    start = loop.time()
     status_msg = None
     last_edit_elapsed = 0.0
+    last_edit_ts = 0.0
+    last_rendered_progress = ""
+
+    def _status_text(elapsed_str: str) -> str:
+        text = f"⏳ Working… {elapsed_str}"
+        if progress is not None and progress.text:
+            text += f"\n{progress.text}"
+        return text
 
     while not stop_event.is_set():
         try:
@@ -318,7 +353,8 @@ async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
         except Exception:
             pass
 
-        elapsed = asyncio.get_event_loop().time() - start
+        now_ts = loop.time()
+        elapsed = now_ts - start
         m, s = divmod(int(elapsed), 60)
         elapsed_str = f"{m}m {s}s" if m else f"{s}s"
 
@@ -326,7 +362,8 @@ async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
             cancel_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🛑 Cancel", callback_data="cancel_active")]
             ])
-            status_text = f"⏳ Working… {elapsed_str}"
+            current_progress = progress.text if progress is not None else ""
+            status_text = _status_text(elapsed_str)
 
             if status_msg is None:
                 try:
@@ -336,19 +373,29 @@ async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
                         reply_markup=cancel_kb,
                     )
                     last_edit_elapsed = elapsed
+                    last_edit_ts = now_ts
+                    last_rendered_progress = current_progress
                 except Exception:
                     pass
-            elif elapsed - last_edit_elapsed >= 60:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=status_msg.message_id,
-                        text=status_text,
-                        reply_markup=cancel_kb,
-                    )
-                    last_edit_elapsed = elapsed
-                except Exception:
-                    pass
+            else:
+                time_edit_due = elapsed - last_edit_elapsed >= 60
+                progress_edit_due = (
+                    current_progress != last_rendered_progress
+                    and now_ts - last_edit_ts >= _PROGRESS_EDIT_MIN_GAP
+                )
+                if time_edit_due or progress_edit_due:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=status_msg.message_id,
+                            text=status_text,
+                            reply_markup=cancel_kb,
+                        )
+                        last_edit_elapsed = elapsed
+                        last_edit_ts = now_ts
+                        last_rendered_progress = current_progress
+                    except Exception:
+                        pass
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=4.0)
@@ -1457,7 +1504,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+    progress = _ProgressBubble()
+    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing, progress))
 
     try:
         filepath = await save_voice(context.bot, update.message.voice)
@@ -1471,7 +1519,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if transcript and not transcript.startswith("["):
             await update.message.reply_text(f'🎤 "{transcript}"')
             response = await _relay_cli_turn(
-                update, uid, chat_id, transcript, auto_title=True)
+                update, uid, chat_id, transcript, auto_title=True, progress=progress)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1519,7 +1567,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     caption = update.message.caption or ""
     stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+    progress = _ProgressBubble()
+    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing, progress))
 
     try:
         filepath = await save_photo(context.bot, update.message.photo)
@@ -1539,7 +1588,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        response = await _relay_cli_turn(update, uid, chat_id, prompt)
+        response = await _relay_cli_turn(update, uid, chat_id, prompt, progress=progress)
         stop_typing.set()
         typing_task.cancel()
         await send_response(update, context, response, uid, chat_id)
@@ -1572,7 +1621,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Caption present — extract text and send to CLI
         stop_typing = asyncio.Event()
-        typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+        progress = _ProgressBubble()
+        typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing, progress))
 
         try:
             extracted = await asyncio.to_thread(extract_text, filepath)
@@ -1590,7 +1640,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Read the file and respond."
                 )
 
-            response = await _relay_cli_turn(update, uid, chat_id, prompt)
+            response = await _relay_cli_turn(update, uid, chat_id, prompt, progress=progress)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1733,9 +1783,26 @@ async def _handle_adduser_flow(update: Update, context: ContextTypes.DEFAULT_TYP
 #  MAIN TEXT HANDLER
 # ══════════════════════════════════════════════════════════
 
+async def _react_seen(bot, chat_id: int, message_id: int) -> None:
+    """Instant 👀 ack (P1.5 deliverable 4) — fired as a background task so it
+    can never delay the handler itself. Best-effort: PTB 22.7 (installed)
+    supports Bot.set_message_reaction, but a private/group chat's own
+    permissions can still refuse it, so any failure is swallowed silently —
+    the bot must never feel dead, but a missing reaction is not an error."""
+    try:
+        await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction="👀")
+    except Exception:
+        pass
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
+
+    # Instant ack — before any lock/busy-check, so the bot never feels dead
+    # even while a previous turn is still holding this user's lock.
+    if update.message is not None:
+        asyncio.create_task(_react_seen(context.bot, chat_id, update.message.message_id))
 
     # Floodguard: drop bursts (runaway script / compromised client). A human
     # never trips 8 msgs / 10s; when tripped, say so at most once per window.
@@ -1826,7 +1893,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 
     stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
+    progress = _ProgressBubble()
+    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing, progress))
 
     # Bind before the try so a BaseException (e.g. asyncio.CancelledError on
     # shutdown, which `except Exception` does NOT catch) can't leave `response`
@@ -1834,7 +1902,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = ""
     try:
         response = await _relay_cli_turn(
-            update, uid, chat_id, user_message, auto_title=True)
+            update, uid, chat_id, user_message, auto_title=True, progress=progress)
     except Exception as e:
         response = _friendly_error(e)
         logger.error(f"Handler error: {e}", exc_info=True)
