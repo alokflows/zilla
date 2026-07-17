@@ -772,7 +772,14 @@ def run_cli(
             response = pty_response
 
         if not response and exit_reason == "normal":
-            response = "No response from CLI. Try rephrasing."
+            # steal #36: prefer whatever real activity we actually captured
+            # (the last tool/progress line seen mid-run) over a fully generic
+            # line — it tells the user something concrete happened even if
+            # the final answer text didn't land.
+            if poller._last_message:
+                response = f"(No final answer captured — last activity: {poller._last_message})"
+            else:
+                response = "No response from CLI. Try rephrasing."
 
         response = sanitize_response(response)
 
