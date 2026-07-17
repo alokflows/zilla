@@ -318,7 +318,12 @@ def stop_bot():
     else:
         subprocess.run(["pkill", "-f", "run_background.py"], check=False)
         subprocess.run(["pkill", "-f", os.path.join(BASE, "bot.py")], check=False)
-        subprocess.run(["systemctl", "--user", "stop", "zilla.service"], check=False)
+        if not IS_MAC:  # check=False still raises FileNotFoundError if the
+            try:        # binary itself is absent — and macOS has no systemctl
+                subprocess.run(["systemctl", "--user", "stop", "zilla.service"],
+                               check=False)
+            except FileNotFoundError:
+                pass
     ok("Zilla stopped.")
 
 
