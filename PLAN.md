@@ -97,7 +97,7 @@ One file next to `settings.json`'s old home. WAL mode,
 ```sql
 CREATE TABLE meta      (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE settings  (key TEXT PRIMARY KEY, value TEXT);           -- KV, replaces settings.json
-CREATE TABLE users     (uid INTEGER PRIMARY KEY,
+CREATE TABLE users     (uid INTEGER PRIMARY KEY, name TEXT,
                         role TEXT NOT NULL CHECK(role IN ('admin','limited')),
                         added_at TEXT, added_by INTEGER);            -- replaces authorized_users.json
 CREATE TABLE denied    (uid INTEGER PRIMARY KEY, denied_at TEXT);    -- replaces denied_users.json;
@@ -115,10 +115,14 @@ CREATE TABLE schedules (id TEXT PRIMARY KEY, uid INTEGER NOT NULL,
                         kind TEXT NOT NULL,          -- once|interval|daily|weekly
                         spec TEXT NOT NULL,          -- JSON, same shape as today
                         title TEXT, prompt TEXT,
-                        session_name TEXT,           -- optional session binding (bot.py reads it)
+                        session_name TEXT,           -- legacy pre-Part-B binding (back-compat read only)
+                        session TEXT,                 -- 'isolated'|'main'|'named:<x>' (resolve_session_mode)
+                        payload_type TEXT DEFAULT 'message',  -- message|system_event|command
+                        backend TEXT, model TEXT,     -- pin (None = any); see backend_pin_mismatch
+                        backend_pin_notified INTEGER DEFAULT 0,  -- one-time pin-drift note, never repeats
                         enabled INTEGER DEFAULT 1,
                         system INTEGER DEFAULT 0,    -- system jobs: undeletable via UI, pausable
-                        next_run TEXT, last_run TEXT,
+                        next_run REAL, last_run REAL, -- epoch seconds (compute_next_run's native unit)
                         fail_count INTEGER DEFAULT 0, created_at TEXT); -- replaces schedules.json
 CREATE TABLE usage     (day TEXT NOT NULL, backend TEXT NOT NULL,
                         turns INTEGER DEFAULT 0, errors INTEGER DEFAULT 0,
@@ -131,6 +135,21 @@ CREATE TABLE skill_approvals (slug TEXT PRIMARY KEY,
 CREATE VIRTUAL TABLE mem_fts USING fts5(path, title, body, tokenize='porter unicode61');
 CREATE TABLE mem_seen  (path TEXT PRIMARY KEY, mtime REAL, size INTEGER);
 ```
+
+**M1 grep-enumeration correction (2026-07-17 night, per the step-2 mandate
+below):** `users.name` and `schedules.session`/`payload_type`/`backend`/
+`model`/`backend_pin_notified` were read/written by live code
+(`zilla/users.py`, `zilla/schedules.py`) but absent from the schema as
+first drafted — added above. Confirmed against source, not just grep:
+`resolve_session_mode()` and `backend_pin_mismatch()` in
+`zilla/schedules.py` depend on all five schedule fields; `add_user()` in
+`zilla/users.py` always writes `name`. Also corrected:
+`schedules.next_run`/`last_run` are epoch-second floats in every real
+write path (`compute_next_run`, `touch_run`, `mark_failure`), not the
+TEXT datetime strings first drafted — now REAL. `schedules.system` and
+`users.added_by` remain in the schema unused by current code (forward-
+looking, harmless). `usage`/`skill_approvals` have no migration source
+data (later phases populate them).
 
 **Threading/locking model (one coherent story — do not improvise another):**
 - Managers (`SessionManager`, `ScheduleManager`, `users`, settings KV) become
