@@ -1,5 +1,20 @@
 # ZILLA — HANDOFF
 
+> **SUPERSEDED PLANNING NOTICE (2026-07-17 night):** the work order is now
+> [`PLAN.md`](PLAN.md) — a from-scratch, adversarially-reviewed blueprint
+> (Fable + owner, 2026-07-17) covering Phases M (SQLite + Markdown memory
+> foundation) → H (heartbeat/health) → R (router/fallback) → S (skills) →
+> G/T (engine facade + terminal app) → V (voice). **Read PLAN.md first, then
+> come back here for status only** — this file no longer carries the plan
+> (§6 below is kept for historical trap/decision context only; do not follow
+> its phase list). PLAN.md was written on a branch that forked BEFORE
+> everything below §"LIVE STATUS BOARD" landed, so its own phase list
+> doesn't know P1.5/TUI/CLI/approvals already shipped — the RECONCILIATION
+> note in the status board maps PLAN.md's phases onto what already exists
+> here. PLAN.md's own architecture decisions (§1-2, especially adopting
+> SQLite) are settled — don't reopen them, including against this file's
+> older "SQLite rejected for now" note below (superseded).
+
 > **If you are an AI session reading this: this document is your complete brief.**
 > Read it fully, then jump to the [LIVE STATUS BOARD](#live-status-board) and
 > continue from the first unchecked item. Do not re-derive anything documented
@@ -230,293 +245,30 @@ every commit.
 
 ---
 
-## 6. THE PLAN
+## 6. THE PLAN — SUPERSEDED, SEE PLAN.md
 
-Phases are dependency-ordered. Do them in order. Each phase lists Goal,
-Steps, and Acceptance criteria — a step is done only when its acceptance
-criteria are verified by actually running things.
+The phase list that used to live here (P0-P10) is retired. **`PLAN.md`
+is the current work order** (Phases M/H/R/S/G/T/V, §5-10 there). What
+remains useful from the old P0-P10 plan — traps found, owner decisions,
+and dead ends — is preserved below as historical record; none of it is a
+todo list anymore.
 
-### PHASE 0 — VERIFY REALITY ON THIS MACHINE (blocks everything)
-
-**Goal:** replace assumptions with the installed truth. No building yet.
-
-Steps:
-1. Capture `agy --help`, `claude --help`, `opencode --help` (and
-   `opencode run --help` or equivalent). Record: model selection flags,
-   print/headless mode, conversation persistence flags, `--add-dir` or
-   workspace flags, output formats, approval/permission flags,
-   `--print-timeout` default.
-2. Test whether agy reads `GEMINI.md` / `AGENTS.md` from its working dir
-   (put a distinctive instruction in one, ask a question, see if it obeys).
-3. Re-test Trap #2 (sandbox): in the most restrictive permission mode each
-   CLI offers, run a headless turn that tries to write a file to a temp
-   dir. Record whether the write happened. SAFE probes only.
-4. Record login state of each CLI, `agy models` output, opencode's model
-   list and how a model is chosen per run.
-5. Run both test suites on macOS; note any platform-specific failures.
-
-**Acceptance:** a findings table committed to `docs/dev/PHASE0_FINDINGS.md`;
-any finding that changes this plan is raised to the owner BEFORE Phase 1.
-
-### PHASE 1 — CORE EXTRACTION (the foundation)
-
-**Goal:** an interface-agnostic core so the TUI and Telegram are both thin
-frontends. The Telegram bot's behavior must not change.
-
-Steps:
-1. Design first (orchestrator): define the core API on paper — roughly:
-   `core.handle_message(user, text, attachments) → stream of (progress |
-   response | ask | files)`, plus session ops, settings ops, schedule ops,
-   approval ops, health ops. Present to the owner before coding.
-2. Create `zilla/` package; move pure modules in unchanged first
-   (`sessions`, `users`, `schedules`, `schedule_parse`, `verify`,
-   `autoharness`, `interactive`, `harness`, `config`, `platform_compat`,
-   `cli_engine`, `backends`, `media`, `formatter`) with import shims so
-   `bot.py` and tests keep passing at every commit.
-3. Extract from `bot.py` into the core, one seam at a time: turn pipeline
-   (locks, approval hold, run, verify, deliver), scheduler runtime, bridge
-   watcher, health. `bot.py` shrinks to Telegram I/O + menus.
-   **Scheduler seam additions** (cheap now, painful later — RESEARCH §7
-   items 2–6): add schema fields `payload_type` (system-event = deliver
-   canned text with ZERO model call / message / command), per-job `session`
-   mode (isolated default / main / named), pinned `backend`+`model` at
-   creation (fallback + one-time owner note if gone at fire time); retry
-   backoff ladder 30s→60s→5m→15m→60m reset-on-success (keep Zilla's
-   still-fires-next-occurrence); atomic `schedules.json` writes; outbound
-   scheduled messages carry their session id so a reply can continue it;
-   a scheduled run may NOT create schedules (recursion guard).
-4. The core exposes the ask/answer bridge as events so ANY frontend
-   (terminal included) can relay OTP/confirm prompts.
-
-**Acceptance:** all 192 tests green plus new tests for the core seams; a
-live Telegram round-trip works unchanged (text, voice, file, schedule,
-approval, cancel); `bot.py` no longer contains engine/scheduler logic.
-
-### PHASE 2 — THE `zilla` APP (entrypoint + TUI)
-
-**Goal:** `zilla` is a real application.
-
-Steps:
-1. `zilla` console entrypoint (installable, e.g. `pipx install .` /
-   `pip install -e .`): subcommands `config`, `doctor`, `start`, `stop`,
-   `status`, `logs`. These wrap what `install.py --doctor`,
-   `start.sh`/`stop.sh`, and the pid/lock files already do — promote, don't
-   duplicate. `install.py` becomes a thin alias or is absorbed.
-   Add `zilla doctor --security` (RESEARCH §5.3): file perms on home/config
-   (600/700), secrets not in argv/logs, no unexpected listening sockets,
-   WebBridge loopback-only, pending-skill gate intact, owner ID set;
-   `--fix` auto-remediates the safe items.
-2. `zilla config`: plain numbered-menu terminal settings editor covering
-   the full settings table in §3. Reads/writes the SAME `.env` +
-   `settings.json` the core uses. Works over SSH.
-3. Bare `zilla`: full-screen TUI (Textual) — chat pane + input bar, driven
-   by the same core API from Phase 1. Must support: chatting (with live
-   progress), answering ask/OTP/confirm prompts inline, a settings screen,
-   a skills list screen, a health screen.
-4. Conversational onboarding in the TUI: first run with no config walks
-   the user through setup; "connect to my Telegram" asks token + owner ID,
-   validates, saves, starts the connector.
-5. Telegram becomes a connector the core starts only when configured.
-
-**Acceptance:** on a machine with zero prior config, `pipx install` →
-`zilla` → onboard → chat with the AI in the terminal → enable Telegram →
-same conversation continues from the phone. Doctor reports environment
-detection results (OS, GUI, CLIs + login, ffmpeg, WebBridge).
-
-### PHASE 3 — NEW HOME LAYOUT
-
-**Goal:** one portable directory that IS the product.
-
-Steps:
-1. New layout (name it `~/Zilla` unless the owner objects):
-   `wiki/  skills/  inbox/  outbox/  logs/  bridge/  config/`.
-   All paths flow from `config.py` only.
-2. Git-init the home on creation; auto-commit wiki/skill changes with
-   simple messages (this is the knowledge safety net).
-3. Migration shim: on startup, if `~/AGI-Brain` exists and the new home
-   doesn't, offer to migrate (move files, keep a symlink or note).
-
-**Acceptance:** fresh install creates the new home; existing install
-migrates cleanly; grep shows no hardcoded `AGI-Brain` outside the shim.
-
-### PHASE 4 — WIKI + FIRST-RUN INTERVIEW
-
-**Goal:** the agent's persistent knowledge, owned by the user.
-
-Steps:
-1. `wiki/` = hierarchical Markdown + YAML frontmatter. The harness injects
-   a one-line-per-page INDEX every turn (mirror `skills_summary()`);
-   bodies are read on demand by the agent's own file tools. No vector DB.
-   Injection char budgets per page (Hermes starting points: ~2,200 chars
-   for durable agent memory, ~1,375 for the user profile) — truncate in
-   context, never on disk. Add `wiki/journal/YYYY-MM-DD.md` daily notes:
-   harness injects today+yesterday; distill-journal-into-pages happens
-   during heartbeats (RESEARCH §7 items 10–14).
-2. Preamble instruction: the agent creates/updates wiki pages autonomously
-   when it learns something durable (people, processes, preferences,
-   domain facts), and consults the index before asking the user something
-   it should already know.
-3. First-run interview: on a brand-new wiki, the agent interviews the
-   owner (who they are, what they do, what they need) and writes
-   `wiki/identity.md` + initial domain pages from the answers. This
-   conversation IS the anti-hardcoding mechanism — no industry vocabulary
-   ships in code.
-
-**Acceptance:** fresh setup → interview happens → identity pages exist →
-a later, separate conversation answers a question using wiki knowledge
-without being told (verified live). Wiki survives switching backends.
-
-### PHASE 5 — SKILLS, 100%
-
-**Goal:** "make that into a skill" works end-to-end, safely.
-
-Steps:
-1. Preamble instruction: when the user asks to make something a skill, the
-   agent authors a `SKILL.md` (+ code files if IT decides code is better —
-   the agent chooses the form) into the active backend's skills dir.
-   Authoring template (Hermes): When to Use / Procedure / Pitfalls /
-   Verification. Autonomous-creation triggers (verbatim from Hermes):
-   after a 5+-tool-call task succeeds; after errors led to a working path;
-   after a user corrects the approach. Frontmatter gains OpenClaw-style
-   gating (`requires.bins/env/config`, `os`) — skills whose gates fail are
-   silently omitted from the index, viewer shows why (pairs with P6).
-2. Code-type skills are written to `skills/pending/` instead — and edits,
-   patches, and deletes of existing code skills are staged the same way
-   (Hermes granularity), not just creation. Zilla (not
-   the model) detects pending skills and raises an approval request —
-   reuse the Approval-mode UI in Telegram AND an equivalent prompt in the
-   TUI. One owner tap moves it live. Instruction-only skills go live
-   immediately. The distinction is determined by Zilla inspecting the
-   skill's files (deterministic), not by asking the model.
-3. Skills viewer: list (name + description + type + status) in both TUI
-   and Telegram menu; per-skill enable/disable/delete.
-4. Failure loop (harness-enforced): a failing skill gets
-   `{code, error, intent}` handed back to the agent, one rewrite, one
-   retry; a second failure stops, explains the bottleneck to the user in
-   ONE plain sentence, and logs the full trace for the owner. Never loop
-   silently.
-
-**Acceptance:** live demo: user says "make that into a skill" → skill
-exists → (if code) owner gets one approval tap → next relevant request
-activates it (verified in the transcript). A deliberately broken skill
-stops after exactly one retry with a plain-language explanation.
-
-### PHASE 6 — ENVIRONMENT DETECTION + ADAPTATION
-
-**Goal:** Zilla knows its machine and adapts silently.
-
-Steps:
-1. Detection module (extend `platform_compat.py`): OS + version,
-   GUI/headless (e.g. DISPLAY/WAYLAND on Linux, always-GUI on macOS),
-   installed CLIs + login state, ffmpeg, WebBridge reachability.
-   Run at startup, cache, expose in `doctor` + health screens.
-2. Adaptation policy: GUI → desktop-control instructions included in the
-   preamble; headless → shell-only phrasing. Windows → stub errors.
-3. Display/audio specifics resolved at runtime, never hardcoded; if a
-   genuine ambiguity needs a user choice, ask ONCE and persist the answer
-   to the wiki.
-
-**Acceptance:** `zilla doctor` prints an accurate environment report on
-macOS; simulated-headless run (unset DISPLAY on Linux CI or a test) flips
-the adaptation; no display/audio identifiers appear hardcoded anywhere.
-
-### PHASE 7 — SILENT SELF-HEALING HEALTH
-
-**Goal:** the 3am problem dies quietly.
-
-Steps:
-1. Background health loop in the core (piggyback on the scheduler tick):
-   periodically check CLI reachability + login (`agy_reachable(force=True)`,
-   `claude_identity()`), disk space, WebBridge (only if web mode =
-   my-browser), Telegram connectivity.
-2. Self-heal what a program can: restart crashed connector, re-create
-   missing dirs, clear stale bridge files, retry transient failures.
-   Log every check + action to `trust_log.jsonl`. NO messages to anyone.
-3. Alert the owner ONLY on human-required conditions (login expired, disk
-   full, token revoked) — one message, plain language, with exact recovery
-   steps (a runbook readable at 3am), and no repeat alert until the
-   condition changes.
-   **ASSISTED RE-LOGIN (owner decree 2026-07-17):** on CLI login expiry
-   (agy, claude, later opencode) the bot must never go stale/dumb. The
-   alert itself carries the login link/URL for that CLI; the owner replies
-   with the token/code **in the same chat**; Zilla feeds it to the CLI's
-   login flow and confirms recovery — the owner never has to touch the
-   machine. Build it on the existing ask/answer bridge (`Ask` kind
-   `password`/`text`, secrets masked + wiped after use — the plumbing
-   already exists and is tested). Deterministic detection first
-   (`agy_reachable()`, `claude_identity()` auth_error), then drive the
-   CLI's own login command; never store the token anywhere.
-4. Usage/quota counters (per backend+model per day, from trust_log) shown
-   on demand in Health screens; anomaly = a one-time owner note, not spam.
-5. **Heartbeat** (OpenClaw semantics, fully specified in RESEARCH §3.1):
-   every 30–60m start a FRESH conversation (never resume the main one —
-   that's what keeps a beat at ~2–5K tokens) whose context is only the
-   heartbeat prompt + `wiki/heartbeat.md` (owner-editable checklist,
-   "small, stable, safe to consider every 30 minutes"). Prompt near-verbatim
-   theirs, incl. "Do not infer or repeat old tasks from prior chats. If
-   nothing needs attention, reply HEARTBEAT_OK." Strip the token; drop
-   replies ≤300 chars. Run deterministic pre-checks FIRST and only wake the
-   agent if they found something (Hermes `wakeAgent:false`). Quota-aware
-   interval: back off when trust_log shows the day running hot. Skip while
-   the user's lock is busy.
-
-**Acceptance:** kill the CLI login (log out) → within one health interval
-the owner gets ONE plain-language alert with recovery steps, and no
-further spam; restore login → a single "recovered" note; routine checks
-produce zero messages.
-
-### PHASE 8 — FALLBACK CHAIN + OPENCODE BACKEND
-
-**Goal:** model access can vanish and the user never sees a hole.
-
-Steps:
-1. `run_opencode()` in `backends.py` honoring the existing backend
-   contract (headless run, model flag, conversation persistence — per
-   Phase 0 findings); register in `cli_engine._run_blocking`; add its
-   models to `config.model_catalog()`.
-2. Fallback policy in `_run_blocking`: if the primary backend's turn ends
-   in error / empty output / `detect_limit()` hit, re-run the SAME turn on
-   the next backend in the owner-configured priority. The user gets one
-   clean answer; the owner gets a log event (and a health note only if it
-   keeps happening). Never fall back on long-but-alive runs.
-3. All backend/model choices live in settings; zero hardcoded model
-   strings outside `config.py` fallback caches.
-
-**Acceptance:** with the primary CLI broken on purpose (logged out or
-renamed), a user message still gets a real answer via the fallback, the
-switch is visible in trust_log, and the user-visible reply contains no
-error garbage. Restore primary → next turn uses it again.
-
-### PHASE 9 — VOICE (offline option)
-
-**Goal:** voice notes work per the owner's privacy choice.
-
-Steps:
-1. Add local Whisper transcription (faster-whisper or whisper.cpp binding;
-   small/base model — must run acceptably on an i5/16GB) alongside the
-   existing Google path in `media.py`.
-2. `voice_mode` setting decides; offline mode must never touch the
-   network; if the chosen engine is unavailable, degrade to the other WITH
-   a one-time owner note.
-
-**Acceptance:** a voice note transcribes correctly in both modes; network
-disabled + offline mode still works.
-
-### PHASE 10 — DEPLOYMENT HARDENING (later, on the client's Ubuntu laptop)
-
-**Goal:** the real security boundary, per Trap #2.
-
-Steps: dedicated non-root `zilla` user; systemd unit with hardening
-(`ProtectSystem=strict`, `ReadWritePaths=` the Zilla home, resource
-limits); autostart; SSH/Tailscale access for the owner; deployment runbook
-in `docs/`. Never run the agent as root — elevation is for building the
-cage, not for the agent.
-
-**Acceptance:** documented install on a fresh Ubuntu machine; the agent
-cannot write outside its allowed paths (verified by probe); reboot →
-everything comes back by itself.
-
----
+**Known traps carried forward (still true, still worth knowing):**
+1. agy has no `--model` flag in some builds; silently ignores unknown model
+   strings — always keep the read-back verification (`docs/dev/PHASE0_FINDINGS.md`).
+2. No in-CLI sandbox: headless runs execute tools regardless of permission
+   flags — the only real security boundary is OS-level (H3 in PLAN.md).
+3. agy/claude auth expires silently (the "3am problem") — PLAN.md §H2 gives
+   the honest, adversarially-reviewed version of assisted re-login (default
+   deliverable is detect + precise instructions; relay-assisted login only
+   where the executor verifies the CLI actually supports it — **do not
+   build speculative login automation**, a call already validated once by
+   this session pausing on exactly that before PLAN.md confirmed it).
+4. `~/AGI-Brain` legacy layout — PLAN.md's `AGI-Brain/Memory/` (§3.2) is the
+   new, git-init'd home for the Markdown knowledge tier; not a full replace
+   of the old layout discussion, just the memory subtree.
+5. Older docs (`README.md` on `main`, `docs/dev/STATUS.md`) may still
+   reflect the pre-PLAN.md vision — PLAN.md wins on any conflict.
 
 ## 7. WORKING AGREEMENTS (always in force)
 
@@ -544,18 +296,16 @@ everything comes back by itself.
 > only notes a future session actually needs. History lives in git log.
 
 **Current phase:** Phase 1 + P1.5 + P2 (entrypoint, TUI) are **DONE and
-merged** — GOD MODE round 1 (2026-07-17 pm) landed the P1.5 router,
-`zilla/cli.py` + `doctor`/`security`/`configmenu`, and the Textual TUI
-(`zilla/tui/`) in parallel worktrees, merged serially with the full test
-gate. **NEXT SESSION IS A PLANNING SESSION (Fable, no execution):** write
-numbered, self-contained SERIAL execution briefs into §"EXECUTION BRIEFS"
-below for: P7 (health + supervisor fix + assisted re-login), P2
-onboarding, P8 opencode+fallback, P9 whisper, P6 env detection, then P3.
-One brief = one Sonnet session's worth of work. After planning, a
-separate Sonnet terminal executes brief-by-brief ("dumb mode": follow the
-brief exactly, full test gate, tick the box, one-line session log, stop).
-FOR ALOK live smokes still pending (P1.5 smoke, TUI real-terminal launch,
-Approval mode taps).
+merged** on this branch — that shipped, tested, live-running code is not
+in question. **The forward plan is now PLAN.md's M → H → R → S → G → T →
+V phase order (see the notice at the top of this file), not the old
+P0-P10 list.** PLAN.md was written on a branch that forked before this
+code existed, so its phase list doesn't know P1.5/CLI/TUI/approvals are
+already done — the reconciliation checklist below maps PLAN.md's phases
+onto that reality. **NEXT UNIT OF WORK: Phase M1 — `store.py` + first-start
+migration** (PLAN.md §5.M1). Everything after M1 in PLAN.md's order
+depends on the store existing, so M1 goes first, alone, with the full
+test gate before and after.
 **Working branch (source of truth):** `claude/zilla-harness-review-0v96bs`
 **Tests:** 204+16+112+57 core + 71 review + 17 tui + 69 cli = **546 green**
 — `.venv/bin/python test_fixes.py / test_interactive.py / test_core.py /
@@ -569,26 +319,29 @@ in its log.
 
 ### Checklist
 
-
+**Shipped, pre-PLAN.md (kept — not reopened):**
 - [x] **P0** Verify reality (flags, GEMINI.md/AGENTS.md, sandbox test, logins, tests on macOS) → `docs/dev/PHASE0_FINDINGS.md`
-- [x] **P1** Core extraction: design core API (owner-approved) → `docs/dev/CORE_API.md`
-- [x] **P1** Move modules into `zilla/` package (tests green)
-- [x] **P1** Extract turn pipeline / scheduler / bridge / approvals / health-stub from `bot.py` (FOR ALOK: live Telegram smoke of Approval mode — have a limited user send a request, tap ✅ and ❌ once each)
-- [x] **P1.5** Orchestration router (OWNER DECREE 2026-07-17) — MERGED. `zilla/review.py`: `review()` (empty → limit → error-garbage/exit_reason → fabrication-retry-once → deliver, hooked into `handle_message` right before the Response yield and into `_execute_message_schedule`) + `classify_route()` (conservative smalltalk whitelist, explicit share-verb prefixes). `core.handle_message` triage: smalltalk → one-shot `claude -p --model haiku` call with a minimal persona+style preamble (live-verified ~4-6s vs 17s–2m34s full turn), reviewed before delivery, transparent fallback to the full path on stop/unreachable; share → verbatim timestamped append to `WIKI_JOURNAL_DIR/YYYY-MM-DD.md` (new `WIKI_DIR`/`WIKI_JOURNAL_DIR` config knobs, `.env`-overridable); every route decision logged to `trust_log.jsonl`. `harness.py`: `_SELF_HEAL` directive in every turn — `skip_permissions` untouched, still role-derived only. `cli_engine.py`: steal #36. `bot.py`: instant 👀 reaction ack + Progress→⏳-bubble (throttled ~3s edits). FOR ALOK: live Telegram smoke — say "hi" (fast path + 👀), "remember I like mango lassi" (journal), one heavy task (progress bubble).
-- [x] **P2** `zilla` entrypoint + `config`/`doctor`/`start`/`stop`/`status`/`logs` — `zilla/cli.py` (+`doctor.py`, `security.py`, `configmenu.py`, `pyproject.toml`); `doctor --security --fix` remediates perms; `start`/`status` proven live (restarted the real bot). NOT yet verified: `pip install -e .` data-file packaging (bot_instructions.md), real autostart toggle.
-- [x] **P2** Full-screen TUI (chat + settings + skills + health; ASCII logo home + prompt box) — `zilla/tui/`, `python -m zilla.tui`; Pilot-tested headless (FOR ALOK: launch it once in a real terminal). TUI runs standalone with `schedules=None` (no double-fire); Telegram-as-connector unification is the later P2 step.
-- [ ] **P2** Conversational onboarding + Telegram-as-connector
-- [ ] **P3** New Zilla home layout + git-init + migration shim
-- [ ] **P4** Wiki: index injection + autonomous read/write instructions
-- [ ] **P4** First-run interview → identity/domain pages
-- [ ] **P5** Skill authoring via chat
-- [ ] **P5** Code-skill approval gate (pending/ + one tap)
-- [ ] **P5** Skills viewer + failure loop (one retry, then plain-language stop)
-- [ ] **P6** Environment detection + adaptation
-- [ ] **P7** Silent self-healing health + 3am alert (incl. ASSISTED RE-LOGIN — see Phase 7 step 3) + usage counters
-- [ ] **P8** opencode backend + fallback chain
-- [ ] **P9** Local Whisper + voice_mode setting
-- [ ] **P10** Ubuntu deployment hardening (LAST — on the client machine)
+- [x] **P1** Core extraction: `zilla/core.py` (`ZillaCore` — turn pipeline, scheduler, bridge, approvals, health snapshot) — this IS most of PLAN.md's G1 engine-facade target already; G1 below is the delta, not a from-scratch build.
+- [x] **P1.5** Orchestration router — `zilla/review.py` (`review()` gate + `classify_route()` triage: smalltalk→haiku fast path, share→wiki journal, every route logged to `trust_log.jsonl`) — this covers most of PLAN.md's R1 triage router; R1 below is refinement, not a from-scratch build.
+- [x] **P2** `zilla` entrypoint (`zilla/cli.py`, `doctor.py`, `security.py`, `configmenu.py`) — `config`/`doctor`/`start`/`stop`/`status`/`logs` all live-verified.
+- [x] **P2** Full-screen TUI (`zilla/tui/`) — chat/settings/skills/health screens exist; this is most of PLAN.md's T1 target. Missing for T1: Sessions/Schedules/Memory screens, Unix-socket IPC daemon-attach model, conversational onboarding.
+- [ ] **P2** Conversational onboarding + Telegram-as-connector unification — folds into PLAN.md's T1.
+
+**PLAN.md phases (strict order, §13 — do not skip ahead):**
+- [ ] **M1** `store.py` (SQLite+WAL) + first-start migration from the 5 JSON files — genuinely new. NEXT.
+- [ ] **M2** Memory layout (`AGI-Brain/Memory/`) + injection + `TurnContext` threading — genuinely new.
+- [ ] **M3** FTS5 search + memory git + quiet-run mode — genuinely new.
+- [ ] **M4** Nightly distillation + `/memory` command + change surfacing — genuinely new.
+- [ ] **H1** Heartbeat loop — genuinely new.
+- [ ] **H2** Health probes + assisted re-login — PARTIAL: earlier P7 health-loop WIP exists (stashed, `git stash list` → "P7 health-loop WIP"), built before PLAN.md was found; PLAN.md's H2 spec is more precise (explicit "do not build speculative login automation" ceiling) — treat the stash as reference only, re-derive from PLAN.md's spec rather than popping it verbatim.
+- [ ] **H3** systemd Linux service — genuinely new (this is P10 Ubuntu hardening's old slot, now precisely specified here).
+- [ ] **R1** Triage router refinement — MOSTLY DONE via `zilla/review.py` (P1.5 above); confirm against PLAN.md's exact spec before marking done, don't rebuild.
+- [ ] **R2** Fallback chain — genuinely new.
+- [ ] **R3** opencode adapter — genuinely new (was P8).
+- [ ] **S** Skills from chat, ask-first approval — genuinely new (was P5).
+- [ ] **G1** Engine facade extraction — PARTIAL via existing `zilla/core.py` (P1 above); the new part is the Unix-socket IPC daemon-attach model. PLAN.md flags this as the riskiest refactor in the plan — do it alone, no parallel fan-out.
+- [ ] **T1** Terminal app (Textual, daemon-attach via IPC) — MOSTLY DONE via existing `zilla/tui/` (P2 above); missing pieces listed there.
+- [ ] **V** Offline voice (faster-whisper — already pip-installed, salvaged from GOD MODE round 2) — genuinely new (was P9).
 
 ### Session log (one line per session — details in git log)
 
@@ -605,16 +358,8 @@ in its log.
 | 2026-07-17 pm | GOD MODE round 1: TUI landed (`zilla/tui/`, Textual, +17 tests = 396 green, no existing files touched; needs a real-terminal launch by owner). P1.5 router + `zilla` CLI entrypoint executors running in parallel worktrees. Owner Q&A: OAuth≠replacement for CLI (CLI login IS OAuth; Hermes OAuth = their hosted paid inference) — stay the course, replica-of-Hermes rejected, steal-list stands. |
 | 2026-07-17 pm | `zilla` CLI landed (+69 tests = 465 green). Found the bot DEAD since 08:22 (httpx ConnectError killed PTB, no auto-restart — P7 evidence); restarted live via `zilla start` ✅. config.py gained per-backend model helpers (`get/set_model_for`, `model_catalog_for`). |
 | 2026-07-17 pm | P1.5 router merged (built in parallel worktree): `zilla/review.py` gate + triage, harness `_SELF_HEAL`, smalltalk fast path (`claude --model haiku`), share→wiki journal, steal #36, 👀 ack + Progress→⏳-bubble. Orchestrator patched `_SELF_HEAL` post-merge to restore the spec's destructive/irreversible/costs-money stop-condition. Bot restarted on merged code. Awaiting owner live smoke. |
-| 2026-07-17 eve | GOD MODE round 2 FAILED: 5 parallel Sonnet executors (P7/P2-onboarding/P8/P9/P6) killed by the shared usage limit in ~5 min, zero commits; worktrees deleted (only scrap: partial tui/wizard.py, discarded). Salvage: `faster-whisper` is already pip-installed in `.venv` (P9 can skip that step). Owner decree: parallel fan-out BANNED → serial Fable-plans/Sonnet-executes protocol (see Notes). Antigravity suggestions reviewed → verdicts in Notes; P11 WhatsApp connector parked. |
-
-### EXECUTION BRIEFS (planner writes, Sonnet executes serially)
-
-*(Empty — the next Fable PLANNING session fills this. Format per brief:
-number + title, files owned, exact steps, live-verification rules, test
-gate command list, done-criteria, explicit do-NOT-touch list. A brief must
-be executable by Sonnet with zero questions. Execute strictly in order:
-1=P7, 2=P2 onboarding, 3=P8, 4=P9, 5=P6, 6=P3. Raw material: Phase
-sections above + round-2 scoping in git history of this file.)*
+| 2026-07-17 eve | GOD MODE round 2 FAILED: 5 parallel Sonnet executors (P7/P2-onboarding/P8/P9/P6) killed by the shared usage limit in ~5 min, zero commits; worktrees deleted (only scrap: partial tui/wizard.py, discarded). Salvage: `faster-whisper` is already pip-installed in `.venv` (P9/V can skip that step). Owner decree: parallel fan-out BANNED → serial execution protocol. Antigravity suggestions reviewed → verdicts in Notes; P11 WhatsApp connector parked. |
+| 2026-07-17 night | Paused mid-build on a P7 health-loop (stashed, uncommitted — `zilla/core.py` health task + `bot.py` alert-runbook rendering) when the owner surfaced `PLAN.md`: a separate, from-scratch, adversarially-reviewed plan (Fable + owner) found on remote branch `claude/python-cli-bot-planning-80x8a3` (not yet fetched locally before this session — discovered via `git fetch --prune`). That branch forked at `85d5893`, before P1.5/CLI/TUI/approvals existed, and has no code changes of its own — docs only. Owner decision (asked directly): bring PLAN.md onto this shipped-code branch rather than switch branches or discard either plan. PLAN.md copied here as a new file; this file's old §6 (P0-P10) and status board reconciled to point at PLAN.md's M/H/R/S/G/T/V order (see notice at top). Old antigravity verdict rejecting SQLite (below) is now superseded — PLAN.md's adoption of SQLite+WAL for M1 is the settled decision. |
 
 ### Notes (only what a future session needs)
 
@@ -634,23 +379,29 @@ sections above + round-2 scoping in git history of this file.)*
   SERIAL ONLY.** Parallel fan-out is BANNED: round 2 launched 5 parallel
   Sonnet worktree executors and the shared 5-hour usage window died in ~5
   minutes with ZERO commits (the account limit counts every agent; 5×
-  repo-reading in parallel = instant burn). New flow, three terminals:
-  (1) Fable = PLANNER only — writes serial numbered briefs into
-  §EXECUTION BRIEFS, never executes, stays open to review; (2) Sonnet
-  terminal = executor — takes the next brief, follows it literally, full
-  test gate, ticks the box, one-line log, commits, stops; (3) repeat. One
-  brief at a time. Merge/review discipline unchanged.
-- **Antigravity-CLI suggestions reviewed (2026-07-17, orchestrator verdicts):**
-  1. *SQLite WAL pragmas* — correct engineering, wrong time: sessions are
-     small JSON files and one connector; adopt SQLite+WAL only when a
-     webhook-based connector (WhatsApp) creates real write concurrency.
+  repo-reading in parallel = instant burn). Still true under PLAN.md: work
+  PLAN.md's phase list top to bottom, one phase at a time, full test gate
+  before and after each, small phase-prefixed commits (`feat(M1): …`), no
+  parallel worktree fan-out. PLAN.md itself is the brief now — it replaces
+  the old Fable-writes-briefs/Sonnet-executes handoff dance described in
+  earlier session-log entries above; that protocol is retired, not this
+  serial-only discipline.
+- **Antigravity-CLI suggestions reviewed (2026-07-17, orchestrator verdicts
+  — SUPERSEDED 2026-07-17 night where noted, see PLAN.md):**
+  1. *SQLite WAL pragmas* — original verdict was "wrong time, adopt only
+     when a webhook connector creates real write concurrency."
+     **SUPERSEDED:** PLAN.md's M1 adopts SQLite+WAL now, as the
+     operational-truth store for sessions/schedules/users/settings, not
+     gated on a future connector. Don't reopen this — it's the settled
+     decision behind M1.
   2. *MemGPT-style core memory* — good cheap steal: our CLIs already edit
      files, so "core memory" = a wiki page the harness preamble tells the
-     agent to keep updated. Fold into **P4 wiki**, no new library.
+     agent to keep updated. PLAN.md's M2-M4 (`AGI-Brain/Memory/`, memory
+     tiers, nightly distillation) is the fuller realization of this idea.
   3. *FastAPI webhook + asyncio.Queue* — accurate and REQUIRED for a
-     future WhatsApp connector (Meta webhooks demand <3s ack). Parked as
-     **P11 — WhatsApp connector** (after P10; needs Meta business app +
-     number; check free-tier limits first).
+     future WhatsApp connector (Meta webhooks demand <3s ack). Parked —
+     not in PLAN.md's phase list; revisit after V, needs Meta business
+     app + number, check free-tier limits first.
   4. *Instructor/Pydantic auto-retry* — REJECTED: we don't force JSON out
      of CLIs (review() is deterministic on plain text), and silent model
      retries burn the usage budget we just learned is scarce.
