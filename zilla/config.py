@@ -185,6 +185,12 @@ SETTINGS_FILE = DB_FILE
 USERS_FILE = DB_FILE
 SCHEDULES_FILE = DB_FILE
 
+# M2's memory.py creates this tree (MEMORY.md, Journal/, etc). Declared here
+# now, ahead of M2, only so M1's secrets-hygiene perm hardening
+# (_harden_file_perms in bot.py) can find it — a guarded no-op path until
+# M2 actually creates it.
+MEMORY_DIR = os.path.join(BASE_DIR, "Memory")
+
 # Original pre-M1 locations, kept ONLY so run_first_start_migration() (below)
 # knows where to look for data to import. Never assign these to the *_FILE
 # names above — those all point at the new shared DB_FILE now.

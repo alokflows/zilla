@@ -547,6 +547,18 @@ class Store:
         except sqlite3.Error:
             return False
 
+    def backup_to(self, dest_path: str) -> None:
+        """Snapshot this database to dest_path via VACUUM INTO — one
+        consistent, defragmented copy, safe to take while the bot keeps
+        running (PLAN.md §5 M1 step 6 corruption-recovery story). VACUUM
+        INTO refuses to write over an existing file, so remove dest_path
+        first; held under the write lock so no writer runs concurrently
+        with the snapshot."""
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        with self._write_lock:
+            self._write_conn.execute("VACUUM INTO ?", (dest_path,))
+
 
 # ── path-keyed cache — see module docstring for why this exists ─────────
 

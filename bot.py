@@ -73,7 +73,9 @@ from config import (
     SCHEDULES_FILE, agy_models_live,
     model_catalog, get_backend, set_backend,
     run_first_start_migration,
+    DB_FILE, MEMORY_DIR,
 )
+from zilla.store import get_store
 from sessions import SessionManager
 import zilla.core as zcore
 from zilla.cli_engine import detect_limit, backend_status
@@ -166,11 +168,21 @@ def _prune_old_logs(max_age_days: int = 30) -> None:
         pass
 
 
-def _harden_file_perms() -> None:
-    """Best-effort chmod 600 on secret/state files (no-op on Windows)."""
+def _harden_file_perms(base: str | None = None) -> None:
+    """Best-effort chmod 600 on secret/state files (no-op on Windows).
+    Covers the legacy JSON files (pre-migration, or left behind as
+    *.migrated), the shared zilla.db plus its WAL/SHM sidecars and nightly
+    .bak snapshots (PLAN.md §5 M1 step 6 — mem_fts carries full memory
+    text), and the Memory/ tree M2's memory.py will create (Journal is
+    intimate data) — both DB and Memory checks are no-ops until the
+    respective file/dir actually exists, so this is safe to call before
+    either lands. base defaults to this file's directory (production);
+    tests pass a tmp directory instead, so exercising this never touches
+    the real repo's .env/sessions.json/etc."""
     if os.name == "nt":
         return
-    base = os.path.dirname(os.path.abspath(__file__))
+    if base is None:
+        base = os.path.dirname(os.path.abspath(__file__))
     for name in (".env", "sessions.json", "settings.json", "schedules.json",
                  "authorized_users.json", "denied_users.json"):
         p = os.path.join(base, name)
@@ -188,6 +200,61 @@ def _harden_file_perms() -> None:
                     os.chmod(fp, 0o600)
     except OSError:
         pass
+    for suffix in ("", "-wal", "-shm", ".bak", ".bak.1"):
+        p = DB_FILE + suffix
+        try:
+            if os.path.exists(p):
+                os.chmod(p, 0o600)
+        except OSError:
+            pass
+    try:
+        if os.path.isdir(MEMORY_DIR):
+            for dirpath, dirnames, filenames in os.walk(MEMORY_DIR):
+                os.chmod(dirpath, 0o700)
+                for f in filenames:
+                    os.chmod(os.path.join(dirpath, f), 0o600)
+    except OSError:
+        pass
+
+
+# Nightly zilla.db snapshot (PLAN.md §5 M1 step 6 corruption-recovery
+# story): checked hourly rather than slept-24h so a bot restart doesn't
+# push the next backup a full day out, but only actually runs a VACUUM
+# INTO once _BACKUP_INTERVAL_SECS has elapsed since the last one.
+_BACKUP_INTERVAL_SECS = 24 * 3600
+_BACKUP_CHECK_TICK_SECS = 3600
+
+
+def _maybe_backup_db() -> None:
+    """Take a rotated zilla.db.bak snapshot if the last one is stale (or
+    there isn't one yet). One prior generation is kept as zilla.db.bak.1
+    so a backup taken mid-corruption doesn't wipe out the only good copy."""
+    if not os.path.exists(DB_FILE):
+        return
+    last = get_setting("last_db_backup_ts", 0) or 0
+    if time.time() - last < _BACKUP_INTERVAL_SECS:
+        return
+    bak = DB_FILE + ".bak"
+    prev = DB_FILE + ".bak.1"
+    if os.path.exists(bak):
+        os.replace(bak, prev)
+    get_store(DB_FILE).backup_to(bak)
+    _harden_file_perms()
+    set_setting("last_db_backup_ts", time.time())
+    logger.info(f"[BACKUP] zilla.db snapshot -> {bak}")
+
+
+async def _backup_loop() -> None:
+    """Background task: hourly check, nightly (by elapsed time) backup.
+    Started in post_init, cancelled in post_shutdown."""
+    while True:
+        try:
+            _maybe_backup_db()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[BACKUP] db backup check failed: {e}")
+        await asyncio.sleep(_BACKUP_CHECK_TICK_SECS)
 
 BOT_START_TIME = time.time()
 
@@ -208,6 +275,8 @@ _application = None
 # in post_shutdown) and the queue it reads from.
 _core_events_queue: asyncio.Queue = None
 _core_events_task_handle: asyncio.Task = None
+# Nightly db-backup checker (started in post_init, cancelled in post_shutdown).
+_backup_task_handle: asyncio.Task = None
 
 # Per-chat id of the CURRENT live menu message. When a new menu opens we strip
 # the previous one's buttons so old menus in the chat history can't be tapped
@@ -2568,7 +2637,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 
 async def post_init(application):
-    global _application, _core_events_queue, _core_events_task_handle
+    global _application, _core_events_queue, _core_events_task_handle, _backup_task_handle
     _application = application
 
     # Register the native Telegram slash-command menu (the "/" autocomplete).
@@ -2583,6 +2652,7 @@ async def post_init(application):
     core.subscribe(_core_events_queue)
     _core_events_task_handle = application.create_task(
         _core_events_task(core, _core_events_queue))
+    _backup_task_handle = application.create_task(_backup_loop())
     await core.start()
 
     if OWNER_CHAT_ID:
@@ -2600,9 +2670,10 @@ async def post_init(application):
 
 
 async def post_shutdown(application):
-    """Mirror of post_init's startup wiring: stop the core's scheduler task
-    and the event-render consumer cleanly on shutdown."""
-    global _core_events_task_handle
+    """Mirror of post_init's startup wiring: stop the core's scheduler task,
+    the event-render consumer, and the db-backup checker cleanly on
+    shutdown."""
+    global _core_events_task_handle, _backup_task_handle
     try:
         await core.stop()
     except Exception as e:
@@ -2614,6 +2685,13 @@ async def post_shutdown(application):
         except (asyncio.CancelledError, Exception):
             pass
         _core_events_task_handle = None
+    if _backup_task_handle is not None:
+        _backup_task_handle.cancel()
+        try:
+            await _backup_task_handle
+        except (asyncio.CancelledError, Exception):
+            pass
+        _backup_task_handle = None
 
 
 # Base commands every admin/owner sees in the "/" menu.

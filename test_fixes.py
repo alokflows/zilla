@@ -19,6 +19,7 @@
 import os
 import sys
 import json
+import sqlite3
 import tempfile
 
 _passed = 0
@@ -1101,6 +1102,150 @@ def test_migration_interrupted_retry_is_idempotent():
     check("migrate: retry does not corrupt denied list", db.users_denied_list() == [99])
 
 
+def _read_backup_setting(bak_path: str, key: str):
+    """Reads a .bak snapshot with a throwaway raw connection -- NOT via
+    zstore.get_store(), which caches one Store per path and would keep
+    returning the FIRST snapshot's already-open connection on a re-backup
+    (backup_to unlinks and recreates the file at the same path; a cached
+    connection's fd stays pinned to the unlinked old inode on POSIX)."""
+    conn = sqlite3.connect(bak_path)
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def test_store_backup_to_round_trip():
+    base = os.path.join(_tmpdir, f"backup_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    db_path = os.path.join(base, "zilla.db")
+    db = zstore.get_store(db_path)
+    db.set_setting("backup_probe", "hello")
+
+    bak_path = os.path.join(base, "zilla.db.bak")
+    db.backup_to(bak_path)
+    check("backup: snapshot file created", os.path.exists(bak_path))
+    check("backup: snapshot has the data written before it was taken",
+          _read_backup_setting(bak_path, "backup_probe") == "hello")
+
+    # A second write after the snapshot must NOT show up in the (already
+    # taken) backup -- proves it's a real point-in-time copy, not a link.
+    db.set_setting("backup_probe", "changed-after-backup")
+    check("backup: snapshot is independent of the live db",
+          _read_backup_setting(bak_path, "backup_probe") == "hello")
+
+    # backup_to() must overwrite (not error on) a pre-existing dest path --
+    # this is what nightly re-backups rely on.
+    db.backup_to(bak_path)
+    check("backup: re-running backup_to overwrites the previous snapshot",
+          _read_backup_setting(bak_path, "backup_probe") == "changed-after-backup")
+
+
+import stat  # noqa: E402
+import time  # noqa: E402
+import bot as _bot  # noqa: E402
+import config as _config  # noqa: E402
+
+
+def _mode(p: str) -> int:
+    return stat.S_IMODE(os.stat(p).st_mode)
+
+
+def test_harden_file_perms_covers_db_and_memory():
+    """PLAN.md §5 M1 step 6 perms test. Points bot.DB_FILE/MEMORY_DIR at a
+    throwaway tmp dir before calling the real _harden_file_perms(), so this
+    never touches the real repo's zilla.db or .env — see _harden_file_perms'
+    own base= param, added for exactly this."""
+    base = os.path.join(_tmpdir, f"perms_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    db_path = os.path.join(base, "zilla.db")
+    zstore.get_store(db_path)  # creates zilla.db (and, via WAL, -wal/-shm)
+    bak_path = db_path + ".bak"
+    with open(bak_path, "w") as f:
+        f.write("x")
+    for p in (db_path, db_path + "-wal", db_path + "-shm", bak_path):
+        os.chmod(p, 0o644)  # start over-permissive so the fix is observable
+
+    memory_dir = os.path.join(base, "Memory")
+    os.makedirs(os.path.join(memory_dir, "Journal"), exist_ok=True)
+    journal_file = os.path.join(memory_dir, "Journal", "2026-07-17.md")
+    with open(journal_file, "w") as f:
+        f.write("secret")
+    os.chmod(memory_dir, 0o755)
+    os.chmod(os.path.join(memory_dir, "Journal"), 0o755)
+    os.chmod(journal_file, 0o644)
+
+    old_db_file, old_memory_dir = _bot.DB_FILE, _bot.MEMORY_DIR
+    try:
+        _bot.DB_FILE = db_path
+        _bot.MEMORY_DIR = memory_dir
+        _bot._harden_file_perms(base=base)
+
+        check("perms: zilla.db -> 0600", _mode(db_path) == 0o600)
+        check("perms: zilla.db-wal -> 0600", _mode(db_path + "-wal") == 0o600)
+        if os.path.exists(db_path + "-shm"):
+            check("perms: zilla.db-shm -> 0600", _mode(db_path + "-shm") == 0o600)
+        check("perms: zilla.db.bak -> 0600", _mode(bak_path) == 0o600)
+        check("perms: Memory/ dir -> 0700", _mode(memory_dir) == 0o700)
+        check("perms: Memory/Journal/ dir -> 0700",
+              _mode(os.path.join(memory_dir, "Journal")) == 0o700)
+        check("perms: Memory/Journal file -> 0600", _mode(journal_file) == 0o600)
+
+        # missing zilla.db.bak/Memory tree -> no-op, not an error
+        no_db_base = os.path.join(_tmpdir, f"perms_missing_{os.urandom(4).hex()}")
+        os.makedirs(no_db_base, exist_ok=True)
+        _bot.DB_FILE = os.path.join(no_db_base, "zilla.db")
+        _bot.MEMORY_DIR = os.path.join(no_db_base, "Memory")
+        _bot._harden_file_perms(base=no_db_base)  # must not raise
+        check("perms: missing db/Memory tree is a silent no-op", True)
+    finally:
+        _bot.DB_FILE, _bot.MEMORY_DIR = old_db_file, old_memory_dir
+
+
+def test_maybe_backup_db_gating_and_rotation():
+    """The nightly backup only fires once _BACKUP_INTERVAL_SECS has
+    elapsed since last_db_backup_ts, and keeps one prior generation as
+    zilla.db.bak.1 so a bad backup doesn't destroy the only good copy."""
+    base = os.path.join(_tmpdir, f"nightly_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    db_path = os.path.join(base, "zilla.db")
+    db = zstore.get_store(db_path)
+    db.set_setting("gen", "seed")
+
+    bak_path = db_path + ".bak"
+    bak1_path = db_path + ".bak.1"
+
+    old_db_file, old_settings_file = _bot.DB_FILE, _config.SETTINGS_FILE
+    try:
+        _bot.DB_FILE = db_path
+        _config.SETTINGS_FILE = db_path
+
+        _bot._maybe_backup_db()
+        check("nightly: first call (no prior timestamp) backs up immediately",
+              os.path.exists(bak_path))
+        check("nightly: first backup captured current data",
+              _read_backup_setting(bak_path, "gen") == "seed")
+        check("nightly: no .bak.1 yet (nothing to rotate)",
+              not os.path.exists(bak1_path))
+
+        db.set_setting("gen", "second")
+        _bot._maybe_backup_db()
+        check("nightly: called again immediately after -> gated, no new backup",
+              _read_backup_setting(bak_path, "gen") == "seed")
+        check("nightly: gating means no rotation happened either",
+              not os.path.exists(bak1_path))
+
+        db.set_setting("last_db_backup_ts", time.time() - _bot._BACKUP_INTERVAL_SECS - 1)
+        _bot._maybe_backup_db()
+        check("nightly: stale timestamp -> backs up again",
+              _read_backup_setting(bak_path, "gen") == "second")
+        check("nightly: prior backup rotated into .bak.1",
+              os.path.exists(bak1_path) and _read_backup_setting(bak1_path, "gen") == "seed")
+    finally:
+        _bot.DB_FILE, _config.SETTINGS_FILE = old_db_file, old_settings_file
+
+
 # ════════════════════════════════════════════════════════════
 
 def main():
@@ -1160,6 +1305,9 @@ def main():
         test_migration_round_trip,
         test_migration_no_legacy_files_is_noop,
         test_migration_interrupted_retry_is_idempotent,
+        test_store_backup_to_round_trip,
+        test_harden_file_perms_covers_db_and_memory,
+        test_maybe_backup_db_gating_and_rotation,
     ]
     print("Running zilla fix tests...\n")
     for t in tests:
