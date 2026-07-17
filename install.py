@@ -296,6 +296,85 @@ def start_bot():
         bad(f"Couldn't start automatically: {e}")
 
 
+def stop_bot():
+    """Stop the background supervisor + bot, mirroring stop.sh /
+    STOP_BACKGROUND.bat (same stop-file + best-effort process kill), but as
+    plain importable Python so `zilla stop` doesn't need a shell. Never
+    raises — every step is best-effort, matching the shell scripts."""
+    info("Stopping Zilla…")
+    try:
+        open(os.path.join(BASE, "zilla.stop"), "w", encoding="utf-8").write("stop")
+    except OSError as e:
+        bad(f"Couldn't write zilla.stop: {e}")
+    if IS_WIN:
+        ps = (
+            "Get-CimInstance Win32_Process | Where-Object { "
+            "($_.Name -eq 'pythonw.exe' -or $_.Name -eq 'python.exe') -and "
+            "($_.CommandLine -like '*bot.py*' -or $_.CommandLine -like "
+            "'*run_background.pyw*') } | ForEach-Object { Stop-Process -Id "
+            "$_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False)
+    else:
+        subprocess.run(["pkill", "-f", "run_background.py"], check=False)
+        subprocess.run(["pkill", "-f", os.path.join(BASE, "bot.py")], check=False)
+        subprocess.run(["systemctl", "--user", "stop", "zilla.service"], check=False)
+    ok("Zilla stopped.")
+
+
+def disable_autostart():
+    """Undo setup_autostart() — inverse per OS. Best-effort; never raises."""
+    try:
+        if IS_WIN:
+            shortcut = os.path.join(
+                os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                "Start Menu", "Programs", "Startup", "Zilla Bot.lnk",
+            )
+            if os.path.exists(shortcut):
+                os.remove(shortcut)
+            ok("Autostart shortcut removed.")
+        elif IS_MAC:
+            plist = os.path.expanduser("~/Library/LaunchAgents/com.zilla.bot.plist")
+            subprocess.run(["launchctl", "unload", plist], check=False)
+            if os.path.exists(plist):
+                os.remove(plist)
+            ok("Autostart LaunchAgent removed.")
+        else:  # Linux
+            subprocess.run(["systemctl", "--user", "disable", "--now", "zilla.service"],
+                            check=False)
+            unit = os.path.expanduser("~/.config/systemd/user/zilla.service")
+            if os.path.exists(unit):
+                os.remove(unit)
+            ok("Autostart systemd unit removed.")
+    except Exception as e:
+        bad(f"Couldn't remove autostart automatically: {e}")
+
+
+def is_running() -> bool:
+    """True if a Zilla bot instance currently holds the single-instance lock.
+    Reuses the SAME cross-platform lock primitive bot.py itself uses (never a
+    second liveness mechanism) — try to acquire it; if we succeed, nobody
+    else held it, so release immediately and report not-running."""
+    import zilla.platform_compat as platform_compat
+    lock_path = os.path.join(BASE, "zilla_bot_instance.lock")
+    handle = platform_compat.acquire_instance_lock(lock_path)
+    if handle is None:
+        return True
+    platform_compat.release_instance_lock(handle, lock_path)
+    return False
+
+
+def read_pid() -> int | None:
+    """Best-effort PID of the running bot.py, for display only (status uses
+    is_running() — the lock, not this file — as the source of truth)."""
+    pid_path = os.path.join(BASE, "zilla.pid")
+    try:
+        with open(pid_path, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def _arg(name: str):
     """Read --name=value or --name value from argv (for non-interactive/AI setup)."""
     for i, a in enumerate(sys.argv):
