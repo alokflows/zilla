@@ -552,7 +552,7 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 - [x] **P1** Core extraction: design core API (owner-approved) → `docs/dev/CORE_API.md`
 - [x] **P1** Move modules into `zilla/` package (tests green)
 - [ ] **P1** Extract turn pipeline / scheduler / bridge / health from `bot.py`
-- [ ] **P1.5** Orchestration router (OWNER DECREE 2026-07-17): a cheap first pass on EVERY incoming message decides complexity + intent BEFORE the heavy CLI turn — (a) small-talk/simple → answer fast (small model or short-circuit), complex → full CLI agent turn; (b) if the user is *sharing* something (a fact about their life, a preference, something they did) → immediately append it to the wiki journal (`wiki/journal/YYYY-MM-DD.md`), structure matures over time via heartbeat distillation (steal-list #12/#13). This also attacks LATENCY, the owner's other complaint: today every "hi" pays full CLI cold-start (~10s spin-up + model time). Also add an instant ack reaction (👀 or typing starts <1s) so the bot never feels dead. Design this seam into CORE_API alongside the bridge/approvals/health extraction.
+- [ ] **P1.5** Orchestration router (OWNER DECREE 2026-07-17): a cheap first pass on EVERY incoming message decides complexity + intent BEFORE the heavy CLI turn — (a) small-talk/simple → answer fast (small model or short-circuit), complex → full CLI agent turn; (b) if the user is *sharing* something (a fact about their life, a preference, something they did) → immediately append it to the wiki journal (`wiki/journal/YYYY-MM-DD.md`), structure matures over time via heartbeat distillation (steal-list #12/#13). This also attacks LATENCY, the owner's other complaint: today every "hi" pays full CLI cold-start (~10s spin-up + model time). Also add an instant ack reaction (👀 or typing starts <1s) so the bot never feels dead. Design this seam into CORE_API alongside the bridge/approvals/health extraction. (c) EXPANDED (owner decree 2026-07-17, the "effortless" mandate): an orchestrator RESPONSE-REVIEW gate — every outbound response is inspected BEFORE delivery to the user (deterministic checks first: empty/error-garbage/limit; then bounded self-heal — on a tool/dependency failure, fix it (e.g. install the missing converter) and retry ONCE, never deliver error garbage, never loop silently). Owner's reference story: OpenClaw hit a missing OGG converter, installed it, transcribed, answered — zero errors shown. Spec: `docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` (deep-dive comparison of OpenClaw/Hermes source vs Zilla's pipeline).
 - [ ] **P2** `zilla` entrypoint + `config`/`doctor`/`start`/`stop`/`status`/`logs`
 - [ ] **P2** Full-screen TUI (chat + settings + skills + health; OWNER 2026-07-17: ASCII-art Zilla logo centered on the home screen + a visible prompt box — the terminal app should look like a real product the moment it opens)
 - [ ] **P2** Conversational onboarding + Telegram-as-connector
@@ -591,3 +591,9 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
   `docs/dev/RESEARCH_OPENCLAW_HERMES.md` §7; consult at each phase start.
 - Orchestrator liberty: if findings contradict this plan, argue it with the
   owner before proceeding — never silently comply with a stale plan.
+- **Loop protocol (owner decree 2026-07-17): GOD MODE.** Each round fans out
+  ALL unchecked items that don't conflict on files to parallel Sonnet
+  executors in isolated git worktrees (+ Opus agents for research items) —
+  never one-at-a-time. The orchestrator reviews every diff, merges the
+  worktrees SERIALLY with the full test gate between merges (that is what
+  keeps parallel safe), restarts the bot when bot.py changed, pushes.
