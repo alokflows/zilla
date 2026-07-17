@@ -142,6 +142,12 @@ OUTBOX_DIR = os.path.join(AGI_BRAIN_DIR, "Outbox")
 OUTBOX_DOCUMENTS = os.path.join(OUTBOX_DIR, "documents")
 OUTBOX_IMAGES = os.path.join(OUTBOX_DIR, "images")
 
+# --- Wiki (P1.5 triage 'share' route journal; full wiki lands Phase 4) ---
+# Default lives under the AGI-Brain data home for now (a future phase can move
+# this to a clean Zilla-owned home directory) — override with WIKI_DIR in .env.
+WIKI_DIR = os.getenv("WIKI_DIR", os.path.join(AGI_BRAIN_DIR, "wiki"))
+WIKI_JOURNAL_DIR = os.path.join(WIKI_DIR, "journal")
+
 # --- ffmpeg (voice-note transcription) ---
 # Windows: bundled copy under AGI-Brain\Tools. Unix: system ffmpeg (brew/apt).
 FFMPEG_PATH = os.getenv("FFMPEG_PATH") or _find_exe(
