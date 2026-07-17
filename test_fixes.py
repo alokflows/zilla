@@ -1142,6 +1142,70 @@ def test_store_backup_to_round_trip():
           _read_backup_setting(bak_path, "backup_probe") == "changed-after-backup")
 
 
+import threading  # noqa: E402
+import time as _time_mod  # noqa: E402
+
+
+def test_store_concurrent_session_increment_no_lost_updates():
+    """PLAN.md §5 M1 accept criteria: two tasks mutate sessions 100x, no
+    loss. sessions_increment_messages does the += inside the row (one
+    write transaction, serialized by _write_lock) rather than the
+    caller doing read-then-sessions_upsert -- this proves that actually
+    holds under real concurrent threads, not just in isolation."""
+    base = os.path.join(_tmpdir, f"concurrent_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    db = zstore.get_store(os.path.join(base, "zilla.db"))
+    db.sessions_upsert(1, "main", messages=0)
+
+    def bump(n):
+        for _ in range(n):
+            db.sessions_increment_messages(1, "main", "2026-01-01T00:00:00")
+
+    threads = [threading.Thread(target=bump, args=(100,)) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    row = db.sessions_get(1, "main")
+    check("store: 200 concurrent increments across 2 threads -> no lost updates",
+          row["messages"] == 200, row["messages"])
+
+
+def test_store_reader_never_blocks_during_bulk_fts_write():
+    """PLAN.md §5 M1 accept criteria: bulk FTS write in flight, get_setting
+    returns in < 50ms. WAL readers (_r(), a separate per-thread connection)
+    must not queue behind the writer's lock/transaction."""
+    base = os.path.join(_tmpdir, f"readerblock_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    db = zstore.get_store(os.path.join(base, "zilla.db"))
+    db.set_setting("probe", "ok")
+
+    stop = threading.Event()
+
+    def bulk_write():
+        i = 0
+        while not stop.is_set():
+            db.fts_index(f"/mem/note_{i}.md", f"title {i}", ("body text " * 50))
+            i += 1
+
+    writer = threading.Thread(target=bulk_write)
+    writer.start()
+    _time_mod.sleep(0.05)  # let the writer get going before measuring
+
+    max_latency = 0.0
+    for _ in range(50):
+        t0 = _time_mod.perf_counter()
+        db.get_setting("probe")
+        max_latency = max(max_latency, _time_mod.perf_counter() - t0)
+
+    stop.set()
+    writer.join()
+
+    check("store: get_setting stays under 50ms while a bulk FTS write is in flight",
+          max_latency < 0.05, f"{max_latency * 1000:.1f}ms")
+
+
 import stat  # noqa: E402
 import time  # noqa: E402
 import bot as _bot  # noqa: E402
@@ -1306,6 +1370,8 @@ def main():
         test_migration_no_legacy_files_is_noop,
         test_migration_interrupted_retry_is_idempotent,
         test_store_backup_to_round_trip,
+        test_store_concurrent_session_increment_no_lost_updates,
+        test_store_reader_never_blocks_during_bulk_fts_write,
         test_harden_file_perms_covers_db_and_memory,
         test_maybe_backup_db_gating_and_rotation,
     ]
