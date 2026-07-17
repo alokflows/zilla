@@ -82,7 +82,7 @@ from media import (
     save_photo, save_voice, save_audio, save_document, save_video,
     get_inbox_stats, get_inbox_items, get_inbox_counts, delete_inbox_file,
     get_outbox_items, get_outbox_counts, delete_outbox_file,
-    format_file_size, extract_text,
+    format_file_size, extract_text, MediaTooLargeError,
 )
 from formatter import format_for_telegram, detect_file_paths
 from harness import log_summary
@@ -905,10 +905,11 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    uid = update.effective_user.id
     if context.user_data.pop("awaiting_custom_model", None):
         await update.message.reply_text("Custom model entry cancelled.")
         return
-    if core.cancel(chat_id):
+    if core.cancel(chat_id, uid):
         await update.message.reply_text("🛑 Canceling…")
     else:
         await update.message.reply_text("Nothing is running right now.")
@@ -1529,6 +1530,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             typing_task.cancel()
             msg = transcript if transcript else "Transcription unavailable."
             await update.message.reply_text(f"🎤 Voice saved.\n{msg}")
+    except MediaTooLargeError as e:
+        stop_typing.set()
+        typing_task.cancel()
+        await update.message.reply_text(f"🚫 {e}")
     except Exception as e:
         stop_typing.set()
         typing_task.cancel()
@@ -1555,6 +1560,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f'🎵 Transcribed:\n"{transcript}"')
         else:
             await update.message.reply_text(f"🎵 Audio saved: {os.path.basename(filepath)}")
+    except MediaTooLargeError as e:
+        stop_typing.set()
+        typing_task.cancel()
+        await update.message.reply_text(f"🚫 {e}")
     except Exception as e:
         stop_typing.set()
         typing_task.cancel()
@@ -1593,6 +1602,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stop_typing.set()
         typing_task.cancel()
         await send_response(update, context, response, uid, chat_id)
+    except MediaTooLargeError as e:
+        stop_typing.set()
+        typing_task.cancel()
+        await update.message.reply_text(f"🚫 {e}")
     except Exception as e:
         stop_typing.set()
         typing_task.cancel()
@@ -1651,6 +1664,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Document analysis error: {e}", exc_info=True)
             await update.message.reply_text(f"Analysis error: {str(e)[:200]}")
 
+    except MediaTooLargeError as e:
+        await update.message.reply_text(f"🚫 {e}")
     except Exception as e:
         logger.error(f"Document save error: {e}", exc_info=True)
         await update.message.reply_text(f"Document error: {str(e)[:200]}")
@@ -1664,6 +1679,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🎬 Video saved. ({format_file_size(os.path.getsize(filepath))})"
         )
+    except MediaTooLargeError as e:
+        await update.message.reply_text(f"🚫 {e}")
     except Exception as e:
         await update.message.reply_text(f"Video error: {str(e)[:200]}")
 
@@ -1972,7 +1989,7 @@ async def _cb_misc(query, context, data, uid, chat_id):
         await query.edit_message_text(await _health_panel(), reply_markup=kb_back())
 
     elif data == "cancel_active":
-        if core.cancel(chat_id):
+        if core.cancel(chat_id, uid):
             await query.edit_message_text("🛑 Canceling…")
         else:
             await query.edit_message_text("Nothing to cancel.")

@@ -267,10 +267,10 @@ def test_cancel():
             task = asyncio.create_task(consume())
             await asyncio.sleep(0.05)          # let the run start
             results["busy"] = core.is_busy(uid)
-            results["cancel1"] = core.cancel(uid)   # chat_key defaults to uid
-            results["cancel2"] = core.cancel(uid)   # already set → False
+            results["cancel1"] = core.cancel(uid, uid)   # chat_key defaults to uid
+            results["cancel2"] = core.cancel(uid, uid)   # already set → False
             await task
-            results["cancel_after"] = core.cancel(uid)  # nothing running → False
+            results["cancel_after"] = core.cancel(uid, uid)  # nothing running → False
             results["busy_after"] = core.is_busy(uid)
 
     asyncio.run(run())
@@ -286,6 +286,55 @@ def test_cancel():
           core._active_cancel == {}, f"{core._active_cancel}")
     check("no longer busy", results["busy_after"] is False)
     check("cancel after finish → False", results["cancel_after"] is False)
+
+
+# ── 4b. cancel keying — group chat cross-user isolation ─────
+
+def test_cancel_group_chat_keying():
+    print("\n[4b] Cancel — same group chat_key, different users don't cross-cancel")
+    core = _fresh_core("cancel_group")
+    GROUP_CHAT = -5000  # Telegram group chat ids are negative
+    user_a, user_b = 201, 202
+
+    async def fake_run(prompt, conv_id, progress_callback=None,
+                       cancel_event=None, skip_permissions=False):
+        for _ in range(200):
+            if cancel_event.is_set():
+                return "🛑 Canceled — partial result so far.", None
+            await asyncio.sleep(0.01)
+        return "finished uncanceled", None
+
+    results = {}
+
+    async def run():
+        with _patched(fake_run):
+            async def consume_a():
+                results["events_a"] = await _collect(
+                    core, user_a, "a's long task", chat_key=GROUP_CHAT,
+                    skip_permissions=True)
+
+            task = asyncio.create_task(consume_a())
+            await asyncio.sleep(0.05)  # let A's run start
+            # B (same chat, different user) tries to cancel — must be a
+            # no-op against A's run: it isn't (GROUP_CHAT, user_b)'s event.
+            results["b_cancel_a"] = core.cancel(GROUP_CHAT, user_b)
+            await asyncio.sleep(0.05)
+            results["a_still_busy"] = core.is_busy(user_a)
+            # A cancels their OWN run in the same chat — must succeed.
+            results["a_cancel_self"] = core.cancel(GROUP_CHAT, user_a)
+            await task
+
+    asyncio.run(run())
+    resp = [e for e in results["events_a"] if isinstance(e, Response)]
+    check("other user's cancel() in same chat is a no-op",
+          results["b_cancel_a"] is False)
+    check("victim's run kept going after the other user's cancel attempt",
+          results["a_still_busy"] is True)
+    check("run owner's own cancel() in the same chat succeeds",
+          results["a_cancel_self"] is True)
+    check("run owner's canceled-style Response delivered",
+          len(resp) == 1 and resp[0].text.startswith("🛑 Canceled"),
+          f"{[r.text for r in resp]}")
 
 
 # ── 5. failure path — cancel bookkeeping never leaks ────────
@@ -876,6 +925,7 @@ def main():
         test_session_bookkeeping,
         test_lock_serialization,
         test_cancel,
+        test_cancel_group_chat_keying,
         test_error_cleanup,
         test_bridge_announce_once,
         test_bridge_no_subscribers,

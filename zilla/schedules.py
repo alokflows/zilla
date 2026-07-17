@@ -23,13 +23,43 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
+from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 from zilla import store
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _local_zone() -> tzinfo:
+    """Best-effort IANA local timezone, so compute_next_run's daily/weekly
+    math tracks DST transitions correctly (STATUS.md audit finding: naive
+    local datetimes gave wrong fire times near a DST boundary). Resolves
+    via /etc/localtime's symlink target (the standard way on Linux/macOS);
+    Windows has no such symlink and stdlib zoneinfo ships no IANA database
+    there either (requirements.txt pins `tzdata` for
+    platform_system=="Windows" to supply one), so on Windows — or if the
+    symlink trick fails for any reason — this falls back to a FIXED offset
+    snapshotted from the system's current UTC offset. That fallback is
+    correct until the next DST transition and self-heals on process
+    restart, which is an acceptable trade for a personal single-owner bot.
+    Cached for the process lifetime; call _local_zone.cache_clear() in
+    tests that need to force re-resolution."""
+    try:
+        real = os.path.realpath("/etc/localtime")
+        marker = "zoneinfo/"
+        idx = real.find(marker)
+        if idx != -1:
+            return ZoneInfo(real[idx + len(marker):])
+    except Exception:
+        pass
+    offset = datetime.now().astimezone().utcoffset() or timedelta(0)
+    return timezone(offset)
 
 VALID_KINDS = ("once", "interval", "daily", "weekly")
 
@@ -95,7 +125,7 @@ def _slot_today(now_dt: datetime, hh: int, mm: int) -> datetime:
     return now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
 
-def compute_next_run(kind: str, spec: dict, after: float) -> float | None:
+def compute_next_run(kind: str, spec: dict, after: float, tz: tzinfo | None = None) -> float | None:
     """
     Return the next run time (epoch seconds) strictly greater than `after`,
     or None if the schedule has no future occurrence (a past one-off).
@@ -104,6 +134,14 @@ def compute_next_run(kind: str, spec: dict, after: float) -> float | None:
     - interval: spec{seconds}    → after + seconds
     - daily:    spec{hh,mm}      → next HH:MM at/after `after`
     - weekly:   spec{days,hh,mm} → next chosen weekday at HH:MM after `after`
+
+    daily/weekly math is done in an explicit tz-aware datetime (tz, or
+    _local_zone() if not given) so a schedule that spans a DST transition
+    still fires at the same LOCAL wall-clock HH:MM on both sides of it —
+    "+1 day" of wall-clock time is 23h or 25h of real elapsed time near a
+    transition, and zoneinfo-aware arithmetic gets that right where naive
+    arithmetic wouldn't. tz is exposed mainly so tests can pin a specific
+    zone regardless of the machine running them.
     """
     if kind == "once":
         run_at = float(spec.get("run_at", 0))
@@ -113,7 +151,7 @@ def compute_next_run(kind: str, spec: dict, after: float) -> float | None:
         seconds = max(1, int(spec.get("seconds", 0)))
         return after + seconds
 
-    after_dt = datetime.fromtimestamp(after)
+    after_dt = datetime.fromtimestamp(after, tz or _local_zone())
 
     if kind == "daily":
         hh, mm = int(spec.get("hh", 0)), int(spec.get("mm", 0))

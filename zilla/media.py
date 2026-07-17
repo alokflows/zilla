@@ -12,10 +12,19 @@ from datetime import datetime
 from zilla.config import (
     FFMPEG_PATH, INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS,
     OUTBOX_DOCUMENTS, OUTBOX_IMAGES,
-    TELEGRAM_MAX_SEND_FILE,
+    TELEGRAM_MAX_SEND_FILE, get_setting,
 )
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_MEDIA_MB = 50
+
+
+class MediaTooLargeError(Exception):
+    """Raised by download_telegram_file when an incoming file exceeds the
+    configured max_media_mb cap (STATUS.md audit finding: no media ingest
+    size cap). Frontends should catch this specifically and show one
+    friendly refusal rather than treating it as an unexpected error."""
 
 # ── Configure ffmpeg for pydub ────────────────────────────
 
@@ -109,12 +118,20 @@ def transcribe_audio(audio_path: str) -> str | None:
 # ── File Download ─────────────────────────────────────────
 
 async def download_telegram_file(bot, file_id: str, dest_folder: str, filename: str) -> str:
-    """Download a file from Telegram to the specified folder."""
+    """Download a file from Telegram to the specified folder. Raises
+    MediaTooLargeError (without downloading anything) if Telegram reports a
+    size over the configured cap — setting 'max_media_mb', default 50."""
+    tg_file = await bot.get_file(file_id)
+    max_mb = get_setting("max_media_mb", DEFAULT_MAX_MEDIA_MB)
+    if tg_file.file_size and tg_file.file_size > max_mb * 1024 * 1024:
+        size_mb = tg_file.file_size / (1024 * 1024)
+        raise MediaTooLargeError(
+            f"That file is {size_mb:.1f} MB, over the {max_mb} MB limit — not downloading it."
+        )
     os.makedirs(dest_folder, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     name, ext = os.path.splitext(os.path.basename(filename))
     filepath = os.path.join(dest_folder, f"{ts}_{name}{ext}")
-    tg_file = await bot.get_file(file_id)
     await tg_file.download_to_drive(filepath)
     logger.info(f"[MEDIA] Downloaded: {filepath} ({os.path.getsize(filepath)} bytes)")
     return filepath

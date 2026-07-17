@@ -367,10 +367,14 @@ class ZillaCore:
         self._pending_approvals: dict[str, dict] = {}
         self.approvals = Approvals(self)
 
-        # Per-chat cancel events — set to cancel the active CLI request for
-        # that chat. Keyed by the frontend's chat key (Telegram: chat_id;
-        # defaults to user_id for frontends without a separate chat concept).
-        self._active_cancel: dict[int, threading.Event] = {}
+        # Per-(chat, user) cancel events — set to cancel the active CLI
+        # request for that user in that chat. Keyed by a (chat_key, user_id)
+        # tuple, NOT chat_key alone: a group chat's chat_key is shared by
+        # every sender, so chat_key-only keying let one user's /cancel stop
+        # a DIFFERENT user's run in the same group (STATUS.md audit
+        # finding). chat_key defaults to user_id for frontends without a
+        # separate chat concept (TUI/CLI), which still keys uniquely.
+        self._active_cancel: dict[tuple[int, int], threading.Event] = {}
 
         # Per-user CLI serialization. The agy CLI keeps ONE conversation per
         # user, and running two invocations against the same conversation at
@@ -543,10 +547,12 @@ class ZillaCore:
         schedules (bot.py checks it in NL schedule-detection)."""
         return uid in self._scheduled_running
 
-    def cancel(self, key: int) -> bool:
-        """Cancel the active CLI run for this chat key. Returns True if a
-        live (not yet set) cancel event was found and set."""
-        cancel_ev = self._active_cancel.get(key)
+    def cancel(self, chat_key: int, user_id: int) -> bool:
+        """Cancel the active CLI run for this (chat, user) pair. Returns
+        True if a live (not yet set) cancel event was found and set. Both
+        must match — see _active_cancel's comment for why chat_key alone
+        isn't enough in group chats."""
+        cancel_ev = self._active_cancel.get((chat_key, user_id))
         if cancel_ev and not cancel_ev.is_set():
             cancel_ev.set()
             return True
@@ -647,7 +653,7 @@ class ZillaCore:
 
         if skip_permissions is None:
             skip_permissions = self.auth.can(user_id, "admin")
-        key = user_id if chat_key is None else chat_key
+        key = (user_id if chat_key is None else chat_key, user_id)
         cancel_event = threading.Event()
 
         # Progress events arrive from the backend's worker thread; relay them

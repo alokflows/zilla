@@ -379,6 +379,86 @@ def test_inbox_delete_file():
 
 
 # ════════════════════════════════════════════════════════════
+#  MEDIA INGEST SIZE CAP (STATUS.md audit finding, PLAN.md M1 step 5)
+# ════════════════════════════════════════════════════════════
+
+import asyncio  # noqa: E402
+
+
+class _FakeTGFile:
+    def __init__(self, file_size):
+        self.file_size = file_size
+        self.downloaded = False
+
+    async def download_to_drive(self, path):
+        self.downloaded = True
+        with open(path, "wb") as f:
+            f.write(b"x" * 10)
+
+
+class _FakeBot:
+    def __init__(self, file_size):
+        self._tg_file = _FakeTGFile(file_size)
+
+    async def get_file(self, file_id):
+        return self._tg_file
+
+
+def test_media_size_cap_default_is_50mb():
+    check("media: default cap is 50 MB", media.DEFAULT_MAX_MEDIA_MB == 50)
+
+
+def test_media_size_cap_refuses_oversize():
+    config.set_setting("max_media_mb", 1)
+    dest = os.path.join(_tmpdir, f"media_cap_{os.urandom(4).hex()}")
+    bot = _FakeBot(file_size=2 * 1024 * 1024)  # 2 MB, over the 1 MB test cap
+
+    async def run():
+        try:
+            await media.download_telegram_file(bot, "fid", dest, "big.bin")
+            return None
+        except media.MediaTooLargeError as e:
+            return str(e)
+
+    msg = asyncio.run(run())
+    check("media: oversize file raises MediaTooLargeError", msg is not None, msg)
+    check("media: error message names the configured cap", msg and "1 MB" in msg, msg)
+    check("media: oversize file never downloaded", bot._tg_file.downloaded is False)
+    check("media: oversize file not written to disk",
+          not os.path.exists(dest) or not os.listdir(dest))
+    config.set_setting("max_media_mb", media.DEFAULT_MAX_MEDIA_MB)
+
+
+def test_media_size_cap_allows_under_limit():
+    config.set_setting("max_media_mb", 1)
+    dest = os.path.join(_tmpdir, f"media_cap_ok_{os.urandom(4).hex()}")
+    bot = _FakeBot(file_size=500 * 1024)  # 500 KB, under the 1 MB test cap
+
+    async def run():
+        return await media.download_telegram_file(bot, "fid", dest, "small.bin")
+
+    path = asyncio.run(run())
+    check("media: under-cap file downloads normally", os.path.exists(path))
+    check("media: under-cap file actually invoked download", bot._tg_file.downloaded is True)
+    config.set_setting("max_media_mb", media.DEFAULT_MAX_MEDIA_MB)
+
+
+def test_media_size_cap_unknown_size_is_allowed():
+    # Telegram doesn't always report file_size (it's an optional field) —
+    # absent/zero size must not be misread as "always oversize".
+    config.set_setting("max_media_mb", 1)
+    dest = os.path.join(_tmpdir, f"media_cap_unknown_{os.urandom(4).hex()}")
+    bot = _FakeBot(file_size=None)
+
+    async def run():
+        return await media.download_telegram_file(bot, "fid", dest, "unknown.bin")
+
+    path = asyncio.run(run())
+    check("media: unknown file_size is not blocked", os.path.exists(path))
+    config.set_setting("max_media_mb", media.DEFAULT_MAX_MEDIA_MB)
+
+
+# ════════════════════════════════════════════════════════════
 #  OUTBOX — browse/send/delete of agent-produced files (v4.6)
 # ════════════════════════════════════════════════════════════
 
@@ -476,6 +556,53 @@ def test_next_run_weekly():
     got = datetime.fromtimestamp(nxt)
     check("sched: weekly picks next chosen weekday",
           got == datetime(2026, 6, 3, 9, 0), str(got))
+
+
+from zoneinfo import ZoneInfo  # noqa: E402
+
+_NY = ZoneInfo("America/New_York")
+
+
+def test_next_run_dst_spring_forward():
+    # US 2026 spring-forward: clocks jump 2:00am -> 3:00am on 2026-03-08.
+    # A daily 09:00 schedule computed the evening before must still land on
+    # 09:00 local the next day (23h of real time elapsed, not 24h) — proving
+    # the tz-aware math tracks the wall-clock slot across the gap, pinned to
+    # an explicit zone so this is deterministic regardless of the host's TZ.
+    base = datetime(2026, 3, 7, 20, 0, tzinfo=_NY)
+    nxt = compute_next_run("daily", {"hh": 9, "mm": 0}, base.timestamp(), tz=_NY)
+    got = datetime.fromtimestamp(nxt, tz=_NY)
+    check("sched: daily crosses spring-forward -> still 09:00 local next day",
+          got == datetime(2026, 3, 8, 9, 0, tzinfo=_NY), str(got))
+    check("sched: real elapsed time is 12h (13h wall-clock minus the skipped hour)",
+          abs((nxt - base.timestamp()) - 12 * 3600) < 1, nxt - base.timestamp())
+
+
+def test_next_run_dst_fall_back():
+    # US 2026 fall-back: clocks repeat 1:00am->2:00am becomes 1:00am on
+    # 2026-11-01. A daily 09:00 schedule (well outside the ambiguous hour)
+    # computed the evening before must still land on 09:00 local the next
+    # day (25h of real time elapsed, not 24h).
+    base = datetime(2026, 10, 31, 20, 0, tzinfo=_NY)
+    nxt = compute_next_run("daily", {"hh": 9, "mm": 0}, base.timestamp(), tz=_NY)
+    got = datetime.fromtimestamp(nxt, tz=_NY)
+    check("sched: daily crosses fall-back -> still 09:00 local next day",
+          got == datetime(2026, 11, 1, 9, 0, tzinfo=_NY), str(got))
+    check("sched: real elapsed time is 14h (13h wall-clock plus the repeated hour)",
+          abs((nxt - base.timestamp()) - 14 * 3600) < 1, nxt - base.timestamp())
+
+
+def test_next_run_dst_weekly_spans_transition():
+    # Weekly schedule search window (up to 8 days) spans the spring-forward
+    # boundary; the picked slot must still land on the correct local
+    # wall-clock time on the far side.
+    # 2026-03-03 is a Tuesday; want Sunday (2026-03-08, the DST day itself).
+    base = datetime(2026, 3, 3, 8, 0, tzinfo=_NY)
+    nxt = compute_next_run("weekly", {"days": [6], "hh": 9, "mm": 0},
+                           base.timestamp(), tz=_NY)
+    got = datetime.fromtimestamp(nxt, tz=_NY)
+    check("sched: weekly slot lands correctly across a DST boundary",
+          got == datetime(2026, 3, 8, 9, 0, tzinfo=_NY), str(got))
 
 
 def _sm():
@@ -1001,12 +1128,19 @@ def main():
         test_inbox_counts,
         test_inbox_filter_returns_only_category,
         test_inbox_delete_file,
+        test_media_size_cap_default_is_50mb,
+        test_media_size_cap_refuses_oversize,
+        test_media_size_cap_allows_under_limit,
+        test_media_size_cap_unknown_size_is_allowed,
         test_outbox_lists_and_classifies,
         test_outbox_delete_is_path_scoped,
         test_detect_file_paths_posix,
         test_next_run_daily,
         test_next_run_interval_and_once,
         test_next_run_weekly,
+        test_next_run_dst_spring_forward,
+        test_next_run_dst_fall_back,
+        test_next_run_dst_weekly_spans_transition,
         test_schedule_add_due_touch,
         test_schedule_once_disables_after_run,
         test_schedule_reconcile_catchup,

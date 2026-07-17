@@ -3,3 +3,6 @@ SpeechRecognition==3.16.1
 pydub==0.25.1
 # Windows needs winpty (ConPTY) for the agy backend; Unix uses the stdlib `pty`.
 pywinpty; sys_platform == "win32"
+# stdlib zoneinfo has no IANA timezone database on Windows (schedules.py's
+# compute_next_run needs one for DST-correct daily/weekly math).
+tzdata; platform_system == "Windows"
