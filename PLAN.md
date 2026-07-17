@@ -179,7 +179,18 @@ injection, indexing, and git history.
 
 **Memory tiers (MemGPT model, mapped to files):**
 core = `MEMORY.md` (always in context) · archival = `Wiki/` (searched on
-demand) · recall buffer = `Journal/` (distilled nightly into Wiki, §5.M3).
+demand) · recall buffer = `Journal/` (distilled nightly into Wiki, §5.M4).
+
+**Recorded decision — MemGPT/Letta as a library: adopted as a pattern,
+rejected as a dependency.** The MemGPT codebase (and forks of it) is its own
+agent runtime: API-key-driven, vector-DB-backed, with its own loop — each of
+which contradicts a product invariant (CLI logins not API keys; P1 knowledge
+in plain Markdown; "harness, not another agent"). Zilla implements the
+paper's tier architecture natively, above. Known trade-off, consciously
+deferred: FTS5 is keyword search, not semantic search. If recall quality
+proves insufficient in practice, the upgrade path is a local embedding model
+indexing the same Markdown into the same disposable `zilla.db` (P1 intact) —
+a new sub-phase to be specced then, not speculatively now.
 
 ---
 
