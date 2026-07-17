@@ -576,6 +576,7 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 | 2026-07-16 | Turn-pipeline seam → `core.handle_message` (+`test_core.py`); scheduler seam Parts A+B → payload types, session modes, backend pins, retry ladder (+frozen `test_schedules_seam.py`). |
 | 2026-07-16 night | Live smoke: text/photo/doc/cancel ✅; `safe_send` 4× retry + raised PTB timeouts; voice fixed (`brew install flac` on Apple Silicon — add a doctor check in P2); reminder parser broadened; one-off reminders instant, `system_event` payloads (zero model call at fire), exact-time scheduler tick. |
 | 2026-07-17 | Bridge seam → core (`Ask` events over `subscribe()`, `pending_ask_for`/`answer_ask`; bot.py renders only). 334 green; bot restarted live. |
+| 2026-07-17 | `docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` — verdict: OpenClaw/Hermes have NO reviewer LLM; "effortless" = in-loop tool self-heal + persistence system prompt + deterministic delivery filter. Zilla plan: harness self-heal clause, unify scattered checks into one `review()` seam at both delivery points, surface existing `Progress` events into the ⏳ bubble (free "feels alive" win), steal-list #31–40. |
 
 ### Notes (only what a future session needs)
 
