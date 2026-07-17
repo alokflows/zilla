@@ -22,10 +22,11 @@ For any execution agent, every session:
 | Item | State | Notes |
 |---|---|---|
 | Planning (architecture, phases, blueprint) | ✅ done | Fable + owner, 2026-07-17 |
+| Independent adversarial review + amendments | ✅ done | 2nd Fable review: 2 critical, 5 high, 9 medium, 4 low — all verified against code and folded into PLAN.md |
 | M1 SQLite store + migration | ⬜ next | |
 | M2 Memory layout + injection | ⬜ | |
-| M3 FTS5 + nightly distillation | ⬜ | |
-| M4 Memory git + quiet runs | ⬜ | |
+| M3 FTS5 + memory git + quiet runs | ⬜ | |
+| M4 Nightly distillation + /memory + change surfacing | ⬜ | |
 | H1 Heartbeat loop | ⬜ | |
 | H2 Health probes + assisted re-login | ⬜ | |
 | H3 systemd service | ⬜ | |
