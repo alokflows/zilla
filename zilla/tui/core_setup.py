@@ -58,6 +58,12 @@ def build_core() -> tuple[ZillaCore | None, int, str | None]:
     is ever configured.
     """
     try:
+        # First-start migration (PLAN.md §3.1/§5 M1 step 3) — a no-op once
+        # already migrated, so this is cheap and safe on every launch. The
+        # TUI is a standalone frontend (see module docstring) and may be
+        # the very first thing a fresh install runs, so it needs the same
+        # migration bot.py's startup does, not just a copy for parity.
+        config.run_first_start_migration()
         sessions = SessionManager(config.SESSIONS_FILE)
         auth = AuthManager(config.USERS_FILE, config.OWNER_CHAT_ID)
         core = ZillaCore(

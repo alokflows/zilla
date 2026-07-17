@@ -185,6 +185,34 @@ SETTINGS_FILE = DB_FILE
 USERS_FILE = DB_FILE
 SCHEDULES_FILE = DB_FILE
 
+# Original pre-M1 locations, kept ONLY so run_first_start_migration() (below)
+# knows where to look for data to import. Never assign these to the *_FILE
+# names above — those all point at the new shared DB_FILE now.
+_LEGACY_SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
+_LEGACY_SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+_LEGACY_USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
+_LEGACY_DENIED_FILE = os.path.join(BASE_DIR, "denied_users.json")
+_LEGACY_SCHEDULES_FILE = os.path.join(BASE_DIR, "schedules.json")
+
+
+def run_first_start_migration() -> dict:
+    """Import the five legacy JSON files (if any still exist) into the
+    shared zilla.db. PLAN.md §3.1/§5 M1 step 3 — idempotent, single
+    transaction, renames originals to *.migrated only after a successful
+    commit, never deletes them. Deliberately NOT called at module import
+    time (this file is imported by nearly every test and by bot.py itself
+    just to read constants) — the bot's own startup path calls this once,
+    explicitly, before constructing any manager."""
+    from zilla.migrate import migrate_legacy_json
+    return migrate_legacy_json(
+        store.get_store(DB_FILE),
+        sessions_file=_LEGACY_SESSIONS_FILE,
+        schedules_file=_LEGACY_SCHEDULES_FILE,
+        users_file=_LEGACY_USERS_FILE,
+        denied_file=_LEGACY_DENIED_FILE,
+        settings_file=_LEGACY_SETTINGS_FILE,
+    )
+
 # ┌─────────────────────────────────────────────────────────┐
 # │  USER MANAGEMENT                                        │
 # │                                                         │

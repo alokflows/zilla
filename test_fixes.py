@@ -819,6 +819,162 @@ def test_platform_compat_imports_clean():
 
 
 # ════════════════════════════════════════════════════════════
+#  MIGRATION (first-start JSON → SQLite import, PLAN.md §5 M1 step 3)
+# ════════════════════════════════════════════════════════════
+
+import zilla.store as zstore  # noqa: E402
+from zilla.migrate import migrate_legacy_json  # noqa: E402
+
+
+def _write_legacy_fixture(base: str):
+    """Write all five pre-M1 JSON files at base_* paths and return their
+    paths plus the raw data written, so callers can assert against it."""
+    sessions_path = os.path.join(base, "sessions.json")
+    schedules_path = os.path.join(base, "schedules.json")
+    users_path = os.path.join(base, "authorized_users.json")
+    denied_path = os.path.join(base, "denied_users.json")
+    settings_path = os.path.join(base, "settings.json")
+
+    sessions_data = {
+        "sessions": {
+            "42_main": {
+                "name": "main", "user_id": 42, "conversation_id": "conv-abc",
+                "conv_backend": "claude", "created": "2026-01-01 09:00:00",
+                "last_used": "2026-01-02 10:00:00", "messages": 3,
+                "last_seen_step": 5, "title": "hello world",
+            },
+            "42_work": {
+                "name": "work", "user_id": 42, "conversation_id": None,
+                "created": "2026-01-01 09:05:00", "messages": 0,
+                "last_seen_step": 0, "title": None,
+            },
+        },
+        "active_per_user": {"42": "main"},
+    }
+    schedules_data = {
+        "s1": {
+            "id": "s1", "user_id": 42, "chat_id": 42, "prompt": "ping",
+            "title": "ping", "kind": "daily", "spec": {"hh": 9, "mm": 0},
+            "enabled": True, "created": "2026-01-01 08:00:00",
+            "last_run": None, "next_run": 1893456000.0,
+            "session_name": None, "session": "isolated",
+            "payload_type": "message", "backend": "claude", "model": "sonnet",
+            "backend_pin_notified": False, "fail_count": 0,
+        },
+    }
+    users_data = {
+        "42": {"name": "Legacy Admin", "role": "admin", "added_at": "2026-01-01 00:00:00"},
+        "43": {"name": "Old Style", "role": "user", "added_at": "2026-01-01 00:00:00"},
+    }
+    denied_data = [99]
+    settings_data = {"backend": "claude", "idle_kill_after": 300}
+
+    with open(sessions_path, "w", encoding="utf-8") as f:
+        json.dump(sessions_data, f)
+    with open(schedules_path, "w", encoding="utf-8") as f:
+        json.dump(schedules_data, f)
+    with open(users_path, "w", encoding="utf-8") as f:
+        json.dump(users_data, f)
+    with open(denied_path, "w", encoding="utf-8") as f:
+        json.dump(denied_data, f)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(settings_data, f)
+
+    return dict(sessions=sessions_path, schedules=schedules_path, users=users_path,
+                denied=denied_path, settings=settings_path)
+
+
+def test_migration_round_trip():
+    base = os.path.join(_tmpdir, f"migrate_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    paths = _write_legacy_fixture(base)
+    db_path = os.path.join(base, "zilla.db")
+    db = zstore.get_store(db_path)
+
+    stats = migrate_legacy_json(
+        db, sessions_file=paths["sessions"], schedules_file=paths["schedules"],
+        users_file=paths["users"], denied_file=paths["denied"],
+        settings_file=paths["settings"],
+    )
+    check("migrate: imported 2 sessions", stats["sessions"] == 2, stats)
+    check("migrate: imported 1 schedule", stats["schedules"] == 1, stats)
+    check("migrate: imported 2 users", stats["users"] == 2, stats)
+    check("migrate: imported 1 denied", stats["denied"] == 1, stats)
+    check("migrate: imported 2 settings", stats["settings"] == 2, stats)
+
+    row = db.sessions_get(42, "main")
+    check("migrate: session field translation (conv_id)", row["conv_id"] == "conv-abc")
+    check("migrate: session is_active flag from active_per_user", row["is_active"] == 1)
+    other = db.sessions_get(42, "work")
+    check("migrate: second session not active", other["is_active"] == 0)
+
+    sched = db.schedules_get("s1")
+    check("migrate: schedule present", sched is not None)
+    check("migrate: schedule spec round-trips as dict", sched["spec"] == {"hh": 9, "mm": 0})
+    check("migrate: schedule backend/model carried", sched["backend"] == "claude" and sched["model"] == "sonnet")
+
+    u42 = db.users_get(42)
+    check("migrate: user role kept when valid", u42["role"] == "admin")
+    u43 = db.users_get(43)
+    check("migrate: legacy 'user' role normalizes to admin", u43["role"] == "admin")
+    check("migrate: denied uid present", db.users_is_denied(99))
+    check("migrate: settings values round-trip",
+          db.get_setting("backend") == "claude" and db.get_setting("idle_kill_after") == 300)
+
+    check("migrate: originals renamed to *.migrated, never deleted",
+          all(os.path.exists(p + ".migrated") and not os.path.exists(p) for p in paths.values()))
+
+
+def test_migration_no_legacy_files_is_noop():
+    base = os.path.join(_tmpdir, f"migrate_empty_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    db = zstore.get_store(os.path.join(base, "zilla.db"))
+    stats = migrate_legacy_json(
+        db, sessions_file=os.path.join(base, "sessions.json"),
+        schedules_file=os.path.join(base, "schedules.json"),
+        users_file=os.path.join(base, "authorized_users.json"),
+        denied_file=os.path.join(base, "denied_users.json"),
+        settings_file=os.path.join(base, "settings.json"),
+    )
+    check("migrate: no legacy files -> all-zero stats", all(v == 0 for v in stats.values()), stats)
+
+
+def test_migration_interrupted_retry_is_idempotent():
+    """Simulates a crash between commit and rename (or a caller re-invoking
+    migration with the pre-rename files still in place, e.g. a retried
+    first start): running the import twice against the SAME source data
+    must not error or duplicate rows — every insert is a keyed upsert."""
+    base = os.path.join(_tmpdir, f"migrate_retry_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    paths = _write_legacy_fixture(base)
+    db_path = os.path.join(base, "zilla.db")
+    db = zstore.get_store(db_path)
+
+    migrate_legacy_json(
+        db, sessions_file=paths["sessions"], schedules_file=paths["schedules"],
+        users_file=paths["users"], denied_file=paths["denied"],
+        settings_file=paths["settings"],
+    )
+    # Restore the originals from their *.migrated backups, as if the
+    # rename step is what a crash interrupted (commit happened, rename
+    # didn't) and the next start retries against the same files.
+    for p in paths.values():
+        os.replace(p + ".migrated", p)
+
+    stats2 = migrate_legacy_json(
+        db, sessions_file=paths["sessions"], schedules_file=paths["schedules"],
+        users_file=paths["users"], denied_file=paths["denied"],
+        settings_file=paths["settings"],
+    )
+    check("migrate: retry attempts the same rows", stats2["sessions"] == 2 and stats2["schedules"] == 1)
+    check("migrate: retry does not duplicate sessions",
+          len(db.sessions_list(42)) == 2)
+    check("migrate: retry does not duplicate schedules", len(db.schedules_all()) == 1)
+    check("migrate: retry does not duplicate users", db.users_count() == 2)
+    check("migrate: retry does not corrupt denied list", db.users_denied_list() == [99])
+
+
+# ════════════════════════════════════════════════════════════
 
 def main():
     tests = [
@@ -867,6 +1023,9 @@ def main():
         test_model_catalog_per_backend,
         test_platform_compat_lock,
         test_platform_compat_imports_clean,
+        test_migration_round_trip,
+        test_migration_no_legacy_files_is_noop,
+        test_migration_interrupted_retry_is_idempotent,
     ]
     print("Running zilla fix tests...\n")
     for t in tests:

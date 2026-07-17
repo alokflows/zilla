@@ -72,6 +72,7 @@ from config import (
     OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES, BRAIN_DIR,
     SCHEDULES_FILE, agy_models_live,
     model_catalog, get_backend, set_backend,
+    run_first_start_migration,
 )
 from sessions import SessionManager
 import zilla.core as zcore
@@ -2727,6 +2728,11 @@ def main():
     # files carry conversation ids + auto-titled message snippets).
     _harden_file_perms()
     _prune_old_logs()
+    # First-start migration (PLAN.md §3.1/§5 M1 step 3): import any pre-M1
+    # sessions.json/schedules.json/authorized_users.json/denied_users.json/
+    # settings.json into the shared zilla.db, once, before any manager
+    # below touches the store. No-op (all zeros) once already migrated.
+    run_first_start_migration()
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)

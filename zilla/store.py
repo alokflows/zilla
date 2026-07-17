@@ -193,6 +193,17 @@ class Store:
         _configure(conn, read_only=False)
         return conn
 
+    def transaction(self, fn):
+        """Public entry point for callers outside store.py (e.g.
+        zilla/migrate.py's first-start import) that need several
+        statements to commit as one atomic transaction — the same
+        writer-lock mechanism every mutator method above uses via
+        _write. Migration data is small (one owner's sessions/schedules/
+        users), so one transaction is correct and simpler than batching;
+        large bulk work (FTS reindex) should use connect_bulk() and
+        commit in batches instead, so it never holds this lock for long."""
+        return self._write(fn)
+
     def _write(self, fn):
         """Run fn(conn) inside the writer lock as one transaction."""
         with self._write_lock:
