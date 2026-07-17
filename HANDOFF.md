@@ -302,16 +302,20 @@ V phase order (see the notice at the top of this file), not the old
 P0-P10 list.** PLAN.md was written on a branch that forked before this
 code existed, so its phase list doesn't know P1.5/CLI/TUI/approvals are
 already done — the reconciliation checklist below maps PLAN.md's phases
-onto that reality. **NEXT UNIT OF WORK: Phase M1 — `store.py` + first-start
-migration** (PLAN.md §5.M1). Everything after M1 in PLAN.md's order
-depends on the store existing, so M1 goes first, alone, with the full
-test gate before and after.
+onto that reality. **M1 (`store.py` + migration) is COMPLETE — every
+step and every accept-criteria test from PLAN.md §5.M1 is committed and
+green.** **NEXT UNIT OF WORK: Phase M2 — Memory layout
+(`AGI-Brain/Memory/`) + injection** (PLAN.md §5.M2), full test gate
+before and after.
 **Working branch (source of truth):** `claude/zilla-harness-review-0v96bs`
-**Tests:** 204+16+112+57 core + 71 review + 17 tui + 69 cli = **546 green**
+**Tests:** 260+16+116+57 core + 71 review + 17 tui + 69 cli = **606 green**
 — `.venv/bin/python test_fixes.py / test_interactive.py / test_core.py /
 test_schedules_seam.py / test_review.py / test_tui.py / test_zilla_cli.py`
 (test_schedules_seam.py is a frozen acceptance spec — never edit it) +
 `import bot; import zilla.core; import zilla.cli; import zilla.tui.app`.
+M1 note: importing `bot` now safely exercises `_harden_file_perms`/
+`_maybe_backup_db` against tmp paths (see `bot._harden_file_perms`'s
+`base=` param) — never the real repo's `.env`/`sessions.json`/`zilla.db`.
 **Bot:** live on the owner's MacBook (@Mangomangos_bot; `.env` exists here,
 git-ignored). After changing `bot.py`: `zilla stop` + `zilla start` (or
 `.venv/bin/python -m zilla.cli stop/start`), confirm "Application started"
@@ -328,8 +332,8 @@ in its log.
 - [ ] **P2** Conversational onboarding + Telegram-as-connector unification — folds into PLAN.md's T1.
 
 **PLAN.md phases (strict order, §13 — do not skip ahead):**
-- [ ] **M1** `store.py` (SQLite+WAL) + first-start migration from the 5 JSON files — genuinely new. NEXT.
-- [ ] **M2** Memory layout (`AGI-Brain/Memory/`) + injection + `TurnContext` threading — genuinely new.
+- [x] **M1** `store.py` (SQLite+WAL) + first-start migration from the 5 JSON files — DONE 2026-07-18 (6 commits, `store.py`/thin wrappers/migration/doctor DB checks/audit-debt burn-down/secrets hygiene+backup/acceptance tests). 606 green.
+- [ ] **M2** Memory layout (`AGI-Brain/Memory/`) + injection + `TurnContext` threading — genuinely new. NEXT.
 - [ ] **M3** FTS5 search + memory git + quiet-run mode — genuinely new.
 - [ ] **M4** Nightly distillation + `/memory` command + change surfacing — genuinely new.
 - [ ] **H1** Heartbeat loop — genuinely new.
@@ -359,6 +363,7 @@ in its log.
 | 2026-07-17 pm | `zilla` CLI landed (+69 tests = 465 green). Found the bot DEAD since 08:22 (httpx ConnectError killed PTB, no auto-restart — P7 evidence); restarted live via `zilla start` ✅. config.py gained per-backend model helpers (`get/set_model_for`, `model_catalog_for`). |
 | 2026-07-17 pm | P1.5 router merged (built in parallel worktree): `zilla/review.py` gate + triage, harness `_SELF_HEAL`, smalltalk fast path (`claude --model haiku`), share→wiki journal, steal #36, 👀 ack + Progress→⏳-bubble. Orchestrator patched `_SELF_HEAL` post-merge to restore the spec's destructive/irreversible/costs-money stop-condition. Bot restarted on merged code. Awaiting owner live smoke. |
 | 2026-07-17 eve | GOD MODE round 2 FAILED: 5 parallel Sonnet executors (P7/P2-onboarding/P8/P9/P6) killed by the shared usage limit in ~5 min, zero commits; worktrees deleted (only scrap: partial tui/wizard.py, discarded). Salvage: `faster-whisper` is already pip-installed in `.venv` (P9/V can skip that step). Owner decree: parallel fan-out BANNED → serial execution protocol. Antigravity suggestions reviewed → verdicts in Notes; P11 WhatsApp connector parked. |
+| 2026-07-18 | **M1 COMPLETE** (6 commits): `store.py` (SQLite+WAL, typed accessors); sessions/schedules/users/config swapped to thin store wrappers; first-start migration of the 5 legacy JSON files (idempotent, rename-after-commit); `install.py --doctor` DB checks; audit-debt burn-down (tz-aware `compute_next_run` via `zoneinfo`, `_active_cancel` keyed `(chat_id, uid)`, `max_media_mb` ingest cap); secrets hygiene (`_harden_file_perms` covers `zilla.db*`/`Memory/`, nightly `VACUUM INTO` → `zilla.db.bak`+`.bak.1` rotation via a new `_backup_loop` task); every PLAN.md accept-criteria test committed (concurrent-mutation, reader-never-blocks, DST both directions, cancel-keying, media-cap, perms, doctor-OK). 606 green. Production `sessions.json`/`schedules.json` confirmed untouched throughout — no real `zilla.db` was ever created by a test run. |
 | 2026-07-17 night | Paused mid-build on a P7 health-loop (stashed, uncommitted — `zilla/core.py` health task + `bot.py` alert-runbook rendering) when the owner surfaced `PLAN.md`: a separate, from-scratch, adversarially-reviewed plan (Fable + owner) found on remote branch `claude/python-cli-bot-planning-80x8a3` (not yet fetched locally before this session — discovered via `git fetch --prune`). That branch forked at `85d5893`, before P1.5/CLI/TUI/approvals existed, and has no code changes of its own — docs only. Owner decision (asked directly): bring PLAN.md onto this shipped-code branch rather than switch branches or discard either plan. PLAN.md copied here as a new file; this file's old §6 (P0-P10) and status board reconciled to point at PLAN.md's M/H/R/S/G/T/V order (see notice at top). Old antigravity verdict rejecting SQLite (below) is now superseded — PLAN.md's adoption of SQLite+WAL for M1 is the settled decision. |
 
 ### Notes (only what a future session needs)
