@@ -31,9 +31,11 @@
 import asyncio
 import logging
 import threading
+import time
 import time as _time
 from dataclasses import dataclass, field
 
+import zilla.interactive as interactive
 from zilla.cli_engine import run_cli_async, get_latest_step, detect_limit
 from zilla.config import get_backend, get_model, get_setting
 from zilla.formatter import detect_file_paths
@@ -41,6 +43,12 @@ from zilla.harness import log_event
 from zilla.schedules import resolve_session_mode, backend_pin_mismatch
 
 logger = logging.getLogger(__name__)
+
+# How long a chat stays bound to one outstanding bridge ask (see
+# ZillaCore.pending_ask_for). After this, an unanswered (orphaned) ask must
+# NOT keep swallowing the user's next unrelated message. Same value/semantics
+# as bot.py's old _BRIDGE_PENDING_TTL.
+BRIDGE_PENDING_TTL = 900.0
 
 
 # ══════════════════════════════════════════════════════════
@@ -58,11 +66,24 @@ class Progress:
 
 @dataclass
 class Ask:
-    """Agent needs a human (otp/password/text/confirm). Placeholder — the
-    bridge watcher moves here in a later seam (CORE_API migration step 4)."""
+    """Agent needs a human (otp/password/text/confirm) — the credential/OTP
+    bridge (docs/dev/CORE_API.md migration step 4). Broadcast by the core's
+    bridge watcher (_bridge_watcher_loop) via subscribe() when the agent
+    writes a Bridge/ask_*.json file (see zilla/interactive.py for the file
+    protocol); a frontend renders it (Telegram: DM with the prompt) and later
+    hands the human's reply to core.answer_ask(). Also yieldable from
+    handle_message per CORE_API, for a future in-turn ask path.
+
+    chat_id    — which chat/user this ask targets (falls back to the core's
+                 owner_chat_id when the ask itself carries none).
+    is_secret  — True for otp/password kinds; frontends should mask/delete
+                 the reply rather than leave it sitting in chat history.
+    """
     id: str
     kind: str
     prompt: str
+    chat_id: int = None
+    is_secret: bool = False
 
 
 @dataclass
@@ -134,13 +155,29 @@ class ZillaCore:
     exactly one source of truth while bot.py still holds its own references.
     """
 
-    def __init__(self, sessions, auth, schedules=None):
+    def __init__(self, sessions, auth, schedules=None, owner_chat_id: int = None,
+                 bridge_dir: str = None):
         self.sessions = sessions
         self.auth = auth
         # ScheduleManager, optional. None ⇒ this core runs no scheduler (used
         # by tests that only exercise the turn pipeline — start()/stop() are
         # then no-ops). bot.py always passes the real one.
         self.schedules = schedules
+
+        # Human-in-the-loop credential/OTP bridge (docs/dev/CORE_API.md
+        # migration step 4; file protocol in zilla/interactive.py).
+        # owner_chat_id is the fallback target for an ask that carries no
+        # chat_id of its own (e.g. an ask written by a scheduled/background
+        # run rather than a live chat turn).
+        self.owner_chat_id = owner_chat_id
+        self._bridge_dir = bridge_dir or interactive.BRIDGE_DIR
+        # Ask ids already broadcast via subscribe() — so the watcher never
+        # re-announces the same ask (bot.py used to DM it once and remember).
+        self._bridge_announced: set[str] = set()
+        # Which ask each chat currently owes an answer for: chat key ->
+        # (ask_id, announced_ts, is_secret). One outstanding ask per chat.
+        self._pending_asks: dict[int, tuple[str, float, bool]] = {}
+        self._bridge_task: asyncio.Task | None = None
 
         # Per-chat cancel events — set to cancel the active CLI request for
         # that chat. Keyed by the frontend's chat key (Telegram: chat_id;
@@ -184,13 +221,18 @@ class ZillaCore:
     # ── lifecycle ───────────────────────────────────────────
 
     async def start(self):
-        """Start background runtime. This seam: the scheduler loop. Bridge
-        watcher and health loop land here in later seams (CORE_API migration
-        steps 4/6). No-op if built without a ScheduleManager."""
+        """Start background runtime: the scheduler loop (only if a
+        ScheduleManager was provided) and the bridge watcher (CORE_API
+        migration step 4 — always started; it is independent of the
+        scheduler). Health loop lands here in a later seam (step 6)."""
         if self.schedules is not None and self._sched_task is None:
             self._sched_task = asyncio.create_task(self._scheduler_loop())
+        interactive.ensure_bridge_dir(self._bridge_dir)
+        if self._bridge_task is None:
+            self._bridge_task = asyncio.create_task(self._bridge_watcher_loop())
 
     async def stop(self):
+        """Stop the scheduler loop and the bridge watcher, cleanly."""
         if self._sched_task is not None:
             self._sched_task.cancel()
             try:
@@ -200,6 +242,15 @@ class ZillaCore:
             except Exception as e:  # pragma: no cover - defensive
                 logger.error(f"[SCHED] stop() cleanup error: {e}")
             self._sched_task = None
+        if self._bridge_task is not None:
+            self._bridge_task.cancel()
+            try:
+                await self._bridge_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(f"[BRIDGE] stop() cleanup error: {e}")
+            self._bridge_task = None
 
     # ── background event broadcast ─────────────────────────
 
@@ -251,6 +302,36 @@ class ZillaCore:
             cancel_ev.set()
             return True
         return False
+
+    # ── credential/OTP bridge (CORE_API migration step 4) ──
+
+    def pending_ask_for(self, chat_key: int) -> tuple | None:
+        """If this chat currently owes an answer to a bridge ask, return
+        (ask_id, is_secret) so the frontend can treat its next message as
+        that answer instead of a normal turn. Returns None if there is
+        nothing pending — including when the pending ask has gone stale
+        (announced more than BRIDGE_PENDING_TTL seconds ago): the entry is
+        popped and the ask file cleared here, exactly the old bot.py
+        stale-release behavior, so the caller's next message flows on as a
+        normal turn."""
+        entry = self._pending_asks.get(chat_key)
+        if not entry:
+            return None
+        ask_id, announced_ts, is_secret = entry
+        if time.time() - announced_ts > BRIDGE_PENDING_TTL:
+            self._pending_asks.pop(chat_key, None)
+            interactive.clear_ask(ask_id, bridge_dir=self._bridge_dir)
+            return None
+        return ask_id, is_secret
+
+    def answer_ask(self, ask_id: str, text: str) -> None:
+        """Record the human's reply for a pending bridge ask and release the
+        chat that owed it. Exceptions from interactive.write_answer (bad id,
+        oversize value) propagate — the frontend renders the failure."""
+        interactive.write_answer(ask_id, text, bridge_dir=self._bridge_dir)
+        for key, (aid, _ts, _secret) in list(self._pending_asks.items()):
+            if aid == ask_id:
+                self._pending_asks.pop(key, None)
 
     # ── conversation pinning ───────────────────────────────
 
@@ -360,6 +441,64 @@ class ZillaCore:
         finally:
             if self._active_cancel.get(key) is cancel_event:
                 self._active_cancel.pop(key, None)
+
+    # ══════════════════════════════════════════════════════
+    #  CREDENTIAL/OTP BRIDGE WATCHER  (docs/dev/CORE_API.md migration step 4)
+    # ══════════════════════════════════════════════════════
+    #
+    #  Moved from bot.py's bridge_watcher — polls the Bridge dir (file
+    #  protocol in zilla/interactive.py) for asks the agent has written and
+    #  broadcasts each one as an Ask event via subscribe(); Telegram is a
+    #  pure renderer of it (bot.py's _deliver_ask). pending_ask_for/
+    #  answer_ask (above) close the loop: a frontend checks whether a chat
+    #  owes a reply, then hands the human's answer back through answer_ask.
+
+    async def _bridge_poll_once(self) -> None:
+        """One poll pass over the Bridge dir — factored out of the loop so
+        tests can drive it deterministically without sleeping.
+
+        If nobody is subscribed, skip announcing entirely: an ask must never
+        be marked announced while no frontend can hear it (that would lose
+        it forever instead of retrying next pass — the old bot.py behavior
+        of "retry until deliverable")."""
+        if self._subscribers:
+            for ask in interactive.read_pending_asks(bridge_dir=self._bridge_dir):
+                if ask.id in self._bridge_announced:
+                    continue
+                target = ask.chat_id or self.owner_chat_id
+                if not target:
+                    continue
+                cur = self._pending_asks.get(target)
+                if cur and cur[0] != ask.id:
+                    continue  # one outstanding ask per chat at a time
+                self._broadcast(Ask(id=ask.id, kind=ask.kind, prompt=ask.prompt,
+                                     chat_id=target, is_secret=ask.is_secret))
+                self._bridge_announced.add(ask.id)
+                self._pending_asks[target] = (ask.id, time.time(), ask.is_secret)
+                log_event("bridge_ask", kind=ask.kind, chat=target)
+
+        interactive.expire_stale(bridge_dir=self._bridge_dir)
+        # Forget announced asks that are gone (answered+cleared) so the maps
+        # don't grow unbounded.
+        live = {a.id for a in interactive.read_pending_asks(bridge_dir=self._bridge_dir)}
+        for aid in list(self._bridge_announced):
+            if aid not in live:
+                self._bridge_announced.discard(aid)
+                for cid, pv in list(self._pending_asks.items()):
+                    if pv[0] == aid:
+                        self._pending_asks.pop(cid, None)
+
+    async def _bridge_watcher_loop(self) -> None:
+        """Background loop: poll the Bridge dir every 2s, same cadence and
+        error-swallowing as the old bot.py bridge_watcher. Inert when the
+        agent isn't asking for anything."""
+        logger.info("[BRIDGE] credential/OTP watcher started")
+        while True:
+            try:
+                await self._bridge_poll_once()
+            except Exception as e:
+                logger.error(f"[BRIDGE] watcher error: {e}", exc_info=True)
+            await asyncio.sleep(2)
 
     # ══════════════════════════════════════════════════════
     #  SCHEDULER RUNTIME  (docs/dev/CORE_API.md migration step 3)

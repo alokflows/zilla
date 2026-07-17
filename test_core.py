@@ -8,7 +8,9 @@
 #  Covers: event sequence (Progress* then exactly one Response),
 #  session bookkeeping (conv id + backend tag + message count),
 #  per-user lock serialization, cancel path, and cancel-event
-#  identity cleanup.
+#  identity cleanup. Also (CORE_API migration step 4): the
+#  credential/OTP bridge watcher (_bridge_poll_once, pending_ask_for,
+#  answer_ask, start()/stop() of the bridge task).
 #
 #  Run:  python test_core.py
 #  Exit code 0 = all passed, 1 = something failed.
@@ -19,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 _passed = 0
 _failed = 0
@@ -47,9 +50,10 @@ config.SETTINGS_FILE = os.path.join(_tmpdir, "bot_settings.json")
 config._settings_cache = None
 
 import zilla.core as zcore  # noqa: E402
-from zilla.core import ZillaCore, Progress, Response  # noqa: E402
+from zilla.core import ZillaCore, Progress, Response, Ask, BRIDGE_PENDING_TTL  # noqa: E402
 from zilla.sessions import SessionManager  # noqa: E402
 from zilla.users import AuthManager  # noqa: E402
+import zilla.interactive as interactive  # noqa: E402
 
 OWNER = 111
 
@@ -58,6 +62,17 @@ def _fresh_core(tag: str) -> ZillaCore:
     sessions = SessionManager(os.path.join(_tmpdir, f"sessions_{tag}.json"))
     auth = AuthManager(os.path.join(_tmpdir, f"users_{tag}.json"), OWNER)
     return ZillaCore(sessions=sessions, auth=auth)
+
+
+def _fresh_bridge_core(tag: str, owner_chat_id=OWNER) -> tuple:
+    """A core wired for the bridge tests, with its own isolated bridge_dir
+    (so ask_/answer_ files from one test never leak into another)."""
+    sessions = SessionManager(os.path.join(_tmpdir, f"sessions_{tag}.json"))
+    auth = AuthManager(os.path.join(_tmpdir, f"users_{tag}.json"), OWNER)
+    bridge_dir = os.path.join(_tmpdir, f"bridge_{tag}")
+    core = ZillaCore(sessions=sessions, auth=auth, owner_chat_id=owner_chat_id,
+                     bridge_dir=bridge_dir)
+    return core, bridge_dir
 
 
 class _patched:
@@ -293,6 +308,220 @@ def test_error_cleanup():
           f"{info}")
 
 
+# ── 6. bridge — one ask announced exactly once ──────────────
+
+def test_bridge_announce_once():
+    print("\n[6] Bridge — a written ask is announced exactly once")
+    core, bridge_dir = _fresh_bridge_core("announce")
+    q = asyncio.Queue()
+    core.subscribe(q)
+
+    ask = interactive.make_ask("otp", "code?", chat_id=555)
+    interactive.write_ask(ask, bridge_dir=bridge_dir)
+
+    async def run():
+        await core._bridge_poll_once()
+        first_events = []
+        while not q.empty():
+            first_events.append(q.get_nowait())
+        await core._bridge_poll_once()  # second poll — must not re-announce
+        second_events = []
+        while not q.empty():
+            second_events.append(q.get_nowait())
+        return first_events, second_events
+
+    first, second = asyncio.run(run())
+    check("exactly one Ask on first poll",
+          len(first) == 1 and isinstance(first[0], Ask), f"{first}")
+    ev = first[0]
+    check("id matches", ev.id == ask.id)
+    check("kind matches", ev.kind == "otp")
+    check("prompt matches", ev.prompt == "code?")
+    check("chat_id matches", ev.chat_id == 555)
+    check("is_secret True for otp", ev.is_secret is True)
+    check("no re-announce on second poll", second == [], f"{second}")
+
+
+# ── 7. bridge — no subscribers means nothing announced ──────
+
+def test_bridge_no_subscribers():
+    print("\n[7] Bridge — no subscribers ⇒ no announce; subscribing unblocks it")
+    core, bridge_dir = _fresh_bridge_core("nosub")
+    ask = interactive.make_ask("text", "name?", chat_id=222)
+    interactive.write_ask(ask, bridge_dir=bridge_dir)
+
+    async def run():
+        await core._bridge_poll_once()
+        not_announced = ask.id not in core._bridge_announced
+        q = asyncio.Queue()
+        core.subscribe(q)
+        await core._bridge_poll_once()
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        return not_announced, events
+
+    not_announced, events = asyncio.run(run())
+    check("not announced while unsubscribed", not_announced)
+    check("announced once a subscriber exists",
+          len(events) == 1 and isinstance(events[0], Ask), f"{events}")
+
+
+# ── 8. bridge — chat_id fallback to owner; no target ⇒ skipped ──
+
+def test_bridge_chat_id_fallback():
+    print("\n[8] Bridge — falsy ask.chat_id falls back to owner_chat_id")
+    core, bridge_dir = _fresh_bridge_core("fallback", owner_chat_id=999)
+    q = asyncio.Queue()
+    core.subscribe(q)
+    ask = interactive.make_ask("confirm", "proceed?", chat_id=0)
+    interactive.write_ask(ask, bridge_dir=bridge_dir)
+
+    async def poll_and_drain():
+        await core._bridge_poll_once()
+        out = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+    events = asyncio.run(poll_and_drain())
+    check("falls back to owner_chat_id",
+          len(events) == 1 and events[0].chat_id == 999, f"{events}")
+
+    # Neither ask.chat_id nor owner_chat_id ⇒ skipped, never announced.
+    core2, bridge_dir2 = _fresh_bridge_core("fallback_none", owner_chat_id=None)
+    q2 = asyncio.Queue()
+    core2.subscribe(q2)
+    ask2 = interactive.make_ask("confirm", "proceed?", chat_id=0)
+    interactive.write_ask(ask2, bridge_dir=bridge_dir2)
+
+    async def run2():
+        await core2._bridge_poll_once()
+
+    asyncio.run(run2())
+    check("no target ⇒ not announced", ask2.id not in core2._bridge_announced)
+    check("no target ⇒ queue empty", q2.empty())
+
+
+# ── 9. bridge — one outstanding ask per chat ─────────────────
+
+def test_bridge_one_outstanding_per_chat():
+    print("\n[9] Bridge — one outstanding ask per chat; next announces after answer")
+    core, bridge_dir = _fresh_bridge_core("onepc")
+    q = asyncio.Queue()
+    core.subscribe(q)
+    chat = 777
+    ask1 = interactive.make_ask("otp", "first code?", chat_id=chat)
+    interactive.write_ask(ask1, bridge_dir=bridge_dir)
+
+    async def poll_and_drain():
+        await core._bridge_poll_once()
+        out = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+    events1 = asyncio.run(poll_and_drain())
+    check("first ask announced", len(events1) == 1 and events1[0].id == ask1.id,
+          f"{events1}")
+
+    ask2 = interactive.make_ask("otp", "second code?", chat_id=chat)
+    interactive.write_ask(ask2, bridge_dir=bridge_dir)
+    events2 = asyncio.run(poll_and_drain())
+    check("second ask NOT announced while first pending", events2 == [], f"{events2}")
+
+    # Answer the first — it disappears from the pending set (has an answer
+    # file) — one more poll both cleans it up and frees the chat for ask2.
+    core.answer_ask(ask1.id, "123456")
+    events3 = asyncio.run(poll_and_drain())
+    check("second ask announces once first is answered",
+          len(events3) == 1 and events3[0].id == ask2.id, f"{events3}")
+
+
+# ── 10. pending_ask_for / answer_ask ─────────────────────────
+
+def test_pending_ask_for_and_answer():
+    print("\n[10] pending_ask_for returns (id, is_secret); answer_ask records + clears")
+    core, bridge_dir = _fresh_bridge_core("pending")
+    q = asyncio.Queue()
+    core.subscribe(q)
+    chat = 42
+    ask = interactive.make_ask("password", "pw?", chat_id=chat)
+    interactive.write_ask(ask, bridge_dir=bridge_dir)
+    asyncio.run(core._bridge_poll_once())
+
+    pending = core.pending_ask_for(chat)
+    check("pending_ask_for returns (ask_id, is_secret)",
+          pending == (ask.id, True), f"{pending}")
+
+    core.answer_ask(ask.id, "hunter2")
+    check("answer recorded on disk",
+          interactive.read_answer(ask.id, bridge_dir=bridge_dir) == "hunter2")
+    check("pending entry cleared", core.pending_ask_for(chat) is None)
+
+
+# ── 11. TTL — stale pending ask is released ──────────────────
+
+def test_pending_ask_ttl():
+    print("\n[11] pending_ask_for — TTL releases a stale ask and clears its files")
+    core, bridge_dir = _fresh_bridge_core("ttl")
+    q = asyncio.Queue()
+    core.subscribe(q)
+    chat = 88
+    ask = interactive.make_ask("otp", "code?", chat_id=chat)
+    interactive.write_ask(ask, bridge_dir=bridge_dir)
+    asyncio.run(core._bridge_poll_once())
+
+    ask_id, announced_ts, is_secret = core._pending_asks[chat]
+    core._pending_asks[chat] = (ask_id, announced_ts - BRIDGE_PENDING_TTL - 1, is_secret)
+
+    check("stale ask releases (returns None)", core.pending_ask_for(chat) is None)
+    check("chat no longer owes an answer", chat not in core._pending_asks)
+    check("ask file cleared",
+          interactive.read_pending_asks(bridge_dir=bridge_dir) == [])
+
+
+# ── 12. cleanup — externally cleared ask is forgotten ────────
+
+def test_bridge_external_clear_cleanup():
+    print("\n[12] Bridge — an ask cleared externally is forgotten after one poll")
+    core, bridge_dir = _fresh_bridge_core("extclear")
+    q = asyncio.Queue()
+    core.subscribe(q)
+    chat = 63
+    ask = interactive.make_ask("text", "name?", chat_id=chat)
+    interactive.write_ask(ask, bridge_dir=bridge_dir)
+    asyncio.run(core._bridge_poll_once())
+    check("announced before clear", ask.id in core._bridge_announced)
+
+    interactive.clear_ask(ask.id, bridge_dir=bridge_dir)
+    asyncio.run(core._bridge_poll_once())
+    check("forgotten from _bridge_announced", ask.id not in core._bridge_announced)
+    check("forgotten from _pending_asks", chat not in core._pending_asks)
+
+
+# ── 13. start()/stop() — bridge task without a ScheduleManager ──
+
+def test_bridge_start_stop_without_scheduler():
+    print("\n[13] start()/stop() — bridge watcher runs even with no ScheduleManager")
+    sessions = SessionManager(os.path.join(_tmpdir, "sessions_bstart.json"))
+    auth = AuthManager(os.path.join(_tmpdir, "users_bstart.json"), OWNER)
+    bridge_dir = os.path.join(_tmpdir, "bridge_bstart")
+    core = ZillaCore(sessions=sessions, auth=auth, owner_chat_id=OWNER,
+                     bridge_dir=bridge_dir)  # schedules=None
+
+    async def run():
+        await core.start()
+        check("no scheduler task (no ScheduleManager)", core._sched_task is None)
+        check("bridge task created", core._bridge_task is not None)
+        await asyncio.sleep(0.05)
+        check("bridge task alive", not core._bridge_task.done())
+        await core.stop()
+        check("bridge task cleared after stop", core._bridge_task is None)
+
+    asyncio.run(run())
+
+
 def main():
     tests = [
         test_event_sequence,
@@ -300,6 +529,14 @@ def main():
         test_lock_serialization,
         test_cancel,
         test_error_cleanup,
+        test_bridge_announce_once,
+        test_bridge_no_subscribers,
+        test_bridge_chat_id_fallback,
+        test_bridge_one_outstanding_per_chat,
+        test_pending_ask_for_and_answer,
+        test_pending_ask_ttl,
+        test_bridge_external_clear_cleanup,
+        test_bridge_start_stop_without_scheduler,
     ]
     print("Running zilla.core turn-pipeline tests...\n")
     for t in tests:

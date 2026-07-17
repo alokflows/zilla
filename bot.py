@@ -85,8 +85,7 @@ from media import (
     format_file_size, extract_text,
 )
 from formatter import format_for_telegram, detect_file_paths
-from harness import log_event, log_summary
-import interactive
+from harness import log_summary
 from users import AuthManager
 from schedules import ScheduleManager, describe as describe_schedule
 from schedule_parse import parse_schedule, parse_schedule_command
@@ -209,15 +208,6 @@ _application = None
 # in post_shutdown) and the queue it reads from.
 _core_events_queue: asyncio.Queue = None
 _core_events_task_handle: asyncio.Task = None
-
-# Human-in-the-loop credential/OTP bridge: chat_id -> ask_id currently awaiting
-# that chat's reply, plus the set of ask ids we've already DMed (so the watcher
-# doesn't re-prompt). See interactive.py for the file protocol.
-_pending_bridge: dict[int, tuple[str, float]] = {}
-_bridge_announced: set[str] = set()
-# How long a chat stays bound to one ask. After this, an unanswered (orphaned)
-# ask must NOT keep swallowing the user's next unrelated message.
-_BRIDGE_PENDING_TTL = 900.0
 
 # Per-chat id of the CURRENT live menu message. When a new menu opens we strip
 # the previous one's buttons so old menus in the chat history can't be tapped
@@ -1227,10 +1217,33 @@ async def _deliver_alert(ev) -> None:
         logger.error(f"[SCHED] alert deliver failed: {e}")
 
 
+_BRIDGE_KIND_LABEL = {"otp": "🔐 One-time code", "password": "🔑 Password",
+                      "text": "✍️ Input needed", "confirm": "❓ Please confirm"}
+
+
+async def _deliver_ask(ev) -> None:
+    """Render a core.Ask event — the human-in-the-loop credential/OTP bridge
+    (docs/dev/CORE_API.md migration step 4). DMs ev.chat_id the same message
+    the old in-bot.py bridge_watcher used to; the reply is captured back in
+    handle_message via core.pending_ask_for()/core.answer_ask()."""
+    if _application is None:
+        return
+    hint = "\n\n<i>Reply with the value — used once.</i>" if ev.is_secret else ""
+    try:
+        await safe_send(
+            _application.bot, ev.chat_id,
+            f"{_BRIDGE_KIND_LABEL.get(ev.kind, '✍️ Input needed')}\n\n"
+            f"{format_for_telegram(ev.prompt)[0]}{hint}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"[BRIDGE] could not DM ask {ev.id}: {e}")
+
+
 async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> None:
     """Consume core's background event broadcast and render each event the
-    way the old in-bot.py scheduler used to. Runs for the app's lifetime;
-    cancelled in post_shutdown."""
+    way the old in-bot.py scheduler/bridge_watcher used to. Runs for the
+    app's lifetime; cancelled in post_shutdown."""
     while True:
         ev = await sink.get()
         try:
@@ -1238,6 +1251,8 @@ async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> Non
                 await _deliver_scheduled_result(ev)
             elif isinstance(ev, zcore.Alert):
                 await _deliver_alert(ev)
+            elif isinstance(ev, zcore.Ask):
+                await _deliver_ask(ev)
         except Exception as e:
             logger.error(f"[SCHED] event render failed: {e}", exc_info=True)
 
@@ -1737,42 +1752,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Human-in-the-loop bridge: if the agent asked this chat for an OTP / phone /
     # password / confirmation, this message IS the answer — hand it back to the
-    # waiting CLI turn instead of starting a new one.
-    pending = _pending_bridge.get(chat_id)
+    # waiting CLI turn instead of starting a new one. core.pending_ask_for()
+    # also handles TTL release: a stale (orphaned) ask returns None here and
+    # the message falls through to be processed as a normal turn.
+    pending = core.pending_ask_for(chat_id)
     if pending:
-        ask_id, ann_ts = pending[0], pending[1]
-        # Older entries were 2-tuples; treat a missing flag as non-secret.
-        is_secret = pending[2] if len(pending) > 2 else False
-        if time.time() - ann_ts > _BRIDGE_PENDING_TTL:
-            # Orphaned/stale ask — release the chat and process this message
-            # normally instead of swallowing it as an answer.
-            _pending_bridge.pop(chat_id, None)
-            interactive.clear_ask(ask_id)
-        else:
-            text = update.message.text or ""
-            try:
-                interactive.write_answer(ask_id, text)
-                _pending_bridge.pop(chat_id, None)
-                if is_secret:
-                    # An OTP / password must not linger in the chat. In a private
-                    # chat a bot may delete the user's own incoming message; if
-                    # that's ever refused, tell them to remove it themselves.
-                    try:
-                        await update.message.delete()
-                        await safe_send(
-                            context.bot, chat_id,
-                            "✅ Got it — continuing. I removed that message so the "
-                            "code isn't left in the chat.")
-                    except Exception:
-                        await update.message.reply_text(
-                            "✅ Got it — continuing.\n"
-                            "⚠️ Please delete your last message — it holds a "
-                            "sensitive value and I wasn't allowed to remove it.")
-                else:
-                    await update.message.reply_text("✅ Got it — continuing.")
-            except Exception as e:
-                await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
-            return
+        ask_id, is_secret = pending
+        text = update.message.text or ""
+        try:
+            core.answer_ask(ask_id, text)
+            if is_secret:
+                # An OTP / password must not linger in the chat. In a private
+                # chat a bot may delete the user's own incoming message; if
+                # that's ever refused, tell them to remove it themselves.
+                try:
+                    await update.message.delete()
+                    await safe_send(
+                        context.bot, chat_id,
+                        "✅ Got it — continuing. I removed that message so the "
+                        "code isn't left in the chat.")
+                except Exception:
+                    await update.message.reply_text(
+                        "✅ Got it — continuing.\n"
+                        "⚠️ Please delete your last message — it holds a "
+                        "sensitive value and I wasn't allowed to remove it.")
+            else:
+                await update.message.reply_text("✅ Got it — continuing.")
+        except Exception as e:
+            await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
+        return
 
     # Owner add-user flow intercept
     if auth.is_owner(uid) and "adduser_flow" in context.user_data:
@@ -2477,55 +2485,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 #  STARTUP
 # ══════════════════════════════════════════════════════════
 
-async def bridge_watcher(application):
-    """Relay the agent's credential/OTP/confirm requests to the owner's Telegram.
-
-    Polls the Bridge dir; for each new ask it DMs the prompt and records that the
-    chat owes an answer (captured by handle_message). Cleans up answered/stale
-    asks. Inert when the agent isn't asking for anything.
-    """
-    _KIND_LABEL = {"otp": "🔐 One-time code", "password": "🔑 Password",
-                   "text": "✍️ Input needed", "confirm": "❓ Please confirm"}
-    logger.info("[BRIDGE] credential/OTP watcher started")
-    while True:
-        try:
-            for ask in interactive.read_pending_asks():
-                if ask.id in _bridge_announced:
-                    continue
-                target = ask.chat_id or OWNER_CHAT_ID
-                if not target:
-                    continue
-                cur = _pending_bridge.get(target)
-                if cur and cur[0] != ask.id:
-                    continue  # one outstanding ask per chat at a time
-                hint = "\n\n<i>Reply with the value — used once.</i>" if ask.is_secret else ""
-                try:
-                    await application.bot.send_message(
-                        chat_id=target,
-                        text=f"{_KIND_LABEL.get(ask.kind, '✍️ Input needed')}\n\n"
-                             f"{format_for_telegram(ask.prompt)[0]}{hint}",
-                        parse_mode="HTML",
-                    )
-                    _bridge_announced.add(ask.id)
-                    _pending_bridge[target] = (ask.id, time.time(), ask.is_secret)
-                    log_event("bridge_ask", kind=ask.kind, chat=target)
-                except Exception as e:
-                    logger.error(f"[BRIDGE] could not DM ask {ask.id}: {e}")
-            interactive.expire_stale()
-            # Forget announced asks that are gone (answered+cleared) so the maps
-            # don't grow unbounded.
-            live = {a.id for a in interactive.read_pending_asks()}
-            for aid in list(_bridge_announced):
-                if aid not in live:
-                    _bridge_announced.discard(aid)
-                    for cid, pv in list(_pending_bridge.items()):
-                        if pv[0] == aid:
-                            _pending_bridge.pop(cid, None)
-        except Exception as e:
-            logger.error(f"[BRIDGE] watcher error: {e}", exc_info=True)
-        await asyncio.sleep(2)
-
-
 async def post_init(application):
     global _application, _core_events_queue, _core_events_task_handle
     _application = application
@@ -2534,18 +2493,15 @@ async def post_init(application):
     await _register_commands(application)
 
     # Wire the one Telegram-specific fast path the scheduler needs, then start
-    # the core's scheduler runtime (zilla/core.py — CORE_API migration step 3)
-    # and subscribe to render its ScheduledResult/Alert events.
+    # the core's scheduler runtime and bridge watcher (zilla/core.py — CORE_API
+    # migration steps 3/4) and subscribe to render its ScheduledResult/Alert/
+    # Ask events.
     core.schedule_pre_run = _schedule_pre_run_hook
     _core_events_queue = asyncio.Queue()
     core.subscribe(_core_events_queue)
     _core_events_task_handle = application.create_task(
         _core_events_task(core, _core_events_queue))
     await core.start()
-
-    # Start the human-in-the-loop credential/OTP relay watcher.
-    interactive.ensure_bridge_dir()
-    application.create_task(bridge_watcher(application))
 
     if OWNER_CHAT_ID:
         try:
@@ -2710,8 +2666,10 @@ def main():
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)
-    # the turn pipeline + scheduler runtime (CORE_API migration steps 2 + 3)
-    core = zcore.ZillaCore(sessions=sessions, auth=auth, schedules=schedules_mgr)
+    # the turn pipeline + scheduler runtime + bridge watcher (CORE_API
+    # migration steps 2 + 3 + 4)
+    core = zcore.ZillaCore(sessions=sessions, auth=auth, schedules=schedules_mgr,
+                          owner_chat_id=OWNER_CHAT_ID)
     keyboards.auth = auth  # the keyboard builders read auth for role-gated menus
 
     model = get_model()
