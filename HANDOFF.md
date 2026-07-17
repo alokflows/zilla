@@ -304,8 +304,8 @@ Steps:
    duplicate. `install.py` becomes a thin alias or is absorbed.
    Add `zilla doctor --security` (RESEARCH §5.3): file perms on home/config
    (600/700), secrets not in argv/logs, no unexpected listening sockets,
-   WebBridge loopback-only, pending-skill gate intact, owner ID set, token
-   rotated; `--fix` auto-remediates the safe items.
+   WebBridge loopback-only, pending-skill gate intact, owner ID set;
+   `--fix` auto-remediates the safe items.
 2. `zilla config`: plain numbered-menu terminal settings editor covering
    the full settings table in §3. Reads/writes the SAME `.env` +
    `settings.json` the core uses. Works over SSH.
@@ -529,40 +529,24 @@ everything comes back by itself.
 
 ## LIVE STATUS BOARD
 
-> **Update this section and commit after EVERY completed step.** This is
-> what lets a fresh session (or a different account) resume instantly.
+> **Update this section and commit after EVERY completed step.** Keep it
+> LIGHT (owner decree 2026-07-17): current state, one line per session,
+> only notes a future session actually needs. History lives in git log.
 
-**Current phase:** Phase 0 ✅ done → Phase 1 in progress (turn pipeline + scheduler runtime + bridge seam extracted to `zilla/core.py`/`zilla/schedules.py`; approvals + health seams + live Telegram round-trip remain)
+**Current phase:** Phase 1 — core extraction. Turn pipeline, scheduler
+runtime (payload types / session modes / backend pins / retry ladder), and
+the credential/OTP bridge all live in `zilla/core.py`; **next: approvals
+seam (CORE_API step 5), then health stub (step 6), then P1.5 router.**
 **Working branch:** `claude/zilla-harness-review-0v96bs`
-**Last session:** 2026-07-16 late night (MacBook) — LIVE SMOKE STARTED with
-owner's new token (`.env` now exists on this Mac, git-ignored; bot =
-@Mangomangos_bot, owner id 8740189938). First live turn exposed a delivery
-bug: CLI answered fine but the final `send_message` timed out once (owner on
-hotspot) and `safe_send` swallowed it — reply silently vanished. FIXED:
-`safe_send` now retries 4× with backoff; PTB network timeouts raised from 5s
-defaults (connect 15 / read 30 / write 30 / pool 10). Verified live: real-CLI
-pipeline PONG via `core.handle_message` + real DM delivered to owner. 298
-tests green. SMOKE ROUND 2 results: text ✅ photo ✅ document ✅ cancel ✅.
-Voice ❌ → FIXED: `speech_recognition`'s bundled flac binary is Intel-only,
-this Mac is Apple Silicon ("Bad CPU type") — `brew install flac` (SR prefers
-PATH); add a `doctor` check for this in P2. Reminder ⚠️ → root cause: "put a
-reminder for 2 minutes" didn't match `parse_schedule` (only "remind me in
-N…"), fell through to the CLI agent which SLEPT 2 min inside the turn and
-replied late with no confirmation → parser cues broadened (put/keep/set/add/
-create a reminder/timer/alarm; in/after/for N min; bare timer → "Time's up!"),
-+5 tests (196→201). Latency reality check from live logs: every turn = full
-Gemini CLI call, 17s–2m34s — the P1.5 orchestration router is THE fix, this
-is now the owner's top complaint. Bot running on this Mac, PID via
-`pgrep -f "Python bot.py"`, log in the session scratchpad. LATER SAME NIGHT
-(owner decrees, all shipped+pushed): (a) one-off reminders create INSTANTLY,
-no confirm buttons — only recurring schedules ask; (b) remind/timer/alarm-cued
-requests are `payload_type=system_event` (verbatim delivery, zero model call
-at fire time — the "Siri" behavior) while "schedule <task>" stays a `message`
-agent run, via new `payload_hint` from `parse_schedule`; (c) scheduler loop
-sleeps until the soonest `next_run` (capped at the 20s tick) so timers fire
-on time, via new `ScheduleManager.next_due_at()`. 204+16+29+57 = 306 green.
+**Tests:** 204+16+57+57 = **334 green** — `.venv/bin/python test_fixes.py /
+test_interactive.py / test_core.py / test_schedules_seam.py` (the last is a
+frozen acceptance spec — never edit it) + `import bot; import zilla.core`.
+**Bot:** live on the owner's MacBook (@Mangomangos_bot; `.env` exists here,
+git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
+`.venv/bin/python bot.py`, confirm "Application started" in its log.
 
 ### Checklist
+
 
 - [x] **P0** Verify reality (flags, GEMINI.md/AGENTS.md, sandbox test, logins, tests on macOS) → `docs/dev/PHASE0_FINDINGS.md`
 - [x] **P1** Core extraction: design core API (owner-approved) → `docs/dev/CORE_API.md`
@@ -584,44 +568,26 @@ on time, via new `ScheduleManager.next_due_at()`. 204+16+29+57 = 306 green.
 - [ ] **P9** Local Whisper + voice_mode setting
 - [ ] **P10** Ubuntu deployment hardening (LAST — on the client machine)
 
-### Session log
+### Session log (one line per session — details in git log)
 
-| Date | Session did | Warnings for next session |
-|---|---|---|
-| 2026-07-16 | Full codebase analysis; handoff written and pushed. | agy/opencode were NOT installed in that environment — nothing in "traps" is verified yet. Do Phase 0 first. Older repo docs conflict with this vision; this file wins. |
-| 2026-07-16 (later, MacBook) | Phase 0 complete: all 3 CLIs probed live, 208 tests green, `docs/dev/PHASE0_FINDINGS.md` committed. Trap #1 refuted (agy `--model` validates, hard error). Trap #2 split: claude blocks headless writes without permission; agy+opencode execute unattended. agy does NOT read GEMINI.md/AGENTS.md; opencode DOES read AGENTS.md. opencode runs free with 0 credentials. claude = Pro subscription. | Nothing blocks Phase 1. Next: orchestrator designs the core API on paper and gets owner approval BEFORE coding (P1 step 1). Local checkout is `~/Documents/repos/zilla`. |
-| 2026-07-16 (P1 step 2, MacBook) | Pure move (no logic edits): `platform_compat, config, users, sessions, schedules, schedule_parse, verify, autoharness, interactive, harness, cli_engine, backends, media, formatter` → `zilla/` via `git mv` (history preserved). Cross-module imports inside `zilla/` rewritten to `from zilla.<mod> import ...`. Root-level shim files (`import zilla.<mod> as _mod; sys.modules[__name__] = _mod`) alias the old names so `bot.py`, `keyboards.py`, `install.py`, and both test suites are unchanged. `config.BASE_DIR` and `harness._HERE` (both `__file__`-derived) bumped one directory level up — they now point one level deeper than before the move, fixed with a one-line comment each. 192+16 tests green; `zilla.cli_engine/backends/harness/media` import clean; `import bot`/`import keyboards` fail ONLY on missing `telegram` package (not installed in this env — expected, not an import-path bug); `import install` clean. | `bot.py` and `keyboards.py` still import the OLD top-level names (`from config import ...` etc.) via the shims — that's intentional for this step. Next P1 step extracts the turn pipeline out of `bot.py` into `core.handle_message`; once bot.py is rewritten to use `zilla.*` directly (or the shim strategy is revisited) the root-level shim files can be deleted. `telegram` package is not installed in system `python3` on this machine — install it (or use whatever venv the bot normally runs in) before attempting a live Telegram smoke test. |
-| 2026-07-16 (P1 turn-pipeline seam, MacBook) | Extracted the TURN PIPELINE from `bot.py` into `zilla/core.py`: event dataclasses per CORE_API (`Progress`/`Ask`/`Response` live; `ApprovalRequest`/`Alert`/`ScheduledResult` placeholders) + `ZillaCore` with async-generator `handle_message(user_id, text, chat_key=, auto_title=, skip_permissions=)`, `cancel(key)`, `is_busy(uid)`, `get_user_lock(uid)`. Moved (not rewritten): per-user lock map, `_active_cancel`, `_conv_for_run`, the whole `_run_cli_turn` body (in-lock session pinning, `run_cli_async` w/ progress callback + cancel event, session writes threading `session_name`+`backend`). `bot.py` handlers (text/voice/photo/document + approval runner) now drive `_relay_cli_turn` → `core.handle_message`; cancel taps use `core.cancel()`. Scheduler/bridge/health stayed in `bot.py` (thin `_get_user_lock`/`_conv_for_run` delegates share the core's lock). Progress events are consumed silently in Telegram — the ⏳ Working UI remains time-driven `keep_typing`, so visible behavior is unchanged. New `test_core.py` (29 tests, backend monkeypatched): event sequence, bookkeeping, lock serialization, cancel, error hygiene. 192+16+29 = 237 green; `import bot` clean in a local `.venv` (git-ignored). | ⚠️ LIVE TELEGRAM ROUND-TRIP STILL PENDING — this machine has no `.env`/bot token, so the seam is verified only by tests + import. Owner must run a live smoke (text, voice, photo, doc, approval, cancel) before the P1 extraction item can be ticked. AI_CONTEXT.md §Module map/§L still describe the lock/cancel state as living in `bot.py` — update it as the remaining seams move (scheduler → step 3, bridge → step 4, approvals → step 5, health → step 6); only then delete the `_get_user_lock`/`_conv_for_run` delegates and the root-level shims. |
-| 2026-07-16 (P1 scheduler seam, MacBook) | ⚠️ **ROW WRITTEN BY THE EXECUTOR BEFORE IT WAS KILLED MID-COMMIT-SPLIT — only PART A is actually in the tree.** Every PART B claim below (ladder, schema, new `mark_failure(sid, now=)` signature, 57-test suite green, 298 total) describes work that was REVERTED and must be re-implemented; treat it as the spec. Moved the SCHEDULER RUNTIME from `bot.py` into `zilla/core.py` (CORE_API migration step 3), two commits (PART A runtime, PART B schema). **PART A**: `_scheduler_loop`/`_execute_schedule`/`_run_and_record`/`run_schedule_now` now live on `ZillaCore`, started/stopped via `core.start()`/`core.stop()` (wired to PTB `post_init`/new `post_shutdown`). Scheduled `message`-payload runs share the SAME per-user lock as live chat (`core.get_user_lock`) — a schedule and a live turn for the same uid still never overlap. Delivery is a `ScheduledResult`/`Alert` event broadcast through a new `core.subscribe(sink: asyncio.Queue)` — bot.py subscribes once in `post_init` and renders the exact old `⏰ Scheduled — <title>` DM (`_deliver_scheduled_result`), plus a new owner-only `_deliver_alert`. `bot.py`'s `_get_user_lock`/`_conv_for_run` delegates are GONE (grep-confirmed no scheduler logic remains in `bot.py` — only the Telegram-specific screenshot-via-bridge fast path stayed, now wired through `core.schedule_pre_run`). **Discovered default behavior** (informed the schema defaults): every existing schedule in `schedules.json` today runs with `session_name=None` always → i.e. **every schedule is effectively "isolated"** (fresh conversation each run, nothing ever persisted) — no UI path has ever set `session_name`. **PART B schema** (all additive, defaults preserve exactly that discovered behavior): `payload_type` (`message` default/`system_event`/`command`, `command` owner-only enforced in `ScheduleManager.add()` not a comment), `session` (default `"isolated"`), pinned `backend`/`model` (default `None`=unpinned; mismatch at fire time runs on the CURRENT backend — the only thing `cli_engine` can do, no per-call override exists — and sends the owner ONE `Alert`, tracked via new `backend_pin_notified`), retry `RETRY_LADDER=(30,60,300,900,3600)` replacing the old flat `retry_delay`/`max_retries` (still never permanently disables — give-up resets + advances to the next normal occurrence), `ScheduledResult.session`/`conv_id`/`warning` fields (carried for a future continue-conversation UX; no reply-routing built), recursion guard `core.is_scheduled_run(uid)` checked by `bot.py`'s NL schedule-detection. Atomic writes in `ScheduleManager._save()` were ALREADY atomic (tmp+fsync+`os.replace`) — confirmed, not rebuilt. `compute_next_run` untouched. New `test_schedules_seam.py` (57 tests): pure logic (`resolve_session_mode`, `backend_pin_mismatch`, ladder shape, payload-type/owner gating) + runtime integration (system_event zero-CLI-call, command-payload subprocess incl. failure, ScheduledResult/Alert broadcast, give-up-keeps-firing, one-time backend-pin alert, `run_schedule_now` never advances, deauthorized-owner disables, `core.start()`/`stop()` lifecycle incl. no-op without a `ScheduleManager`). `test_fixes.py`'s `test_schedule_failure_retry` rewritten for the new `mark_failure(sid, now=)` signature (196, +4 from finer ladder assertions). Totals: 196+16+29+57 = 298 green. `import bot`/`import zilla.core` clean. One deliberate, documented deviation from byte-identical: the old ephemeral (~5s) `send_chat_action(TYPING)` ping before a scheduled CLI run is dropped — core.py has no Telegram bot handle and it's pure UI nicety, not delivered content. | Bridge and health seams (CORE_API steps 4/6) still remain — P1 extraction checklist item stays unticked. No UI yet lets a user SET `payload_type`/`session`/`backend`/`model` at creation (`/schedule` and NL-parse still only produce `kind`/`spec`/`title`/`prompt`) — these are schema-only, wired for a future UI. Live Telegram round-trip for scheduled jobs is still unverified on this machine (no `.env`/token here, same constraint as the prior seam) — owner should smoke-test a real schedule fire (success, a forced failure to see the ladder+warning, and the model-switch suggestion path) before trusting this in production. AI_CONTEXT.md module map now has a `zilla/core.py` entry (previously missing entirely) folding in both the turn-pipeline AND scheduler description; `bot.py`'s entry, Invariant I-CONV, and Invariant L were updated to stop naming `bot._get_user_lock`/`bot._conv_for_run` (both deleted) and point at `core.*` instead — this also closes out the "AI_CONTEXT still describes lock/cancel as living in bot.py" warning from the previous seam's row. |
-| 2026-07-16 (night wrap-up, MacBook) | Session limits killed the scheduler-seam executor twice mid Part A/Part B split. Orchestrator salvage: **kept PART A** (scheduler runtime in `zilla/core.py`, reviewed line-by-line — includes a real security improvement: schedules owned by a de-authorized user are disabled at fire time, not silently kept running); reverted the orphaned `test_fixes.py` ladder rewrite (green again against HEAD `zilla/schedules.py`, old `mark_failure(sid, retry_delay, max_retries)` signature); **added the missing `core.is_scheduled_run(uid)`** (tracked via `_scheduled_running` set around `_execute_schedule`) that `bot.py:1782` already called — without it every admin text message would have crashed at runtime; committed `test_schedules_seam.py` as the PART B acceptance spec (RED by design — it imports `resolve_session_mode`/`backend_pin_mismatch`/`RETRY_LADDER` which don't exist yet; NOT part of the green trio). 237 green (192+16+29); `import bot` clean in `.venv`. | **RESUME HERE.** (1) Re-implement PART B in `zilla/schedules.py` (+ small core/bot wiring) until `test_schedules_seam.py` is green — the ⚠️ row above and AI_CONTEXT's Scheduler section are the exact spec; also restore the ladder version of `test_fixes.py::test_schedule_failure_retry` then. (2) `bot.py:1053` comment references `core._maybe_notify_backend_pin` — doesn't exist yet, Part B. (3) AI_CONTEXT.md currently DESCRIBES Part B as done (schedules.py entry, Scheduler ladder/schema paragraphs, test counts) — spec, not state; a "⚠️ Part B pending" note was added, remove it and fix counts when Part B lands. (4) Then bridge seam (CORE_API step 4) → approvals (5) → health stub (6). **FOR ALOK**: live Telegram smoke (text/voice/photo/doc/approval/cancel + a real schedule fire) needs your bot token — no `.env` on this Mac; and confirm the previously-leaked token was rotated. |
-| 2026-07-16 (PART B re-implementation, MacBook) | Re-implemented PART B from the frozen `test_schedules_seam.py` spec — no test edits, only source. **`zilla/schedules.py`**: `VALID_PAYLOAD_TYPES = (message/system_event/command)`, `RETRY_LADDER = (30,60,300,900,3600)`; pure helpers `resolve_session_mode(sched)` (explicit `session` wins → legacy `session_name` maps to `named:<x>` → default `"isolated"`) and `backend_pin_mismatch(sched, backend, model)` (no pin / already-notified / model=None-legacy all → False, honoring the one-time-note gate); `ScheduleManager.add()` gained `session`/`payload_type`/`backend`/`model`/`is_owner` kwargs — `command` payload_type is refused unless `is_owner=True`, unknown `payload_type` refused, new schedules default `session="isolated"`, `backend=model=None`, `backend_pin_notified=False`; `mark_failure(sid, now=)` rewritten off the ladder (old flat `retry_delay`/`max_retries` params gone) — same never-permanently-disables contract; added `mark_backend_pin_notified(sid)`. **`zilla/core.py`**: `_execute_schedule` now dispatches by `payload_type` — `system_event` returns the stored prompt text verbatim with **zero** CLI call, `command` runs via `asyncio.create_subprocess_shell` (new `_execute_command_schedule`, also zero model call, stdout+stderr captured, nonzero exit = failure), `message` is the old CLI-turn path renamed `_execute_message_schedule` and now resolves session mode (`resolve_session_mode` → `_sname_for_mode`: `isolated`→fresh conv every run, `main`→the user's active session, `named:<x>`→that session) instead of the old bare `session_name` field. All three return the new `(ok, response, detail, meta)` 4-tuple (`meta` carries `conv_id`, and for message-payload also `session` + `pin_mismatch`). New `_maybe_notify_backend_pin(s)`: broadcasts one `Alert` and calls `mark_backend_pin_notified` — wired into `_run_and_record`/`run_schedule_now` whenever `meta["pin_mismatch"]` is set (bot.py's `_deliver_alert`, already present from the Part A salvage, needed no changes). `ScheduledResult` gained `session`/`conv_id` fields (carried through from `meta`, no reply-routing built on them, matches spec). `test_fixes.py::test_schedule_failure_retry` rewritten for `mark_failure(sid, now=)` walking all 5 ladder rungs before asserting give-up (192→196, +4 exact). Verified: `test_schedules_seam.py` 57/57, `test_fixes.py` 196/196, `test_interactive.py` 16/16, `test_core.py` 29/29 — **298 total green**; `import bot; import zilla.core` clean in `.venv`. No test files touched — every fix was source-side per the frozen-spec constraint. AI_CONTEXT.md: removed the "⚠️ Part B pending" note, Scheduler section now describes the dispatch-by-payload_type flow + `_maybe_notify_backend_pin` by name, verification counts corrected (196/16/29/57). | No UI still lets a user CHOOSE `payload_type`/`session` at creation (schema-only, as before — `command` payload type has no creation path at all yet outside direct `ScheduleManager.add(is_owner=True, payload_type="command")`, i.e. no `/schedule` grammar for it). `_execute_command_schedule` uses `asyncio.create_subprocess_shell` with the raw stored prompt string — this is intentionally unattended shell execution gated owner-only at creation; do not loosen that gate without adding sanitization. Next: bridge seam (CORE_API step 4) → approvals (5) → health stub (6), per the existing Phase 1 checklist. Live Telegram round-trip (including a real schedule fire on all three payload types) is STILL unverified on this machine — same no-`.env` constraint as prior sessions. |
+| Date | What shipped |
+|---|---|
+| 2026-07-16 | Full codebase analysis + this handoff; Phase 0 findings (`docs/dev/PHASE0_FINDINGS.md`); modules moved into `zilla/` package with shims. |
+| 2026-07-16 | Turn-pipeline seam → `core.handle_message` (+`test_core.py`); scheduler seam Parts A+B → payload types, session modes, backend pins, retry ladder (+frozen `test_schedules_seam.py`). |
+| 2026-07-16 night | Live smoke: text/photo/doc/cancel ✅; `safe_send` 4× retry + raised PTB timeouts; voice fixed (`brew install flac` on Apple Silicon — add a doctor check in P2); reminder parser broadened; one-off reminders instant, `system_event` payloads (zero model call at fire), exact-time scheduler tick. |
+| 2026-07-17 | Bridge seam → core (`Ask` events over `subscribe()`, `pending_ask_for`/`answer_ask`; bot.py renders only). 334 green; bot restarted live. |
 
-| 2026-07-17 (P1 bridge seam, MacBook) | Extracted the credential/OTP BRIDGE WATCHER from `bot.py` into `zilla/core.py` (CORE_API migration step 4; Sonnet executor, orchestrator-reviewed line-by-line). **Core**: `Ask` event gained `chat_id`/`is_secret` (no longer a placeholder); new module constant `BRIDGE_PENDING_TTL=900.0`; `ZillaCore.__init__` gained `owner_chat_id=`/`bridge_dir=` kwargs + bridge state (`_bridge_announced`, `_pending_asks` chat→(ask_id, ts, is_secret), `_bridge_task`); `_bridge_poll_once()` (one testable pass — announces new asks as `Ask` events via the existing `subscribe()` broadcast, one-outstanding-ask-per-chat, `ask.chat_id or owner_chat_id` targeting, expire/cleanup as before) + `_bridge_watcher_loop()` (2s cadence); `start()`/`stop()` now own `ensure_bridge_dir` + the watcher task (bridge runs even without a ScheduleManager); new public API `pending_ask_for(chat_key)` (TTL release lives HERE — stale ask popped + cleared, returns None) and `answer_ask(ask_id, text)` (writes answer, releases the owing chat, exceptions propagate to the frontend). **bot.py**: `bridge_watcher`/`_pending_bridge`/`_bridge_announced`/`_BRIDGE_PENDING_TTL` deleted; `_core_events_task` now also dispatches `Ask` → new `_deliver_ask` (byte-identical DM text, via `safe_send` so it inherits the 4× retry); `handle_message` answer-capture rewritten onto `core.pending_ask_for`/`core.answer_ask` (secret-deletion UX unchanged); core constructed with `owner_chat_id=OWNER_CHAT_ID`; unused `interactive`/`log_event` imports dropped. Two deliberate, documented behavior deviations: (a) `log_event("bridge_ask")` fires at broadcast time, not after a successful DM; (b) a DM that exhausts safe_send's retries is logged, not re-announced (the watcher skips announcing entirely while no frontend is subscribed, preserving retry-until-deliverable for the startup window). `test_core.py` +28 checks in 8 new tests (isolated temp `bridge_dir` per test): announce-once, no-subscribers gating, owner fallback + no-target skip, one-per-chat with post-answer handoff, answer round-trip on disk, TTL release + file clear, external-clear cleanup, start/stop without scheduler. Verified: 204+16+57+57 = **334 green**; `import bot; import zilla.core` clean; frozen `test_schedules_seam.py` untouched. AI_CONTEXT.md module map updated (bridge lives in core; bot.py renders `_deliver_ask`), verification counts corrected (incl. a stale 196→204 for test_fixes.py). Bot restarted on this Mac after the change; "Application started" confirmed in log. | Next seams per CORE_API: approvals (step 5) → health stub (step 6), then P1.5 orchestration router. Live Telegram round-trip for the bridge path (a real agent-initiated OTP ask → DM → reply → agent continues) still needs owner smoke — same standing FOR ALOK item as prior seams. `handle_message`'s answer-capture only covers TEXT messages (as before the seam — a voice-note reply to an ask was never supported; consider in a later UX pass). |
+### Notes (only what a future session needs)
 
-### Notes / open concerns
-
-- Owner mentioned rotating the Telegram bot token after an earlier leak
-  (see `docs/dev/STATUS.md`) — confirm it was rotated before going live
-  with the client.
-- Orchestrator liberty: if Phase 0 findings contradict this plan, argue it
-  with the owner BEFORE proceeding — do not silently comply with a stale
-  plan.
-- **Scheduling policy (owner decision, 2026-07-16):** Zilla's own scheduler
-  (`schedules.json` + core ticker) is the ONLY scheduling authority — same
-  architecture OpenClaw/Hermes-class agents use (daemon-held job list firing
-  prompts at the agent). Two additions to the plan: (a) harness rule — the
-  agent must NEVER create OS timers (cron/launchd/Task Scheduler); recurring
-  work goes through Zilla (add when the harness preamble is next touched);
-  (b) a schedule-request bridge (same file pattern as the OTP bridge): the
-  agent writes a schedule request, Zilla shows the owner the normal confirm
-  card, one tap stores it in `schedules.json` — fold into the P1 bridge
-  extraction or P5. Also steal OpenClaw's "heartbeat" idea for Phase 7: the
-  health tick can periodically hand the agent a tiny checklist review, not
-  just probe logins. (Now formalized: P7 step 5 + the RESEARCH doc.)
-- **Reference designs (owner decision, 2026-07-16):** OpenClaw + Hermes
-  Agent are the explicit reference products — "exact replica is fine", with
-  API keys swapped for CLI logins (the niche neither covers: they support
-  Gemini CLI but not Antigravity/Claude Code). The vetted 30-item steal list
-  with per-phase mapping lives in `docs/dev/RESEARCH_OPENCLAW_HERMES.md` §7
-  — consult it at the START of each phase (P2 pairing-code onboarding, P4
-  memory/journal/BOOTSTRAP ritual, P5 skills, P7 heartbeat, P8 pinning).
+- **Latency is the owner's #1 complaint** — every turn pays a full CLI call
+  (17s–2m34s observed live). The P1.5 orchestration router is the fix.
+- `_execute_command_schedule` = unattended shell, owner-only at creation —
+  never loosen that gate. No UI yet sets `payload_type`/`session`/`backend`/
+  `model` at creation (schema-only). Bridge answer-capture is text-only.
+- Scheduling policy (owner): Zilla's scheduler is the ONLY scheduling
+  authority — the agent must never create OS timers; a schedule-request
+  bridge (agent writes request → owner one-tap confirm) folds into P5.
+- Reference designs: OpenClaw + Hermes — steal list in
+  `docs/dev/RESEARCH_OPENCLAW_HERMES.md` §7; consult at each phase start.
+- Orchestrator liberty: if findings contradict this plan, argue it with the
+  owner before proceeding — never silently comply with a stale plan.
