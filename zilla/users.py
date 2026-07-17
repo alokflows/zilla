@@ -11,13 +11,16 @@
 #  headless mode regardless of any permission flag, so anyone who can reach
 #  agy effectively runs code on this machine. Only people the owner trusts
 #  (and adds) get in, and they are all admins.
+#
+#  Persistence: a thin wrapper over store.py (Phase M1). No in-memory user
+#  cache — every read hits the store's read connection directly, so reload()
+#  is a no-op kept only for API compatibility with existing callers.
 # ============================================================
 
-import json
-import os
 import logging
-import threading
 from datetime import datetime
+
+from zilla import store
 
 logger = logging.getLogger(__name__)
 
@@ -39,78 +42,45 @@ VALID_ROLES = ("admin", "limited")
 class AuthManager:
     def __init__(self, users_file: str, owner_id: int = 0):
         self.users_file = users_file
-        self.denied_file = os.path.join(os.path.dirname(users_file), "denied_users.json")
         self.owner_id = owner_id
-        self._lock = threading.Lock()
-        self._users: dict[int, dict] = {}
-        self._denied: set[int] = set()
-        self._mtime_users: float = 0.0
-        self._load()
+        self._store = store.get_store(users_file)
+        self._import_legacy_json()
 
-    def _load(self):
-        with self._lock:
-            try:
-                with open(self.users_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self._users = {int(k): v for k, v in data.items()}
-                # Normalize roles: "admin" (full) and "limited" (approval-gated)
-                # are the only valid tiers. Any legacy/unknown value (e.g. the old
-                # "user") becomes "admin" — the historical default.
-                for info in self._users.values():
-                    if info.get("role") not in VALID_ROLES:
-                        info["role"] = "admin"
-                try:
-                    self._mtime_users = os.path.getmtime(self.users_file)
-                except OSError:
-                    self._mtime_users = 0.0
-            except (FileNotFoundError, json.JSONDecodeError):
-                self._users = {}
-
-            try:
-                with open(self.denied_file, "r", encoding="utf-8") as f:
-                    self._denied = set(int(uid) for uid in json.load(f))
-            except (FileNotFoundError, json.JSONDecodeError):
-                self._denied = set()
-
-    def _save(self):
-        try:
-            tmp = f"{self.users_file}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({str(k): v for k, v in self._users.items()}, f, indent=2)
-            os.replace(tmp, self.users_file)
-            try:
-                self._mtime_users = os.path.getmtime(self.users_file)
-            except OSError:
-                pass
-        except Exception as e:
-            logger.error(f"[USERS] Save failed: {e}")
-
-    def _save_denied(self):
-        try:
-            tmp = f"{self.denied_file}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(list(self._denied), f, indent=2)
-            os.replace(tmp, self.denied_file)
-        except Exception as e:
-            logger.error(f"[USERS] Save denied failed: {e}")
+    def _import_legacy_json(self):
+        """One-time compat shim: if users_file was a pre-M1 JSON blob
+        ({"uid": {"name", "role", "added_at"}}), store.py detected it
+        wasn't a SQLite file and stashed its parsed content on
+        self._store.legacy_json (moving the original file aside). Import
+        it now, normalizing any legacy role (e.g. the old "user" tier,
+        removed in favor of admin/owner-only) to "admin" — the same
+        normalization the old JSON-backed _load() did on every read."""
+        data = self._store.legacy_json
+        if not data or self._store.users_count() > 0:
+            return
+        for uid_str, info in data.items():
+            role = info.get("role") if isinstance(info, dict) else None
+            if role not in VALID_ROLES:
+                role = "admin"
+            self._store.users_add(
+                int(uid_str),
+                (info.get("name", "") if isinstance(info, dict) else ""),
+                role,
+                (info.get("added_at", "") if isinstance(info, dict) else ""),
+            )
 
     def reload(self):
-        """Re-read from disk — but only if the file actually changed."""
-        try:
-            current_mtime = os.path.getmtime(self.users_file)
-        except OSError:
-            current_mtime = 0.0
-        if current_mtime != self._mtime_users:
-            self._load()
+        """No-op — store reads are always live, there is no manager-level
+        cache to invalidate. Kept for API compatibility (bot.py calls it)."""
+        pass
 
     # ── Authorization ─────────────────────────────────────
 
     def is_authorized(self, user_id: int) -> bool:
         if user_id == self.owner_id:
             return True
-        if user_id in self._denied:
+        if self._store.users_is_denied(user_id):
             return False
-        return user_id in self._users
+        return self._store.users_get(user_id) is not None
 
     def is_owner(self, user_id: int) -> bool:
         return user_id == self.owner_id
@@ -122,9 +92,10 @@ class AuthManager:
         """'owner' | 'admin' | 'limited' | 'none'."""
         if user_id == self.owner_id:
             return "owner"
-        if user_id in self._denied or user_id not in self._users:
+        row = self._store.users_get(user_id)
+        if row is None:
             return "none"
-        return self._users[user_id].get("role", "admin")
+        return row.get("role") or "admin"
 
     def is_limited(self, user_id: int) -> bool:
         """Authorized, but every request must be approved by the owner."""
@@ -134,12 +105,11 @@ class AuthManager:
         """Check if user has the given capability."""
         if user_id == self.owner_id:
             return True
-        # Not owner and not a stored account → no capabilities at all.
-        if user_id not in self._users or user_id in self._denied:
+        row = self._store.users_get(user_id)
+        if row is None:
             return False
         allowed_roles = _CAPS.get(capability, set())
-        # Any authorized (stored) account is an admin.
-        role = self._users[user_id].get("role", "admin")
+        role = row.get("role") or "admin"
         return role in allowed_roles
 
     def can_change_model(self, user_id: int, admins_allowed: bool) -> bool:
@@ -157,45 +127,30 @@ class AuthManager:
 
     def add_user(self, user_id: int, name: str = "", role: str = "admin") -> bool:
         role = role if role in VALID_ROLES else "admin"
-        with self._lock:
-            if user_id in self._users:
-                return False
-            self._users[user_id] = {
-                "name": name,
-                "role": role,
-                "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            self._denied.discard(user_id)
-            self._save()
-            self._save_denied()
-        logger.info(f"[USERS] Added {user_id} ({name}) as {role}")
-        return True
+        added_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ok = self._store.users_add(user_id, name, role, added_at)
+        if ok:
+            logger.info(f"[USERS] Added {user_id} ({name}) as {role}")
+        return ok
 
     def set_role(self, user_id: int, role: str) -> bool:
         """Change a stored user's role between 'admin' and 'limited'."""
         if role not in VALID_ROLES:
             return False
-        with self._lock:
-            if user_id not in self._users:
-                return False
-            self._users[user_id]["role"] = role
-            self._save()
-        logger.info(f"[USERS] Set {user_id} role -> {role}")
-        return True
+        ok = self._store.users_set_role(user_id, role)
+        if ok:
+            logger.info(f"[USERS] Set {user_id} role -> {role}")
+        return ok
 
     def remove_user(self, user_id: int) -> bool:
-        with self._lock:
-            if user_id not in self._users:
-                return False
-            del self._users[user_id]
-            self._denied.add(user_id)
-            self._save()
-            self._save_denied()
-        logger.info(f"[USERS] Removed and denied {user_id}")
-        return True
+        denied_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ok = self._store.users_remove(user_id, denied_at)
+        if ok:
+            logger.info(f"[USERS] Removed and denied {user_id}")
+        return ok
 
     def list_users(self) -> dict[int, dict]:
-        return dict(self._users)
+        return self._store.users_list()
 
     def count(self) -> int:
-        return len(self._users)
+        return self._store.users_count()

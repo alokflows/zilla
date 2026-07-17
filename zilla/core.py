@@ -494,7 +494,7 @@ class ZillaCore:
                      "total_bytes": total_bytes},
             "scheduler": {
                 "attached": self.schedules is not None,
-                "schedule_count": (len(self.schedules.schedules)
+                "schedule_count": (self.schedules.count()
                                    if self.schedules is not None else 0),
             },
             "bridge": {"dir": self._bridge_dir,

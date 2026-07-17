@@ -3,15 +3,38 @@
 # ============================================================
 #  Each user gets isolated sessions mapping to CLI conversation
 #  IDs. Supports create, delete, rename, switch.
+#
+#  Persistence: a thin wrapper over store.py (Phase M1). No in-memory
+#  session cache — every read hits the store's read connection directly.
+#  The active-session pointer is a per-row is_active flag (store schema
+#  §3.1) rather than a separate name map, so renaming the active session
+#  carries the flag automatically (same row, new name column).
 # ============================================================
 
-import json
-import os
-import logging
-import threading
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+from zilla import store
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _row_to_dict(row: dict) -> dict:
+    """Translate a store sessions row into the pre-M1 JSON shape that
+    bot.py / keyboards.py / tests already read (conv_id -> conversation_id,
+    created_at -> created, auto_title -> title)."""
+    return {
+        "name": row["name"],
+        "user_id": row["uid"],
+        "conversation_id": row.get("conv_id"),
+        "conv_backend": row.get("conv_backend"),
+        "created": row.get("created_at"),
+        "last_used": row.get("last_used"),
+        "messages": row.get("messages") or 0,
+        "last_seen_step": row.get("last_seen_step") or 0,
+        "title": row.get("auto_title"),
+    }
 
 
 class SessionManager:
@@ -19,120 +42,66 @@ class SessionManager:
 
     def __init__(self, state_file: str):
         self.state_file = state_file
-        self._lock = threading.Lock()
-        self.state = self._load()
-
-    def _load(self) -> dict:
-        with self._lock:
-            try:
-                with open(self.state_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if "sessions" not in data:
-                    data["sessions"] = {}
-                if "active_per_user" not in data:
-                    data["active_per_user"] = {}
-                for key, session in data["sessions"].items():
-                    if "original_name" in session and "name" not in session:
-                        session["name"] = session.pop("original_name")
-                return data
-            except (FileNotFoundError, json.JSONDecodeError):
-                return {"sessions": {}, "active_per_user": {}}
-
-    def _save(self):
-        with self._lock:
-            try:
-                tmp = f"{self.state_file}.tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(self.state, f, indent=2, ensure_ascii=False)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, self.state_file)
-            except Exception as e:
-                logger.error(f"[SESSION] Save failed: {e}")
-
-    def _key(self, name: str, user_id: int) -> str:
-        return f"{user_id}_{name}"
-
-    def _find(self, name: str, user_id: int) -> tuple[str, dict | None]:
-        """Find a session by name for a user. Returns (key, session_data)."""
-        key = self._key(name, user_id)
-        session = self.state["sessions"].get(key)
-        if session and session.get("user_id", 0) == user_id:
-            return key, session
-        # Fallback: try bare name
-        session = self.state["sessions"].get(name)
-        if session and session.get("user_id", 0) == user_id:
-            return name, session
-        return key, None
+        self._store = store.get_store(state_file)
 
     # ── Active Session ────────────────────────────────────
 
     def get_active_name(self, user_id: int) -> str:
-        return self.state.get("active_per_user", {}).get(str(user_id), "main")
+        return self._store.sessions_active_name(user_id) or "main"
 
     def set_active_name(self, name: str, user_id: int):
-        self.state.setdefault("active_per_user", {})[str(user_id)] = name
-        self._save()
+        self._store.sessions_set_active(user_id, name)
 
     # ── Conversation ID ───────────────────────────────────
 
     def get_conversation_id(self, user_id: int, session_name: str = None) -> str | None:
         name = session_name or self.get_active_name(user_id)
-        _, session = self._find(name, user_id)
-        return session.get("conversation_id") if session else None
+        row = self._store.sessions_get(user_id, name)
+        return row.get("conv_id") if row else None
 
     def set_conversation_id(self, conv_id: str, user_id: int, session_name: str = None,
                             backend: str = None):
         name = session_name or self.get_active_name(user_id)
-        key, session = self._find(name, user_id)
-        if not session:
-            self.state["sessions"][key] = {
-                "name": name, "user_id": user_id,
-                "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "messages": 0, "last_seen_step": 0, "title": None,
-            }
-        self.state["sessions"][key]["conversation_id"] = conv_id
-        # Conversation ids are backend-specific (agy brain dir vs claude session).
-        # Remember which backend made this one so we never resume it on the other.
+        fields = {"conv_id": conv_id}
         if backend is not None:
-            self.state["sessions"][key]["conv_backend"] = backend
-        self._save()
+            # Conversation ids are backend-specific (agy brain dir vs claude session).
+            # Remember which backend made this one so we never resume it on the other.
+            fields["conv_backend"] = backend
+        if self._store.sessions_get(user_id, name) is None:
+            fields["created_at"] = _now()
+            fields["messages"] = 0
+            fields["last_seen_step"] = 0
+        self._store.sessions_upsert(user_id, name, **fields)
 
     def get_conv_backend(self, user_id: int, session_name: str = None) -> str | None:
         name = session_name or self.get_active_name(user_id)
-        _, session = self._find(name, user_id)
-        return session.get("conv_backend") if session else None
+        row = self._store.sessions_get(user_id, name)
+        return row.get("conv_backend") if row else None
 
     # ── Last Seen Step ────────────────────────────────────
 
     def get_last_seen_step(self, user_id: int) -> int:
         name = self.get_active_name(user_id)
-        _, session = self._find(name, user_id)
-        return session.get("last_seen_step", 0) if session else 0
+        row = self._store.sessions_get(user_id, name)
+        return (row.get("last_seen_step") or 0) if row else 0
 
     def set_last_seen_step(self, step: int, user_id: int, session_name: str = None):
         name = session_name or self.get_active_name(user_id)
-        key, session = self._find(name, user_id)
-        if session:
-            session["last_seen_step"] = step
-            self._save()
+        if self._store.sessions_get(user_id, name) is not None:
+            self._store.sessions_upsert(user_id, name, last_seen_step=step)
 
     # ── Message Count ─────────────────────────────────────
 
     def increment_messages(self, user_id: int, session_name: str = None):
         name = session_name or self.get_active_name(user_id)
-        key, session = self._find(name, user_id)
-        if session:
-            session["messages"] = session.get("messages", 0) + 1
-            session["last_used"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self._save()
+        self._store.sessions_increment_messages(user_id, name, _now())
 
     # ── Auto-Title ────────────────────────────────────────
 
     def auto_title(self, first_message: str, user_id: int, session_name: str = None):
         name = session_name or self.get_active_name(user_id)
-        _, session = self._find(name, user_id)
-        if not session or session.get("title"):
+        row = self._store.sessions_get(user_id, name)
+        if not row or row.get("auto_title"):
             return
         words = [w for w in first_message.strip().split() if len(w) > 1][:5]
         if not words:
@@ -142,71 +111,51 @@ class SessionManager:
             title = title[:37] + "..."
         title = title.strip(".,!?;:\"'")
         if title:
-            session["title"] = title
-            self._save()
+            self._store.sessions_upsert(user_id, name, auto_title=title)
 
     # ── CRUD ──────────────────────────────────────────────
 
     def create_session(self, name: str, user_id: int) -> bool:
-        key = self._key(name, user_id)
-        if key in self.state["sessions"]:
+        if self._store.sessions_get(user_id, name) is not None:
             return False
-        self.state["sessions"][key] = {
-            "name": name, "user_id": user_id,
-            "conversation_id": None,
-            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "messages": 0, "last_seen_step": 0, "title": None,
-        }
+        self._store.sessions_upsert(
+            user_id, name, created_at=_now(), messages=0, last_seen_step=0,
+        )
         self.set_active_name(name, user_id)
-        self._save()
         return True
 
     def delete_session(self, name: str, user_id: int) -> bool:
-        key, session = self._find(name, user_id)
-        if not session:
+        if self._store.sessions_get(user_id, name) is None:
             return False
-        del self.state["sessions"][key]
-        # Switch active if needed
-        if self.get_active_name(user_id) == name:
+        was_active = self.get_active_name(user_id) == name
+        self._store.sessions_delete(user_id, name)
+        if was_active:
             remaining = self.list_sessions(user_id)
             self.set_active_name(next(iter(remaining), "main"), user_id)
-        self._save()
         return True
 
     def rename_session(self, old_name: str, new_name: str, user_id: int) -> bool:
-        old_key, session = self._find(old_name, user_id)
-        if not session:
-            return False
-        new_key = self._key(new_name, user_id)
-        if new_key in self.state["sessions"]:
-            return False
-        session["name"] = new_name
-        self.state["sessions"][new_key] = self.state["sessions"].pop(old_key)
-        if self.get_active_name(user_id) == old_name:
-            self.set_active_name(new_name, user_id)
-        self._save()
-        return True
+        # A rename is an UPDATE on the same row, so an is_active flag (if
+        # set) follows the row to its new name automatically — no separate
+        # active-pointer housekeeping needed here.
+        return self._store.sessions_rename(user_id, old_name, new_name)
 
     def list_sessions(self, user_id: int) -> dict:
         """Return {name: info} for all sessions owned by user."""
-        result = {}
-        for key, s in self.state["sessions"].items():
-            if s.get("user_id") == user_id:
-                display_name = s.get("name", key)
-                result[display_name] = s
-        return result
+        rows = self._store.sessions_list(user_id)
+        return {row["name"]: _row_to_dict(row) for row in rows}
 
     def get_session_info(self, user_id: int, session_name: str = None) -> dict | None:
         name = session_name or self.get_active_name(user_id)
-        _, session = self._find(name, user_id)
-        if not session:
+        row = self._store.sessions_get(user_id, name)
+        if not row:
             return None
         return {
-            "name": session.get("name", name),
-            "title": session.get("title"),
-            "conversation_id": session.get("conversation_id"),
-            "created": session.get("created"),
-            "last_used": session.get("last_used"),
-            "messages": session.get("messages", 0),
-            "is_active": session.get("name", name) == self.get_active_name(user_id),
+            "name": row["name"],
+            "title": row.get("auto_title"),
+            "conversation_id": row.get("conv_id"),
+            "created": row.get("created_at"),
+            "last_used": row.get("last_used"),
+            "messages": row.get("messages") or 0,
+            "is_active": row["name"] == self.get_active_name(user_id),
         }

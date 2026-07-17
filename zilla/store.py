@@ -118,6 +118,28 @@ class Store:
         # shared read connection. WAL is designed for many independent
         # reader connections, so each thread gets its own, lazily opened.
         self._read_local = threading.local()
+
+        # Compatibility shim (distinct from the production first-start
+        # migration in PLAN.md step 3, which imports the 5 well-known
+        # legacy paths into ONE new zilla.db): a caller may still point a
+        # manager directly at a pre-M1 JSON file that happens to already
+        # exist at this exact path (e.g. a manager constructed against an
+        # old "authorized_users.json"-style path). sqlite3 can't open that
+        # file, so detect it, stash its parsed content on self.legacy_json
+        # for the wrapper class to import on first use, and move it aside
+        # so a fresh database can be created at the same path.
+        self.legacy_json: Any = None
+        if os.path.exists(db_path) and os.path.getsize(db_path) > 0:
+            with open(db_path, "rb") as f:
+                header = f.read(16)
+            if header[:16] != b"SQLite format 3\x00":
+                try:
+                    with open(db_path, "r", encoding="utf-8") as f:
+                        self.legacy_json = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    self.legacy_json = None
+                os.replace(db_path, db_path + ".pre-sqlite-migration.json")
+
         self._write_conn = sqlite3.connect(
             db_path, check_same_thread=False, isolation_level=None
         )

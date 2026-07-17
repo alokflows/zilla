@@ -10,17 +10,24 @@
 #
 #  The next-run math (compute_next_run) is pure and unit-tested.
 #  Times are local; epoch seconds are stored on disk.
+#
+#  Persistence: a thin wrapper over store.py (Phase M1). No in-memory
+#  schedule cache — every read hits the store's read connection
+#  directly. The store's schedules table uses "uid" for the owning
+#  user (SQL convention matching users/sessions) and "created_at" for
+#  the creation timestamp; ScheduleManager translates these back to
+#  the pre-M1 "user_id"/"created" keys that bot.py, core.py and the
+#  tests already read.
 # ============================================================
 
 from __future__ import annotations
 
-import json
-import os
 import logging
-import threading
 import time
 import uuid
 from datetime import datetime, timedelta
+
+from zilla import store
 
 logger = logging.getLogger(__name__)
 
@@ -151,34 +158,45 @@ def describe(kind: str, spec: dict) -> str:
     return kind
 
 
+def _to_dict(row: dict) -> dict:
+    """Translate a store schedules row into the pre-M1 shape (uid ->
+    user_id, created_at -> created; enabled/backend_pin_notified forced
+    to real bool since SQLite round-trips them as 0/1 ints and tests use
+    strict `is True`/`is False` checks against these two fields)."""
+    return {
+        "id": row["id"],
+        "user_id": row["uid"],
+        "chat_id": row["chat_id"],
+        "prompt": row.get("prompt"),
+        "title": row.get("title"),
+        "kind": row["kind"],
+        "spec": row["spec"],
+        "enabled": bool(row.get("enabled")),
+        "created": row.get("created_at"),
+        "last_run": row.get("last_run"),
+        "next_run": row.get("next_run"),
+        "session_name": row.get("session_name"),
+        "session": row.get("session"),
+        "payload_type": row.get("payload_type") or "message",
+        "backend": row.get("backend"),
+        "model": row.get("model"),
+        "backend_pin_notified": bool(row.get("backend_pin_notified")),
+        "fail_count": row.get("fail_count") or 0,
+    }
+
+
 class ScheduleManager:
-    """Persistent store of automation jobs (one JSON file, atomic writes)."""
+    """Persistent store of automation jobs."""
 
     def __init__(self, state_file: str):
         self.state_file = state_file
-        self._lock = threading.Lock()
-        self.schedules = self._load()
-
-    def _load(self) -> dict:
-        with self._lock:
-            try:
-                with open(self.state_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return data if isinstance(data, dict) else {}
-            except (FileNotFoundError, json.JSONDecodeError):
-                return {}
-
-    def _save(self):
-        with self._lock:
-            try:
-                tmp = f"{self.state_file}.tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(self.schedules, f, indent=2, ensure_ascii=False)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, self.state_file)
-            except Exception as e:
-                logger.error(f"[SCHED] Save failed: {e}")
+        self._store = store.get_store(state_file)
+        # Back-compat only: pre-M1 tests occasionally poke a schedule dict
+        # in directly (schedules.schedules[sid] = s) to hand a one-off dict
+        # straight to core._execute_schedule() without going through add().
+        # Nothing in this class reads from it — the store is the only
+        # source of truth for every real method above.
+        self.schedules: dict = {}
 
     # ── CRUD ──────────────────────────────────────────────
 
@@ -200,11 +218,11 @@ class ScheduleManager:
         if next_run is None:
             return None  # nothing in the future (e.g. a one-off in the past)
         sid = uuid.uuid4().hex[:8]
-        sched = {
-            "id": sid, "user_id": user_id, "chat_id": chat_id,
+        row = {
+            "id": sid, "uid": user_id, "chat_id": chat_id,
             "prompt": prompt, "title": (title or prompt)[:60],
-            "kind": kind, "spec": spec, "enabled": True,
-            "created": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": kind, "spec": spec, "enabled": 1,
+            "created_at": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
             "last_run": None, "next_run": next_run,
             # Legacy field, kept for back-compat reads of pre-Part-B schedules
             # (see resolve_session_mode). New code should use "session".
@@ -212,62 +230,63 @@ class ScheduleManager:
             "session": session if session is not None else "isolated",
             "payload_type": payload_type,
             "backend": backend, "model": model,
-            "backend_pin_notified": False,
+            "backend_pin_notified": 0,
+            "fail_count": 0,
         }
-        self.schedules[sid] = sched
-        self._save()
-        return sched
+        self._store.schedules_insert(row)
+        return _to_dict(row)
 
     def get(self, sid: str) -> dict | None:
-        return self.schedules.get(sid)
+        row = self._store.schedules_get(sid)
+        return _to_dict(row) if row else None
+
+    def count(self) -> int:
+        """Total schedules across all users (health report)."""
+        return len(self._store.schedules_all())
 
     def remove(self, sid: str, user_id: int) -> bool:
-        s = self.schedules.get(sid)
-        if not s or s.get("user_id") != user_id:
+        row = self._store.schedules_get(sid)
+        if not row or row["uid"] != user_id:
             return False
-        del self.schedules[sid]
-        self._save()
-        return True
+        return self._store.schedules_delete(sid, user_id)
 
     def set_enabled(self, sid: str, user_id: int, enabled: bool,
                     now: float | None = None) -> bool:
-        s = self.schedules.get(sid)
-        if not s or s.get("user_id") != user_id:
+        row = self._store.schedules_get(sid)
+        if not row or row["uid"] != user_id:
             return False
-        s["enabled"] = enabled
-        if enabled and not s.get("next_run"):
+        fields = {"enabled": 1 if enabled else 0}
+        if enabled and not row.get("next_run"):
             now = now if now is not None else time.time()
-            s["next_run"] = compute_next_run(s["kind"], s["spec"], now)
-        self._save()
+            fields["next_run"] = compute_next_run(row["kind"], row["spec"], now)
+        self._store.schedules_update(sid, **fields)
         return True
 
     def list(self, user_id: int) -> list[dict]:
-        items = [s for s in self.schedules.values() if s.get("user_id") == user_id]
+        rows = self._store.schedules_list(user_id)
+        items = [_to_dict(r) for r in rows]
         items.sort(key=lambda s: (not s.get("enabled"), s.get("next_run") or 1e18))
         return items
 
     def touch_run(self, sid: str, now: float | None = None):
         """Mark a schedule as just-run and advance to its next occurrence."""
-        s = self.schedules.get(sid)
-        if not s:
+        row = self._store.schedules_get(sid)
+        if not row:
             return
         now = now if now is not None else time.time()
-        s["last_run"] = now
-        nxt = compute_next_run(s["kind"], s["spec"], now)
+        nxt = compute_next_run(row["kind"], row["spec"], now)
         if nxt is None:                 # one-off finished
-            s["enabled"] = False
-            s["next_run"] = None
+            self._store.schedules_update(sid, last_run=now, enabled=0, next_run=None)
         else:
-            s["next_run"] = nxt
-        self._save()
+            self._store.schedules_update(sid, last_run=now, next_run=nxt)
 
     # ── Run outcome (self-healing: retry on failure, never silently skip) ──
 
     def mark_success(self, sid: str, now: float | None = None):
         """A run succeeded: clear the failure counter and advance normally."""
-        s = self.schedules.get(sid)
-        if s is not None:
-            s["fail_count"] = 0
+        row = self._store.schedules_get(sid)
+        if row is not None:
+            self._store.schedules_update(sid, fail_count=0)
         self.touch_run(sid, now)
 
     def mark_failure(self, sid: str, now: float | None = None) -> tuple[str, int]:
@@ -283,47 +302,46 @@ class ScheduleManager:
         The schedule is NEVER silently dropped: it always has a future next_run
         (unless it's a finished one-off), so a missed/failed job recovers.
         """
-        s = self.schedules.get(sid)
-        if not s:
+        row = self._store.schedules_get(sid)
+        if not row:
             return ("gone", 0)
         now = now if now is not None else time.time()
-        attempt = int(s.get("fail_count", 0)) + 1
-        s["fail_count"] = attempt
-        s["last_run"] = now
+        attempt = int(row.get("fail_count") or 0) + 1
         if attempt <= len(RETRY_LADDER):
-            s["next_run"] = now + RETRY_LADDER[attempt - 1]
-            self._save()
+            self._store.schedules_update(
+                sid, fail_count=attempt, last_run=now,
+                next_run=now + RETRY_LADDER[attempt - 1],
+            )
             return ("retry", attempt)
         # Ladder exhausted: reset and move to the next normal occurrence.
-        s["fail_count"] = 0
-        nxt = compute_next_run(s["kind"], s["spec"], now)
+        nxt = compute_next_run(row["kind"], row["spec"], now)
         if nxt is None:                 # finished one-off that kept failing
-            s["enabled"] = False
-            s["next_run"] = None
+            self._store.schedules_update(
+                sid, fail_count=0, last_run=now, enabled=0, next_run=None,
+            )
         else:
-            s["next_run"] = nxt
-        self._save()
+            self._store.schedules_update(sid, fail_count=0, last_run=now, next_run=nxt)
         return ("gaveup", attempt)
 
     def mark_backend_pin_notified(self, sid: str):
         """Record that the owner was told once about a backend/model pin
         drift (see backend_pin_mismatch) — suppresses further Alerts."""
-        s = self.schedules.get(sid)
-        if s is not None:
-            s["backend_pin_notified"] = True
-            self._save()
+        row = self._store.schedules_get(sid)
+        if row is not None:
+            self._store.schedules_update(sid, backend_pin_notified=1)
 
     # ── Runtime selection ─────────────────────────────────
 
     def due(self, now: float | None = None) -> list[dict]:
         now = now if now is not None else time.time()
-        return [s for s in self.schedules.values()
-                if s.get("enabled") and s.get("next_run") and s["next_run"] <= now]
+        rows = self._store.schedules_all()
+        return [_to_dict(r) for r in rows
+                if r.get("enabled") and r.get("next_run") and r["next_run"] <= now]
 
     def next_due_at(self) -> float | None:
         """Earliest next_run among enabled schedules (None if none pending)."""
-        pending = [s["next_run"] for s in self.schedules.values()
-                   if s.get("enabled") and s.get("next_run")]
+        rows = self._store.schedules_all()
+        pending = [r["next_run"] for r in rows if r.get("enabled") and r.get("next_run")]
         return min(pending) if pending else None
 
     def reconcile_startup(self, now: float | None = None, catchup: bool = True):
@@ -335,15 +353,11 @@ class ScheduleManager:
         now = now if now is not None else time.time()
         if catchup:
             return  # due() will pick them up and run each once
-        changed = False
-        for s in self.schedules.values():
-            if s.get("enabled") and s.get("next_run") and s["next_run"] <= now:
-                nxt = compute_next_run(s["kind"], s["spec"], now)
+        rows = self._store.schedules_all()
+        for row in rows:
+            if row.get("enabled") and row.get("next_run") and row["next_run"] <= now:
+                nxt = compute_next_run(row["kind"], row["spec"], now)
                 if nxt is None:
-                    s["enabled"] = False
-                    s["next_run"] = None
+                    self._store.schedules_update(row["id"], enabled=0, next_run=None)
                 else:
-                    s["next_run"] = nxt
-                changed = True
-        if changed:
-            self._save()
+                    self._store.schedules_update(row["id"], next_run=nxt)

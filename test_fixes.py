@@ -510,8 +510,8 @@ def test_schedule_reconcile_catchup():
     # Build a schedule whose next_run is already in the past.
     sm = _sm()
     s = sm.add(1, 1, "x", "daily", {"hh": 9, "mm": 0}, now=_epoch(2026, 6, 2, 8, 0))
-    # force past-due
-    sm.get(s["id"])["next_run"] = now - 100
+    # Created at 08:00 for a 09:00 daily slot -> next_run is already 09:00
+    # today, which is before `now` (10:00): naturally past-due already.
     # catchup ON -> stays due
     sm.reconcile_startup(now=now, catchup=True)
     check("sched: catchup ON leaves past-due due", len(sm.due(now)) == 1)

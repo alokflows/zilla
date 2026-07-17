@@ -12,6 +12,8 @@ import time
 import logging
 import subprocess
 
+from zilla import store
+
 logger = logging.getLogger(__name__)
 
 # --- Dynamic Path Resolution ---
@@ -171,10 +173,17 @@ def get_skills_dir(backend: str | None = None) -> str:
 KIMI_BRIDGE_URL = os.getenv("KIMI_BRIDGE_URL", "http://127.0.0.1:10086")
 
 # --- State Files ---
-SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
-USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
-SCHEDULES_FILE = os.path.join(BASE_DIR, "schedules.json")
+# One shared SQLite database (PLAN.md §3.1, Phase M1) backs sessions,
+# settings, users and schedules — all four constants alias the same path
+# so every manager constructed in bot.py / core_setup.py naturally shares
+# one zilla.db. Kept as four names (not one) because tests reassign these
+# individually to distinct tmp paths for isolation (test_core.py) and
+# production code still imports/passes them by their original names.
+DB_FILE = os.path.join(BASE_DIR, "zilla.db")
+SESSIONS_FILE = DB_FILE
+SETTINGS_FILE = DB_FILE
+USERS_FILE = DB_FILE
+SCHEDULES_FILE = DB_FILE
 
 # ┌─────────────────────────────────────────────────────────┐
 # │  USER MANAGEMENT                                        │
@@ -208,43 +217,21 @@ TELEGRAM_MAX_SEND_FILE = 50 * 1024 * 1024  # 50 MB
 BOT_VERSION = "4.7.0"
 
 
-# ── Settings (simple JSON dict) ───────────────────────────
-
-_settings_cache: dict | None = None
-
-
-def _load_settings() -> dict:
-    global _settings_cache
-    if _settings_cache is not None:
-        return _settings_cache
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            _settings_cache = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        _settings_cache = {}
-    return _settings_cache
-
-
-def _save_settings(data: dict):
-    global _settings_cache
-    _settings_cache = data
-    try:
-        tmp = f"{SETTINGS_FILE}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, SETTINGS_FILE)
-    except Exception as e:
-        logger.error(f"[CONFIG] Failed to save settings: {e}")
+# ── Settings (SQLite KV via store.py, Phase M1) ───────────
+#
+# No in-memory cache here — the store's own read connection IS the cache
+# (a local read, not a network round-trip). get_store(SETTINGS_FILE) is
+# called fresh on every access (not hoisted to import time) so tests that
+# reassign config.SETTINGS_FILE to a tmp path after import still get an
+# isolated database, matching the old per-test JSON-file isolation.
 
 
 def get_setting(key: str, default=None):
-    return _load_settings().get(key, default)
+    return store.get_store(SETTINGS_FILE).get_setting(key, default)
 
 
 def set_setting(key: str, value):
-    data = _load_settings()
-    data[key] = value
-    _save_settings(data)
+    store.get_store(SETTINGS_FILE).set_setting(key, value)
 
 
 # ── Model: read/write agy's REAL settings file ────────────
