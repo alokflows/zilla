@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zilla"
+version = "4.7.0"
+description = "Zilla — a terminal-first AI harness (Telegram connector included)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "python-telegram-bot==22.7",
+    "SpeechRecognition==3.16.1",
+    "pydub==0.25.1",
+    "pywinpty; sys_platform == 'win32'",
+]
+
+# `zilla` (bare) needs the TUI, which is a PARALLEL, separate build this
+# round (zilla/tui/). Kept optional so `pip install -e .` alone still gives
+# you `zilla config` / `doctor` / `start` / `stop` / `status` / `logs` even
+# before the TUI lands; `zilla` (bare) degrades to a friendly message +
+# `status` if the extra isn't installed. Install with: pip install -e ".[tui]"
+[project.optional-dependencies]
+tui = ["textual"]
+
+[project.scripts]
+zilla = "zilla.cli:main"
+
+[tool.setuptools]
+# Transitional layout (Phase 1 core-extraction moved most modules into
+# zilla/, but bot.py / install.py / run_background.py and their remaining
+# top-level dependents haven't followed yet — see HANDOFF.md Phase 3 for the
+# planned clean home-directory layout). Declare both so `pip install -e .`
+# resolves every import this round without duplicating any module.
+packages = ["zilla"]
+py-modules = [
+    "bot", "install", "config", "cli_engine", "sessions", "users",
+    "schedules", "schedule_parse", "verify", "autoharness", "interactive",
+    "harness", "media", "formatter", "platform_compat", "keyboards",
+    "run_background", "winhide",
+]

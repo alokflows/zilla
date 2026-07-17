@@ -367,22 +367,39 @@ CLAUDE_MODELS = [
 _CLAUDE_MODEL_FALLBACK = "sonnet"
 
 
+def get_model_for(backend: str) -> str:
+    """Active model for a GIVEN backend (agy/claude), independent of which
+    backend is currently selected — lets a settings UI show/edit every
+    backend's model without switching the active one."""
+    b = (backend or "").strip().lower()
+    if b == "claude":
+        return get_setting("claude_model", _CLAUDE_MODEL_FALLBACK)
+    return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
+
+
+def model_catalog_for(backend: str) -> list[tuple[str, str]]:
+    """(button_label, value) pairs for a GIVEN backend's model picker,
+    independent of the currently active backend."""
+    b = (backend or "").strip().lower()
+    if b == "claude":
+        return [(label, val) for label, val in CLAUDE_MODELS]
+    if b == "agy":
+        return [(_agy_label(m), m) for m in agy_models_live()]
+    return []
+
+
 def get_model() -> str:
     """Active model for the CURRENT backend.
     - agy:    read (cached) from agy's own settings.json.
     - claude: stored in the bot's settings ('claude_model'), passed via --model.
     """
-    if get_backend() == "claude":
-        return get_setting("claude_model", _CLAUDE_MODEL_FALLBACK)
-    return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
+    return get_model_for(get_backend())
 
 
 def model_catalog() -> list[tuple[str, str]]:
     """(button_label, value) pairs for the current backend's model picker.
     agy's list is the REAL `agy models` output (no invented combos)."""
-    if get_backend() == "claude":
-        return [(label, val) for label, val in CLAUDE_MODELS]
-    return [(_agy_label(m), m) for m in agy_models_live()]
+    return model_catalog_for(get_backend())
 
 
 def _agy_set_model(model_name: str) -> str:
@@ -410,12 +427,21 @@ def _agy_set_model(model_name: str) -> str:
     return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
 
 
-def set_model(model_name: str) -> str:
-    """Set the active model for the CURRENT backend; return the stored value."""
-    if get_backend() == "claude":
+def set_model_for(backend: str, model_name: str) -> str:
+    """Set the model for a GIVEN backend (agy/claude); return the stored
+    value. Independent of which backend is currently active."""
+    b = (backend or "").strip().lower()
+    if b == "claude":
         set_setting("claude_model", model_name)
         return model_name
-    return _agy_set_model(model_name)
+    if b == "agy":
+        return _agy_set_model(model_name)
+    return model_name
+
+
+def set_model(model_name: str) -> str:
+    """Set the active model for the CURRENT backend; return the stored value."""
+    return set_model_for(get_backend(), model_name)
 
 
 def get_idle_kill_after() -> int:
