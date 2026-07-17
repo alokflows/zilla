@@ -2,20 +2,23 @@
 #  ZILLA CORE — interface-agnostic turn pipeline (Phase 1)
 # ============================================================
 #
-#  Implements docs/dev/CORE_API.md, migration steps 2 + 3: the TURN
-#  PIPELINE and the SCHEDULER RUNTIME extracted from bot.py.
-#  Frontends (Telegram bot, TUI) are thin translators between their
-#  medium and this API — they preprocess input, then render the
-#  events this module yields/broadcasts.
+#  Implements docs/dev/CORE_API.md, migration steps 2-6: the TURN
+#  PIPELINE, the SCHEDULER RUNTIME, the credential/OTP BRIDGE WATCHER,
+#  APPROVAL MODE, and the health_report() snapshot, all extracted
+#  from bot.py. Frontends (Telegram
+#  bot, TUI) are thin translators between their medium and this API —
+#  they preprocess input, then render the events this module
+#  yields/broadcasts.
 #
 #  This seam owns: per-user CLI serialization, session/conv-id
 #  pinning, the run_cli_async invocation (harness wrapping happens
 #  inside the backend), verify/corrective-retry (inside
 #  cli_engine._run_blocking), session bookkeeping, response +
-#  file-path assembly, and (step 3) the scheduler tick loop /
-#  catch-up / retry-and-record semantics. Approval hold, attachment
-#  preprocessing, bridge watcher and health remain in the frontends /
-#  later seams.
+#  file-path assembly, the scheduler tick loop / catch-up /
+#  retry-and-record semantics, the bridge-file poll loop, and the
+#  Approval-mode hold + execution (see the Approvals class), and the
+#  health_report() snapshot (step 6 STUB — the self-healing health LOOP
+#  is Phase 7). Attachment preprocessing remains in the frontends.
 #
 #  Invariants carried over UNCHANGED from bot.py (see
 #  docs/dev/AI_CONTEXT.md — violating them reintroduces response
@@ -23,14 +26,16 @@
 #  conv_id is re-read and the active session name pinned INSIDE
 #  the lock; session writes thread session_name + backend; the
 #  cancel event is registered inside the lock and popped only if
-#  identity-matched. Scheduled "message" runs go through this SAME
-#  lock (see _execute_schedule) — a live chat turn and a scheduled
-#  job for the same user still never overlap.
+#  identity-matched. Scheduled "message" runs AND owner-approved
+#  Approval-mode runs go through this SAME lock (see _execute_schedule
+#  / Approvals.approve) — a live chat turn, a scheduled job, and an
+#  approved request for the same user still never overlap.
 # ============================================================
 
 import asyncio
 import logging
 import os
+import secrets
 import shutil
 import threading
 import time
@@ -55,6 +60,13 @@ logger = logging.getLogger(__name__)
 # NOT keep swallowing the user's next unrelated message. Same value/semantics
 # as bot.py's old _BRIDGE_PENDING_TTL.
 BRIDGE_PENDING_TTL = 900.0
+
+# Approval mode (limited users, docs/dev/CORE_API.md migration step 5): how
+# long a held request waits for the owner before it's forgotten, and the
+# hard cap on how many can be queued at once so a spammer can't grow the
+# store unbounded. Same values/semantics as bot.py's old _APPROVAL_TTL/_MAX.
+APPROVAL_TTL = 3600.0
+APPROVAL_MAX = 50
 
 
 # ══════════════════════════════════════════════════════════
@@ -107,11 +119,23 @@ class Response:
 
 @dataclass
 class ApprovalRequest:
-    """Limited user waiting for owner approval. Placeholder — the approval
-    flow moves here in a later seam (CORE_API migration step 5)."""
+    """A "limited" user's request, held for the owner to approve or deny
+    (docs/dev/CORE_API.md migration step 5 — Approval mode, users.py role
+    "limited"). Broadcast via subscribe() the moment ZillaCore.approvals.submit()
+    registers the hold; a frontend renders it (Telegram: DM the owner the
+    prompt preview + ✅/❌ buttons, same card bot.py's old
+    _submit_for_approval used to send directly) and later resolves it with
+    core.approvals.approve(id) / .deny(id).
+
+    user/chat_id — who asked and which chat gets the result once approved
+    (Telegram: same value today, kept distinct for frontends where they
+    could differ). name — display name for the owner-facing card (mirrors
+    bot.py's old auth._users[...]['name'] fallback)."""
     id: str
     user: int
     prompt: str
+    chat_id: int = None
+    name: str = ""
 
 
 @dataclass
@@ -149,13 +173,93 @@ class ScheduledResult:
 
 
 # ══════════════════════════════════════════════════════════
+#  APPROVALS  (docs/dev/CORE_API.md migration step 5)
+# ══════════════════════════════════════════════════════════
+#
+#  Moved from bot.py's module-level _pending_approvals/_make_approval/
+#  _prune_approvals/_run_approved_request/_cb_approvals — the HOLD, the
+#  TTL/cap policy, and the execution of an approved turn all live here now.
+#  bot.py keeps only what genuinely needs Telegram: the ✅/❌ button
+#  keyboard, the "Approval needed" card text, and delivering the result
+#  (send_response) — everything that isn't interface I/O moved.
+#
+#  A small wrapper object rather than flat ZillaCore methods (matching
+#  core.sessions / core.schedules) so the CORE_API vocabulary
+#  ("core.approvals.pending()/.approve(id)/.deny(id)") reads exactly as
+#  documented; the state itself lives on ZillaCore (_pending_approvals) —
+#  this is a thin view over it, not a second source of truth.
+
+class Approvals:
+    def __init__(self, core: "ZillaCore"):
+        self._core = core
+
+    def _prune(self) -> None:
+        """Forget un-actioned requests older than APPROVAL_TTL (mirrors
+        bot.py's old _prune_approvals — called lazily on submit, same as
+        before, not on a timer)."""
+        now = time.time()
+        store = self._core._pending_approvals
+        for rid in [r for r, v in store.items() if now - v.get("ts", 0) > APPROVAL_TTL]:
+            store.pop(rid, None)
+
+    def pending(self) -> list:
+        """Snapshot of every held request as {id, uid, chat_id, prompt, name, ts}."""
+        return [{"id": rid, **req} for rid, req in self._core._pending_approvals.items()]
+
+    def submit(self, uid: int, chat_id: int, prompt: str, name: str) -> str | None:
+        """Register a limited user's request and broadcast ApprovalRequest so
+        a frontend can notify the owner. Returns the request id, or None if
+        the queue is already at APPROVAL_MAX (mirrors bot.py's old
+        _make_approval — the frontend shows its 'too many requests waiting'
+        notice on None, same as before)."""
+        self._prune()
+        store = self._core._pending_approvals
+        if len(store) >= APPROVAL_MAX:
+            return None
+        rid = secrets.token_hex(6)
+        store[rid] = {"uid": uid, "chat_id": chat_id, "prompt": prompt,
+                      "name": name, "ts": time.time()}
+        self._core._broadcast(ApprovalRequest(id=rid, user=uid, prompt=prompt,
+                                              chat_id=chat_id, name=name))
+        return rid
+
+    async def approve(self, rid: str) -> dict | None:
+        """Pop the held request and run it through the SAME turn pipeline a
+        live chat message uses (core.handle_message) — same per-user lock,
+        session pinning, and I-CONV/I-STEP handling; skip_permissions=True
+        because the owner already vetted the whole request (mirrors bot.py's
+        old _run_approved_request). Returns
+        {id, uid, chat_id, prompt, name, ts, response} for the frontend to
+        deliver, or None if the id is unknown/already resolved — the
+        frontend then shows 'expired or already handled', same text as
+        before. Exceptions from the turn propagate; the frontend applies its
+        own friendly-error text and still delivers a reply, same as before."""
+        req = self._core._pending_approvals.pop(rid, None)
+        if req is None:
+            return None
+        uid, chat_id, prompt = req["uid"], req["chat_id"], req["prompt"]
+        response = ""
+        async for ev in self._core.handle_message(
+                uid, prompt, chat_key=chat_id, auto_title=True, skip_permissions=True):
+            if isinstance(ev, Response):
+                response = ev.text
+        return {**req, "id": rid, "response": response}
+
+    def deny(self, rid: str) -> dict | None:
+        """Discard a held request without running it. Returns the request
+        (so the frontend can tell the requester it was declined), or None if
+        the id is unknown/already resolved."""
+        return self._core._pending_approvals.pop(rid, None)
+
+
+# ══════════════════════════════════════════════════════════
 #  CORE
 # ══════════════════════════════════════════════════════════
 
 class ZillaCore:
     """Owns everything that is not interface I/O. This seam: the turn
-    pipeline + scheduler runtime. Later seams add bridge watcher, approvals
-    and health (see CORE_API.md).
+    pipeline + scheduler runtime + credential/OTP bridge + approvals. Health
+    is the last seam left (see CORE_API.md).
 
     Shares the frontend's SessionManager/AuthManager instances so there is
     exactly one source of truth while bot.py still holds its own references.
@@ -184,6 +288,13 @@ class ZillaCore:
         # (ask_id, announced_ts, is_secret). One outstanding ask per chat.
         self._pending_asks: dict[int, tuple[str, float, bool]] = {}
         self._bridge_task: asyncio.Task | None = None
+
+        # Approval mode (docs/dev/CORE_API.md migration step 5; users.py role
+        # "limited"): a held request, keyed by a short random id, until the
+        # owner approves or denies it. See the Approvals class above for the
+        # public surface (core.approvals.pending()/.submit()/.approve()/.deny()).
+        self._pending_approvals: dict[str, dict] = {}
+        self.approvals = Approvals(self)
 
         # Per-chat cancel events — set to cancel the active CLI request for
         # that chat. Keyed by the frontend's chat key (Telegram: chat_id;

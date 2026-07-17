@@ -45,7 +45,6 @@ import re
 import logging
 import time
 import json
-import secrets
 from contextlib import aclosing
 from datetime import datetime
 
@@ -243,34 +242,6 @@ def _rate_should_notify(uid: int, min_gap: float = _RATE_WINDOW) -> bool:
         return False
     _rate_notice_at[uid] = now
     return True
-
-
-# ── Approval mode (limited users) ──────────────────────────
-# A "limited" user may chat, but nothing they send runs until the OWNER taps
-# Approve. Each pending request is held here keyed by a short random id.
-_pending_approvals: dict[str, dict] = {}
-_APPROVAL_TTL = 3600.0     # forget un-actioned requests after an hour
-_APPROVAL_MAX = 50         # hard cap so a spammer can't grow this unbounded
-
-
-def _prune_approvals() -> None:
-    now = time.time()
-    for rid in [r for r, v in _pending_approvals.items()
-                if now - v.get("ts", 0) > _APPROVAL_TTL]:
-        _pending_approvals.pop(rid, None)
-
-
-def _make_approval(uid: int, chat_id: int, prompt: str, name: str) -> str | None:
-    """Register a pending request; returns its id, or None if the queue is full."""
-    _prune_approvals()
-    if len(_pending_approvals) >= _APPROVAL_MAX:
-        return None
-    rid = secrets.token_hex(6)
-    _pending_approvals[rid] = {
-        "uid": uid, "chat_id": chat_id, "prompt": prompt,
-        "name": name, "ts": time.time(),
-    }
-    return rid
 
 
 async def _notify_if_busy(uid: int, update: Update) -> None:
@@ -668,14 +639,22 @@ async def send_response(update, context, response: str, user_id: int, chat_id: i
 
 
 # ── Approval mode: submit / approve / run ──────────────────
+# The HOLD (store, TTL/cap) and the approved-turn execution now live in
+# core.approvals (docs/dev/CORE_API.md migration step 5, zilla/core.py) —
+# these three functions are the Telegram-only remainder: the immediate ack
+# to the requester, the owner-DM keyboard/text (rendered from the
+# ApprovalRequest event, see _deliver_approval_request below), and
+# delivering the eventual result.
 
 async def _submit_for_approval(update, context, uid: int, chat_id: int, prompt: str):
-    """Hold a limited user's request and ask the owner to approve it."""
+    """Hold a limited user's request and ask the owner to approve it. Thin
+    call into core.approvals.submit — core owns the hold and broadcasts
+    ApprovalRequest; _deliver_approval_request renders the owner's DM."""
     prompt = (prompt or "").strip()
     if not prompt:
         return
     name = auth._users.get(uid, {}).get("name") or f"User {uid}"
-    rid = _make_approval(uid, chat_id, prompt, name)
+    rid = core.approvals.submit(uid, chat_id, prompt, name)
     if not rid:
         await safe_send(context.bot, chat_id,
                         "⚠️ Too many requests are waiting for approval right now. "
@@ -684,64 +663,53 @@ async def _submit_for_approval(update, context, uid: int, chat_id: int, prompt: 
     await safe_send(context.bot, chat_id,
                     "📨 Sent to the owner for approval. I'll post the answer here "
                     "once they approve it.")
-    preview = prompt if len(prompt) <= 500 else prompt[:500] + "…"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve & run", callback_data=f"appr_ok_{rid}"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"appr_no_{rid}"),
-    ]])
-    try:
-        await context.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=(f"🔔 Approval needed\n\n"
-                  f"{name} (limited) wants to run:\n\n"
-                  f"“{preview}”\n\n"
-                  f"Approving runs it on THIS computer and sends them the result."),
-            reply_markup=kb,
-        )
-    except Exception as e:
-        logger.error(f"[APPROVAL] could not notify owner: {e}")
-        _pending_approvals.pop(rid, None)
-        await safe_send(context.bot, chat_id,
-                        "⚠️ Couldn't reach the owner right now. Please try again later.")
-
-
-async def _run_approved_request(context, req: dict):
-    """Execute an owner-approved limited-user request and deliver it to them."""
-    uid, chat_id, prompt = req["uid"], req["chat_id"], req["prompt"]
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
-    response = ""
-    try:
-        # The owner vetted the whole request, so let the agent act (skip prompts).
-        response = await _relay_cli_turn(
-            None, uid, chat_id, prompt,
-            auto_title=True, skip_permissions=True)
-    except Exception as e:
-        response = _friendly_error(e)
-        logger.error(f"[APPROVAL] run failed: {e}", exc_info=True)
-    finally:
-        stop_typing.set()
-        typing_task.cancel()
-    await send_response(None, context, response, uid, chat_id)
 
 
 async def _cb_approvals(query, context, data, uid, chat_id):
-    """Owner-only: approve or deny a held limited-user request."""
+    """Owner-only: approve or deny a held limited-user request. Thin calls
+    into core.approvals (docs/dev/CORE_API.md migration step 5) — core owns
+    the hold and runs an approved turn through the normal pipeline; this
+    renders the Telegram-specific bits (typing indicator, message text,
+    result delivery) exactly as bot.py's old _run_approved_request did."""
     if not auth.is_owner(uid):
         return
     if data.startswith("appr_ok_"):
-        req = _pending_approvals.pop(data.removeprefix("appr_ok_"), None)
-        if not req:
+        rid = data.removeprefix("appr_ok_")
+        pending = {r["id"]: r for r in core.approvals.pending()}
+        preview = pending.get(rid)
+        if preview is None:
             await query.edit_message_text("⏳ That request expired or was already handled.")
             return
-        await query.edit_message_text(f"✅ Approved — running {req['name']}'s request…")
-        await _run_approved_request(context, req)
+        await query.edit_message_text(f"✅ Approved — running {preview['name']}'s request…")
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            keep_typing(context.bot, preview["chat_id"], stop_typing))
+        result = None
+        response = ""
         try:
-            await safe_send(context.bot, OWNER_CHAT_ID, f"✅ Sent {req['name']} the result.")
+            # The owner vetted the whole request, so let the agent act (skip prompts) —
+            # core.approvals.approve() runs it through the SAME pipeline handle_message
+            # uses for a live turn (per-user lock, session pinning, I-CONV/I-STEP).
+            result = await core.approvals.approve(rid)
+            if result is not None:
+                response = result["response"]
+        except Exception as e:
+            response = _friendly_error(e)
+            logger.error(f"[APPROVAL] run failed: {e}", exc_info=True)
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        if result is None and not response:
+            return  # popped between the peek and approve() (double-tap race) — nothing to deliver
+        target_uid = result["uid"] if result else preview["uid"]
+        target_chat = result["chat_id"] if result else preview["chat_id"]
+        await send_response(None, context, response, target_uid, target_chat)
+        try:
+            await safe_send(context.bot, OWNER_CHAT_ID, f"✅ Sent {preview['name']} the result.")
         except Exception:
             pass
     elif data.startswith("appr_no_"):
-        req = _pending_approvals.pop(data.removeprefix("appr_no_"), None)
+        req = core.approvals.deny(data.removeprefix("appr_no_"))
         if not req:
             await query.edit_message_text("⏳ That request expired or was already handled.")
             return
@@ -1240,10 +1208,36 @@ async def _deliver_ask(ev) -> None:
         logger.error(f"[BRIDGE] could not DM ask {ev.id}: {e}")
 
 
+async def _deliver_approval_request(ev) -> None:
+    """Render a core.ApprovalRequest event — DM the owner the same
+    'Approval needed' card with ✅/❌ buttons bot.py's old
+    _submit_for_approval used to send directly (docs/dev/CORE_API.md
+    migration step 5). The approve()/deny() calls that resolve ev.id live
+    in _cb_approvals."""
+    if _application is None or not OWNER_CHAT_ID:
+        return
+    preview = ev.prompt if len(ev.prompt) <= 500 else ev.prompt[:500] + "…"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve & run", callback_data=f"appr_ok_{ev.id}"),
+        InlineKeyboardButton("❌ Deny", callback_data=f"appr_no_{ev.id}"),
+    ]])
+    try:
+        await _application.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=(f"🔔 Approval needed\n\n"
+                  f"{ev.name} (limited) wants to run:\n\n"
+                  f"“{preview}”\n\n"
+                  f"Approving runs it on THIS computer and sends them the result."),
+            reply_markup=kb,
+        )
+    except Exception as e:
+        logger.error(f"[APPROVAL] could not notify owner: {e}")
+
+
 async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> None:
     """Consume core's background event broadcast and render each event the
-    way the old in-bot.py scheduler/bridge_watcher used to. Runs for the
-    app's lifetime; cancelled in post_shutdown."""
+    way the old in-bot.py scheduler/bridge_watcher/approval flow used to.
+    Runs for the app's lifetime; cancelled in post_shutdown."""
     while True:
         ev = await sink.get()
         try:
@@ -1253,6 +1247,8 @@ async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> Non
                 await _deliver_alert(ev)
             elif isinstance(ev, zcore.Ask):
                 await _deliver_ask(ev)
+            elif isinstance(ev, zcore.ApprovalRequest):
+                await _deliver_approval_request(ev)
         except Exception as e:
             logger.error(f"[SCHED] event render failed: {e}", exc_info=True)
 

@@ -50,7 +50,10 @@ config.SETTINGS_FILE = os.path.join(_tmpdir, "bot_settings.json")
 config._settings_cache = None
 
 import zilla.core as zcore  # noqa: E402
-from zilla.core import ZillaCore, Progress, Response, Ask, BRIDGE_PENDING_TTL  # noqa: E402
+from zilla.core import (  # noqa: E402
+    ZillaCore, Progress, Response, Ask, ApprovalRequest,
+    BRIDGE_PENDING_TTL, APPROVAL_MAX,
+)
 from zilla.sessions import SessionManager  # noqa: E402
 from zilla.users import AuthManager  # noqa: E402
 import zilla.interactive as interactive  # noqa: E402
@@ -624,6 +627,152 @@ def test_health_report_with_schedule_manager():
     check("schedule_count reflects the manager", report["scheduler"]["schedule_count"] == 1,
           f"got {report['scheduler']}")
 
+# ── 15. approvals — submit() broadcasts ApprovalRequest ──────
+
+def test_approval_submit_broadcast():
+    print("\n[14] Approvals — submit() registers the hold and broadcasts ApprovalRequest")
+    core = _fresh_core("appr_submit")
+    q = asyncio.Queue()
+    core.subscribe(q)
+
+    rid = core.approvals.submit(uid=222, chat_id=222, prompt="do a thing", name="Alice")
+    check("submit returns an id", bool(rid), f"{rid}")
+    check("queue has exactly one event", q.qsize() == 1, f"{q.qsize()}")
+    ev = q.get_nowait()
+    check("event is ApprovalRequest", isinstance(ev, ApprovalRequest), f"{ev!r}")
+    check("id matches", ev.id == rid)
+    check("user matches", ev.user == 222)
+    check("prompt matches", ev.prompt == "do a thing")
+    check("chat_id matches", ev.chat_id == 222)
+    check("name matches", ev.name == "Alice")
+
+
+# ── 15. approvals — pending() listing ────────────────────────
+
+def test_approval_pending_listing():
+    print("\n[15] Approvals — pending() lists every held request")
+    core = _fresh_core("appr_pending")
+    r1 = core.approvals.submit(uid=1, chat_id=1, prompt="first", name="A")
+    r2 = core.approvals.submit(uid=2, chat_id=2, prompt="second", name="B")
+
+    pending = core.approvals.pending()
+    ids = {r["id"] for r in pending}
+    check("both requests listed", ids == {r1, r2}, f"{ids}")
+    by_id = {r["id"]: r for r in pending}
+    check("fields carried for first", by_id[r1]["uid"] == 1 and
+          by_id[r1]["chat_id"] == 1 and by_id[r1]["prompt"] == "first" and
+          by_id[r1]["name"] == "A", f"{by_id[r1]}")
+
+    # Hard cap: once at APPROVAL_MAX, submit() refuses (mirrors bot.py's old
+    # "too many requests waiting" notice on None).
+    core2 = _fresh_core("appr_cap")
+    for i in range(APPROVAL_MAX):
+        assert core2.approvals.submit(uid=i, chat_id=i, prompt="x", name="n") is not None
+    check("queue full -> submit returns None",
+          core2.approvals.submit(uid=999, chat_id=999, prompt="one too many", name="n") is None)
+
+
+# ── 16. approvals — approve() runs the held turn and clears it ──
+
+def test_approval_approve_runs_and_clears():
+    print("\n[16] Approvals — approve() runs the held turn (monkeypatched backend) and clears it")
+    core = _fresh_core("appr_run")
+    uid = 555
+
+    async def fake_run(prompt, conv_id, progress_callback=None,
+                       cancel_event=None, skip_permissions=False):
+        check("skip_permissions passed through (owner already vetted)",
+              skip_permissions is True)
+        return f"ran: {prompt}", "conv-appr-1"
+
+    rid = core.approvals.submit(uid=uid, chat_id=777, prompt="book a flight", name="Bob")
+
+    async def run():
+        with _patched(fake_run, latest_step=9):
+            return await core.approvals.approve(rid)
+
+    result = asyncio.run(run())
+    check("approve() returns the resolved request", result is not None)
+    check("response is the turn's output", result["response"] == "ran: book a flight",
+          f"{result}")
+    check("uid/chat_id/name carried through", result["uid"] == uid and
+          result["chat_id"] == 777 and result["name"] == "Bob", f"{result}")
+    check("cleared from pending()", core.approvals.pending() == [])
+    info = core.sessions.get_session_info(user_id=uid)
+    check("the run went through normal session bookkeeping",
+          info and info.get("messages") == 1, f"{info}")
+
+    # Re-approving the same (now-gone) id is a safe no-op.
+    async def run_again():
+        return await core.approvals.approve(rid)
+
+    check("re-approve of an already-run id returns None",
+          asyncio.run(run_again()) is None)
+
+
+# ── 17. approvals — deny() discards + clears ─────────────────
+
+def test_approval_deny_clears():
+    print("\n[17] Approvals — deny() discards without running, and clears it")
+    core = _fresh_core("appr_deny")
+    rid = core.approvals.submit(uid=333, chat_id=444, prompt="rm -rf something scary",
+                                name="Eve")
+
+    req = core.approvals.deny(rid)
+    check("deny() returns the discarded request", req is not None)
+    check("uid/chat_id/name/prompt carried through",
+          req["uid"] == 333 and req["chat_id"] == 444 and req["name"] == "Eve" and
+          req["prompt"] == "rm -rf something scary", f"{req}")
+    check("cleared from pending()", core.approvals.pending() == [])
+    check("denying again is a safe no-op", core.approvals.deny(rid) is None)
+
+
+# ── 18. approvals — an approved turn serializes with a live turn ──
+
+def test_approval_shares_per_user_lock():
+    print("\n[18] Approvals — an approved turn serializes with a live turn for the same uid")
+    core = _fresh_core("appr_lock")
+    uid = 888
+    running = {"now": 0, "max": 0, "order": []}
+
+    async def fake_run(prompt, conv_id, progress_callback=None,
+                       cancel_event=None, skip_permissions=False):
+        running["now"] += 1
+        running["max"] = max(running["max"], running["now"])
+        running["order"].append(f"start:{prompt}")
+        await asyncio.sleep(0.05)
+        running["now"] -= 1
+        running["order"].append(f"end:{prompt}")
+        return f"answer to {prompt}", "conv-shared"
+
+    rid = core.approvals.submit(uid=uid, chat_id=uid, prompt="approved task", name="Carl")
+
+    async def run():
+        with _patched(fake_run):
+            await asyncio.gather(
+                _collect(core, uid, "live message", skip_permissions=True),
+                core.approvals.approve(rid),
+            )
+
+    asyncio.run(run())
+    check("same-uid live turn and approved turn never overlap", running["max"] == 1,
+          f"max concurrency {running['max']} order={running['order']}")
+    check("both turns actually ran", len(running["order"]) == 4, f"{running['order']}")
+
+
+# ── 19. approvals — unknown id is a safe no-op ───────────────
+
+def test_approval_unknown_id_noop():
+    print("\n[19] Approvals — approve()/deny() on an unknown id is a safe no-op")
+    core = _fresh_core("appr_unknown")
+
+    async def run():
+        return await core.approvals.approve("does-not-exist")
+
+    check("approve() of unknown id -> None", asyncio.run(run()) is None)
+    check("deny() of unknown id -> None", core.approvals.deny("does-not-exist") is None)
+    check("pending() still empty", core.approvals.pending() == [])
+
 
 def main():
     tests = [
@@ -643,6 +792,12 @@ def main():
         test_health_report_stable_keys,
         test_health_report_force_false_is_cached,
         test_health_report_with_schedule_manager,
+        test_approval_submit_broadcast,
+        test_approval_pending_listing,
+        test_approval_approve_runs_and_clears,
+        test_approval_deny_clears,
+        test_approval_shares_per_user_lock,
+        test_approval_unknown_id_noop,
     ]
     print("Running zilla.core turn-pipeline tests...\n")
     for t in tests:
