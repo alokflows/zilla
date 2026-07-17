@@ -35,7 +35,7 @@ Zilla is an unapologetic replica of the experience the best personal agents (Ope
 - **Backend & model switching** live from the settings menu — histories stay correctly separated per backend.
 - **Cross-platform** — macOS, Linux, Windows; guided installer; `--doctor` self-check.
 
-## Where it's headed (in active construction — see [`HANDOFF.md`](https://github.com/alokflows/zilla/blob/claude/zilla-harness-review-0v96bs/HANDOFF.md))
+## Where it's headed (in active construction — see [`HANDOFF.md`](HANDOFF.md))
 
 - **`zilla`** — a full-screen terminal app that looks like a real product the moment it opens: chat pane, live progress, settings, skills, and health screens; conversational onboarding ("connect to my Telegram" → it asks for the token and wires itself up).
 - **Orchestration router** — a cheap triage pass on every message: small talk answers fast, complex work gets the full agent, and anything you *share* about your life is journaled into the wiki automatically.
@@ -114,10 +114,10 @@ The core is interface-agnostic: every frontend speaks one small event vocabulary
 | `zilla/config.py` | One source of truth: `.env`, `settings.json`, backend-aware model catalog |
 | `zilla/platform_compat.py` | The only OS-specific code in the tree |
 
-Engineering plan, invariants, live status: [`HANDOFF.md`](https://github.com/alokflows/zilla/blob/claude/zilla-harness-review-0v96bs/HANDOFF.md) and `docs/dev/`. **Tests:** 350+ across four suites, plain Python, no framework, all green before every commit.
+Engineering plan, invariants, live status: [`HANDOFF.md`](HANDOFF.md) and `docs/dev/`. **Tests:** 350+ across four suites, plain Python, no framework, all green before every commit.
 
 ---
 
 ## Project status
 
-Actively developed, in daily use by its owner. The Telegram interface is stable; the terminal application and orchestration layer are under construction on the working branch (`claude/zilla-harness-review-0v96bs`). If something doesn't behave as documented, `python install.py --doctor` plus the newest file in `logs/` tells most of the story.
+Actively developed, in daily use by its owner. The Telegram interface is stable; the terminal application and orchestration layer are under construction on the working branch. If something doesn't behave as documented, `python install.py --doctor` plus the newest file in `logs/` tells most of the story.

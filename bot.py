@@ -43,10 +43,9 @@ import sys
 import os
 import re
 import logging
-import threading
 import time
 import json
-import secrets
+from contextlib import aclosing
 from datetime import datetime
 
 from telegram import (
@@ -75,7 +74,8 @@ from config import (
     model_catalog, get_backend, set_backend,
 )
 from sessions import SessionManager
-from cli_engine import run_cli_async, get_latest_step, detect_limit, backend_status
+import zilla.core as zcore
+from zilla.cli_engine import detect_limit, backend_status
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
@@ -84,8 +84,7 @@ from media import (
     format_file_size, extract_text,
 )
 from formatter import format_for_telegram, detect_file_paths
-from harness import log_event, log_summary
-import interactive
+from harness import log_summary
 from users import AuthManager
 from schedules import ScheduleManager, describe as describe_schedule
 from schedule_parse import parse_schedule, parse_schedule_command
@@ -195,42 +194,24 @@ BOT_START_TIME = time.time()
 sessions: SessionManager = None
 auth: AuthManager = None
 schedules_mgr: ScheduleManager = None
-
-# Per-chat cancel events — set to cancel the active CLI request for that chat
-_active_cancel: dict[int, threading.Event] = {}
-
-# Human-in-the-loop credential/OTP bridge: chat_id -> ask_id currently awaiting
-# that chat's reply, plus the set of ask ids we've already DMed (so the watcher
-# doesn't re-prompt). See interactive.py for the file protocol.
-_pending_bridge: dict[int, tuple[str, float]] = {}
-_bridge_announced: set[str] = set()
-# How long a chat stays bound to one ask. After this, an unanswered (orphaned)
-# ask must NOT keep swallowing the user's next unrelated message.
-_BRIDGE_PENDING_TTL = 900.0
+# The interface-agnostic core (zilla/core.py) — owns the turn pipeline,
+# per-user CLI locks, cancel events, and (this seam) the scheduler runtime.
+# Created in main().
+core: zcore.ZillaCore = None
+# Telegram Application handle, set in post_init — the scheduler-event renderers
+# (_deliver_scheduled_result/_deliver_alert) and the screenshot fast path need
+# bot.send_* but core.py's background broadcast carries no application/bot
+# reference (interface-agnostic by design), so bot.py keeps its own.
+_application = None
+# The core's background-event consumer task (started in post_init, cancelled
+# in post_shutdown) and the queue it reads from.
+_core_events_queue: asyncio.Queue = None
+_core_events_task_handle: asyncio.Task = None
 
 # Per-chat id of the CURRENT live menu message. When a new menu opens we strip
 # the previous one's buttons so old menus in the chat history can't be tapped
 # again (no stale session/menu collisions). The ✕ Close button clears it too.
 _active_menu: dict[int, int] = {}
-
-# Per-user CLI serialization. The agy CLI keeps ONE conversation per user, and
-# running two invocations against the same conversation at once corrupts its
-# transcript and makes each handler scoop up the other turn's steps (responses
-# bleed into the wrong reply). With concurrent_updates(True) the event loop can
-# enter several handlers for one user at once, so we gate every CLI run behind a
-# per-user asyncio.Lock — a user's messages run one at a time, different users
-# stay fully concurrent. Created lazily on the single-threaded event loop, so
-# get-or-create needs no lock of its own.
-_user_cli_locks: dict[int, asyncio.Lock] = {}
-
-
-def _get_user_lock(uid: int) -> asyncio.Lock:
-    lock = _user_cli_locks.get(uid)
-    if lock is None:
-        lock = asyncio.Lock()
-        _user_cli_locks[uid] = lock
-    return lock
-
 
 # ── Floodguard ─────────────────────────────────────────────
 # Per-user turns already serialize (one CLI run at a time via the lock above),
@@ -263,57 +244,40 @@ def _rate_should_notify(uid: int, min_gap: float = _RATE_WINDOW) -> bool:
     return True
 
 
-# ── Approval mode (limited users) ──────────────────────────
-# A "limited" user may chat, but nothing they send runs until the OWNER taps
-# Approve. Each pending request is held here keyed by a short random id.
-_pending_approvals: dict[str, dict] = {}
-_APPROVAL_TTL = 3600.0     # forget un-actioned requests after an hour
-_APPROVAL_MAX = 50         # hard cap so a spammer can't grow this unbounded
-
-
-def _prune_approvals() -> None:
-    now = time.time()
-    for rid in [r for r, v in _pending_approvals.items()
-                if now - v.get("ts", 0) > _APPROVAL_TTL]:
-        _pending_approvals.pop(rid, None)
-
-
-def _make_approval(uid: int, chat_id: int, prompt: str, name: str) -> str | None:
-    """Register a pending request; returns its id, or None if the queue is full."""
-    _prune_approvals()
-    if len(_pending_approvals) >= _APPROVAL_MAX:
-        return None
-    rid = secrets.token_hex(6)
-    _pending_approvals[rid] = {
-        "uid": uid, "chat_id": chat_id, "prompt": prompt,
-        "name": name, "ts": time.time(),
-    }
-    return rid
-
-
-def _conv_for_run(uid: int, sname: str):
-    """The conversation id to resume — but only if it was created by the CURRENT
-    backend. agy brain-dir ids and claude session ids aren't interchangeable, so
-    after switching backend we start a fresh conversation instead of mismatching."""
-    cid = sessions.get_conversation_id(user_id=uid, session_name=sname)
-    if cid and sessions.get_conv_backend(uid, sname) != get_backend():
-        return None
-    return cid
-
-
-async def _acquire_turn(uid: int, update: Update) -> asyncio.Lock:
-    """Return this user's CLI lock, ready to enter with `async with`. If a
-    previous message is still running, send one calm heads-up so the new message
-    doesn't feel ignored while it waits its turn."""
-    lock = _get_user_lock(uid)
-    if lock.locked() and update is not None:
+async def _notify_if_busy(uid: int, update: Update) -> None:
+    """If a previous message is still running (the core's per-user lock is
+    held), send one calm heads-up so the new message doesn't feel ignored
+    while it waits its turn."""
+    if core.is_busy(uid) and update is not None:
         try:
             await update.effective_message.reply_text(
                 "⏳ One sec — finishing your previous message first, then I'll get to this."
             )
         except Exception:
             pass
-    return lock
+
+
+async def _relay_cli_turn(update, uid, chat_id, prompt, *,
+                          auto_title=False, skip_permissions=None) -> str:
+    """Drive one core turn (zilla.core.handle_message) and return the final
+    response text. Shared by the text, voice, photo, document and approval
+    paths — the Telegram translation of the core's event stream.
+
+    Progress events are consumed silently this seam: the visible ⏳ Working
+    UI stays time-driven (keep_typing, started by each handler), exactly as
+    before the extraction. The Response event's text feeds the existing
+    send_response path in each handler."""
+    await _notify_if_busy(uid, update)
+    response = ""
+    # aclosing: if we die mid-stream (Telegram error), close the generator so
+    # the core releases its lock/cancel bookkeeping deterministically.
+    async with aclosing(core.handle_message(
+            uid, prompt, chat_key=chat_id,
+            auto_title=auto_title, skip_permissions=skip_permissions)) as stream:
+        async for event in stream:
+            if isinstance(event, zcore.Response):
+                response = event.text
+    return response
 
 
 # ══════════════════════════════════════════════════════════
@@ -401,10 +365,18 @@ async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
 
 
 async def safe_send(bot, chat_id: int, text: str, parse_mode: str = None):
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
+    # Flaky links (hotspot, sleep-wake) time out on a single attempt; the CLI's
+    # answer must not be lost to one bad send, so retry with backoff.
+    for attempt in range(4):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            return
+        except Exception as e:
+            if attempt == 3:
+                logger.error(f"Failed to send message after 4 attempts: {e}")
+            else:
+                logger.warning(f"send_message attempt {attempt + 1} failed ({e}); retrying")
+                await asyncio.sleep(2 * (attempt + 1))
 
 
 async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None,
@@ -667,14 +639,22 @@ async def send_response(update, context, response: str, user_id: int, chat_id: i
 
 
 # ── Approval mode: submit / approve / run ──────────────────
+# The HOLD (store, TTL/cap) and the approved-turn execution now live in
+# core.approvals (docs/dev/CORE_API.md migration step 5, zilla/core.py) —
+# these three functions are the Telegram-only remainder: the immediate ack
+# to the requester, the owner-DM keyboard/text (rendered from the
+# ApprovalRequest event, see _deliver_approval_request below), and
+# delivering the eventual result.
 
 async def _submit_for_approval(update, context, uid: int, chat_id: int, prompt: str):
-    """Hold a limited user's request and ask the owner to approve it."""
+    """Hold a limited user's request and ask the owner to approve it. Thin
+    call into core.approvals.submit — core owns the hold and broadcasts
+    ApprovalRequest; _deliver_approval_request renders the owner's DM."""
     prompt = (prompt or "").strip()
     if not prompt:
         return
     name = auth._users.get(uid, {}).get("name") or f"User {uid}"
-    rid = _make_approval(uid, chat_id, prompt, name)
+    rid = core.approvals.submit(uid, chat_id, prompt, name)
     if not rid:
         await safe_send(context.bot, chat_id,
                         "⚠️ Too many requests are waiting for approval right now. "
@@ -683,67 +663,53 @@ async def _submit_for_approval(update, context, uid: int, chat_id: int, prompt: 
     await safe_send(context.bot, chat_id,
                     "📨 Sent to the owner for approval. I'll post the answer here "
                     "once they approve it.")
-    preview = prompt if len(prompt) <= 500 else prompt[:500] + "…"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve & run", callback_data=f"appr_ok_{rid}"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"appr_no_{rid}"),
-    ]])
-    try:
-        await context.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=(f"🔔 Approval needed\n\n"
-                  f"{name} (limited) wants to run:\n\n"
-                  f"“{preview}”\n\n"
-                  f"Approving runs it on THIS computer and sends them the result."),
-            reply_markup=kb,
-        )
-    except Exception as e:
-        logger.error(f"[APPROVAL] could not notify owner: {e}")
-        _pending_approvals.pop(rid, None)
-        await safe_send(context.bot, chat_id,
-                        "⚠️ Couldn't reach the owner right now. Please try again later.")
-
-
-async def _run_approved_request(context, req: dict):
-    """Execute an owner-approved limited-user request and deliver it to them."""
-    uid, chat_id, prompt = req["uid"], req["chat_id"], req["prompt"]
-    stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
-    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
-    response = ""
-    try:
-        # The owner vetted the whole request, so let the agent act (skip prompts).
-        response = await _run_cli_turn(
-            None, uid, chat_id, prompt, cancel_event,
-            auto_title=True, skip_permissions=True)
-    except Exception as e:
-        response = _friendly_error(e)
-        logger.error(f"[APPROVAL] run failed: {e}", exc_info=True)
-    finally:
-        stop_typing.set()
-        typing_task.cancel()
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
-    await send_response(None, context, response, uid, chat_id)
 
 
 async def _cb_approvals(query, context, data, uid, chat_id):
-    """Owner-only: approve or deny a held limited-user request."""
+    """Owner-only: approve or deny a held limited-user request. Thin calls
+    into core.approvals (docs/dev/CORE_API.md migration step 5) — core owns
+    the hold and runs an approved turn through the normal pipeline; this
+    renders the Telegram-specific bits (typing indicator, message text,
+    result delivery) exactly as bot.py's old _run_approved_request did."""
     if not auth.is_owner(uid):
         return
     if data.startswith("appr_ok_"):
-        req = _pending_approvals.pop(data.removeprefix("appr_ok_"), None)
-        if not req:
+        rid = data.removeprefix("appr_ok_")
+        pending = {r["id"]: r for r in core.approvals.pending()}
+        preview = pending.get(rid)
+        if preview is None:
             await query.edit_message_text("⏳ That request expired or was already handled.")
             return
-        await query.edit_message_text(f"✅ Approved — running {req['name']}'s request…")
-        await _run_approved_request(context, req)
+        await query.edit_message_text(f"✅ Approved — running {preview['name']}'s request…")
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            keep_typing(context.bot, preview["chat_id"], stop_typing))
+        result = None
+        response = ""
         try:
-            await safe_send(context.bot, OWNER_CHAT_ID, f"✅ Sent {req['name']} the result.")
+            # The owner vetted the whole request, so let the agent act (skip prompts) —
+            # core.approvals.approve() runs it through the SAME pipeline handle_message
+            # uses for a live turn (per-user lock, session pinning, I-CONV/I-STEP).
+            result = await core.approvals.approve(rid)
+            if result is not None:
+                response = result["response"]
+        except Exception as e:
+            response = _friendly_error(e)
+            logger.error(f"[APPROVAL] run failed: {e}", exc_info=True)
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        if result is None and not response:
+            return  # popped between the peek and approve() (double-tap race) — nothing to deliver
+        target_uid = result["uid"] if result else preview["uid"]
+        target_chat = result["chat_id"] if result else preview["chat_id"]
+        await send_response(None, context, response, target_uid, target_chat)
+        try:
+            await safe_send(context.bot, OWNER_CHAT_ID, f"✅ Sent {preview['name']} the result.")
         except Exception:
             pass
     elif data.startswith("appr_no_"):
-        req = _pending_approvals.pop(data.removeprefix("appr_no_"), None)
+        req = core.approvals.deny(data.removeprefix("appr_no_"))
         if not req:
             await query.edit_message_text("⏳ That request expired or was already handled.")
             return
@@ -894,9 +860,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.pop("awaiting_custom_model", None):
         await update.message.reply_text("Custom model entry cancelled.")
         return
-    cancel_ev = _active_cancel.get(chat_id)
-    if cancel_ev and not cancel_ev.is_set():
-        cancel_ev.set()
+    if core.cancel(chat_id):
         await update.message.reply_text("🛑 Canceling…")
     else:
         await update.message.reply_text("Nothing is running right now.")
@@ -1014,7 +978,19 @@ def _kb_confirm_schedule():
 
 
 async def _offer_schedule(update, context, parsed: dict):
-    """Stash a parsed schedule and ask the user to confirm creating it."""
+    """One-off reminders are created instantly, Siri-style (owner decree
+    2026-07-17: asking permission for a 2-minute timer is worse than useless).
+    Only RECURRING schedules — which keep firing until removed — get a
+    confirm step."""
+    if parsed["kind"] == "once":
+        uid = update.effective_user.id
+        chat_id = update.effective_chat.id
+        _make_schedule(uid, chat_id, parsed)
+        await update.effective_message.reply_text(
+            f"⏰ {describe_schedule(parsed['kind'], parsed['spec'])} — "
+            f"{parsed['title']} ✓"
+        )
+        return
     context.user_data["pending_schedule"] = parsed
     await update.effective_message.reply_text(
         "📅 Create this schedule?\n"
@@ -1051,28 +1027,32 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _make_schedule(uid: int, chat_id: int, parsed: dict):
+    # Pin the backend+model active at creation time (HANDOFF P1 scheduler-seam
+    # item 3) — see core._maybe_notify_backend_pin for what happens if it has
+    # drifted by fire time. session defaults to "isolated": every schedule
+    # made through this path always has, and keeps having, a fresh
+    # conversation each run.
+    payload_type = parsed.get("payload_hint", "message")
+    prompt = parsed["prompt"]
+    if payload_type == "system_event":
+        # Delivered verbatim at fire time (no model call) — phrase it as the
+        # reminder the user will read, not as an instruction.
+        prompt = f"Reminder: {parsed['title']}"
     return schedules_mgr.add(
-        user_id=uid, chat_id=chat_id, prompt=parsed["prompt"],
+        user_id=uid, chat_id=chat_id, prompt=prompt,
         kind=parsed["kind"], spec=parsed["spec"], title=parsed["title"],
+        payload_type=payload_type,
+        backend=get_backend(), model=get_model(),
+        is_owner=auth.is_owner(uid) if auth else False,
     )
 
 
-# ── Scheduler runtime (custom asyncio loop; no APScheduler dependency) ──
+# ── Scheduler runtime ──
 #
-#  Self-healing model (fixes the old silent-failure bug where touch_run advanced
-#  the schedule even when the run errored, losing the job forever):
-#    _execute_schedule  → runs the CLI, classifies ok/failure, NO delivery.
-#    _deliver_*         → sends the result to Telegram.
-#    _run_and_record    → loop path: deliver on success/give-up, mark outcome,
-#                         RETRY a failed run a few times before advancing.
-#    _run_now           → manual ▶️ trigger: run + deliver, never advance.
-
-_SCHED_TICK = 20          # seconds between due-checks
-_SCHED_RETRY_DELAY = 120  # wait this long before retrying a failed run
-_SCHED_MAX_RETRIES = 3    # attempts per occurrence before giving up (and notifying)
-
-# Response shapes that mean "the run did not really succeed".
-_SCHED_FAIL_PREFIXES = ("Error:", "Claude error:", "⏱️", "⚠️ Stopped")
+#  The tick loop, retry/self-heal semantics and ScheduleManager mutation live
+#  in zilla/core.py now (CORE_API migration step 3) — bot.py just renders the
+#  ScheduledResult/Alert events the core broadcasts, and supplies the one
+#  Telegram-specific fast path (screenshot-via-bridge) as core.schedule_pre_run.
 
 # A bare "take a screenshot" intent — short, no chaining. Such schedules must
 # NOT go through the CLI agent: on the scheduler path the agent's browser tools
@@ -1088,16 +1068,16 @@ def _is_simple_screenshot(prompt: str) -> bool:
     return len(p.split()) <= 8 and not re.search(r"\b(then|after|and)\b", p, re.IGNORECASE)
 
 
-async def _screenshot_via_bridge(application, s: dict) -> tuple[bool, str, str]:
+async def _screenshot_via_bridge(s: dict) -> tuple[bool, str, str]:
     """Take a screenshot through KimiWebBridge directly (the path that actually
     works) and stash it in the Outbox, so delivery + the send allowlist pass.
-    Returns the (ok, response, detail) triple _execute_schedule promises."""
+    Returns the (ok, response, detail) triple core.schedule_pre_run promises."""
     import shutil
-    bot = application.bot
-    try:
-        await bot.send_chat_action(chat_id=s["chat_id"], action=ChatAction.TYPING)
-    except Exception:
-        pass
+    if _application is not None:
+        try:
+            await _application.bot.send_chat_action(chat_id=s["chat_id"], action=ChatAction.TYPING)
+        except Exception:
+            pass
     try:
         result = await bridge_command("screenshot", {}, timeout=30)
     except Exception as e:
@@ -1114,6 +1094,15 @@ async def _screenshot_via_bridge(application, s: dict) -> tuple[bool, str, str]:
     except Exception as e:
         return False, f"Error: could not save screenshot: {e}", str(e)
     return True, f"📸 Screenshot saved to {dest}", ""
+
+
+async def _schedule_pre_run_hook(s: dict):
+    """Wired to core.schedule_pre_run — the only frontend-specific fast path a
+    'message'-payload schedule needs today. None means 'no special-case, run
+    the schedule normally'."""
+    if _is_simple_screenshot(s.get("prompt", "")):
+        return await _screenshot_via_bridge(s)
+    return None
 
 
 async def _send_screenshot_now(update, context, uid: int, chat_id: int) -> bool:
@@ -1142,68 +1131,25 @@ async def _send_screenshot_now(update, context, uid: int, chat_id: int) -> bool:
         typing_task.cancel()
 
 
-async def _execute_schedule(application, s: dict) -> tuple[bool, str, str]:
-    """Run one schedule's prompt. Returns (ok, response, detail). No delivery,
-    no schedule mutation — pure execution + outcome classification."""
-    uid = s["user_id"]
-    chat_id = s["chat_id"]
-    bot = application.bot
-
-    # SECURITY: a schedule is a stored prompt that runs the agentic CLI with full
-    # host privileges. If the owning user was de-authorized after creating it, the
-    # schedule must NOT keep firing (otherwise removal isn't really revocation —
-    # it's a persistent backdoor). Disable + skip any schedule whose owner is no
-    # longer authorized.
-    if not (auth and (auth.is_owner(uid) or auth.is_authorized(uid))):
-        logger.warning(f"[SCHED] skip {s['id']}: user {uid} no longer authorized — disabling")
+async def _deliver_scheduled_result(ev) -> None:
+    """Render a core.ScheduledResult event exactly as the old in-bot.py
+    scheduler used to: '⏰ Scheduled — <title>' + response, the rate-limit
+    model-switch helper, and any files the job produced. ev.warning (set only
+    on a give-up-after-retries occurrence) is sent first, same ordering as the
+    old two-message sequence."""
+    if _application is None:
+        return
+    bot = _application.bot
+    chat_id, uid = ev.chat_id, ev.user_id
+    if ev.warning:
         try:
-            schedules_mgr.set_enabled(s["id"], uid, False)
+            await safe_send(bot, chat_id, ev.warning, parse_mode="HTML")
         except Exception:
             pass
-        return False, "", "owner deauthorized"
-
-    # Screenshot schedules bypass the CLI agent entirely (see _screenshot_via_bridge).
-    if _is_simple_screenshot(s.get("prompt", "")):
-        return await _screenshot_via_bridge(application, s)
-
-    try:
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
-    ok, detail, response = True, "", ""
-    try:
-        async with _get_user_lock(uid):
-            conv_id = None
-            sname = s.get("session_name")
-            if sname:
-                conv_id = _conv_for_run(uid, sname)
-            response, detected = await run_cli_async(
-                s["prompt"], conv_id, skip_permissions=auth.can(uid, "admin"),
-            )
-            if sname and detected and detected != conv_id:
-                sessions.set_conversation_id(detected, user_id=uid, session_name=sname, backend=get_backend())
-    except Exception as e:
-        ok, detail, response = False, str(e), f"Error: {e}"
-        logger.error(f"[SCHED] run {s['id']} failed: {e}", exc_info=True)
-
-    # Response-level failure detection (empty / rate-limited / error text).
-    if ok:
-        if not (response and response.strip()):
-            ok, detail = False, "empty response"
-        elif detect_limit(response):
-            ok, detail = False, f"model limited: {detect_limit(response)}"
-        elif response.lstrip().startswith(_SCHED_FAIL_PREFIXES):
-            ok, detail = False, response.strip()[:200]
-    return ok, response, detail
-
-
-async def _deliver_schedule_result(application, s: dict, response: str):
-    """Send a schedule's output to its chat, with the rate-limit switch helper."""
-    bot = application.bot
-    chat_id = s["chat_id"]
-    uid = s["user_id"]
-    header = f"⏰ Scheduled — {s.get('title','')}\n"
+        if not (ev.response and ev.response.strip()):
+            return  # gave-up-with-no-partial-output: warning is the whole message
+    response = ev.response
+    header = f"⏰ Scheduled — {ev.title}\n"
     try:
         formatted, parse_mode = format_for_telegram(response or "(no output)")
         for chunk in split_message(header + formatted):
@@ -1215,9 +1161,7 @@ async def _deliver_schedule_result(application, s: dict, response: str):
                             parse_mode="HTML")
             await bot.send_message(chat_id=chat_id, text="🤖 Switch model:",
                                    reply_markup=kb_model(get_model()))
-        # Attach any files the job produced. Scheduled jobs never did this
-        # before — a schedule that made a chart/sheet/screenshot delivered only
-        # the text path, never the file.
+        # Attach any files the job produced.
         if auth and auth.can(uid, "admin"):
             paths = _fresh_files(detect_file_paths(response or ""))
             sent = 0
@@ -1227,74 +1171,86 @@ async def _deliver_schedule_result(application, s: dict, response: str):
             if sent:
                 await safe_send(bot, chat_id, f"📎 {sent} file(s) delivered.")
     except Exception as e:
-        logger.error(f"[SCHED] deliver {s['id']} failed: {e}")
+        logger.error(f"[SCHED] deliver {ev.schedule_id} failed: {e}")
 
 
-async def _run_and_record(application, s: dict):
-    """Loop path: run a due schedule, deliver, and record the outcome with retry.
-    A failed run is retried (_SCHED_MAX_RETRIES × _SCHED_RETRY_DELAY) before the
-    schedule advances — and the user is told if it ultimately couldn't complete."""
-    sid = s["id"]
-    title = s.get("title", "")
-    ok, response, detail = await _execute_schedule(application, s)
-    if ok:
-        schedules_mgr.mark_success(sid)
-        log_event("schedule_ok", id=sid, title=title[:40])
-        await _deliver_schedule_result(application, s, response)
+async def _deliver_alert(ev) -> None:
+    """Render a core.Alert event — owner-scoped operational notes (currently:
+    the one-time backend/model pin-mismatch note, HANDOFF P1 item 3)."""
+    if _application is None or not OWNER_CHAT_ID:
         return
-    outcome, attempt = schedules_mgr.mark_failure(
-        sid, _SCHED_RETRY_DELAY, _SCHED_MAX_RETRIES)
-    log_event("schedule_failed", id=sid, title=title[:40],
-              attempt=attempt, outcome=outcome, detail=(detail or "")[:200])
-    if outcome == "gaveup":
-        # Never silent: tell the owner what happened + hand over any partial output.
-        try:
-            await safe_send(
-                application.bot, s["chat_id"],
-                f"⚠️ Scheduled job couldn't complete: <b>{title}</b>\n"
-                f"Tried {attempt}× over a few minutes. I'll run it again at its next "
-                f"scheduled time.\nLast issue: {(detail or 'unknown')[:200]}",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        if response and response.strip():
-            await _deliver_schedule_result(application, s, response)
-    # 'retry' / 'gone' → stay quiet; it will run again on its own.
-
-
-async def _run_now(application, s: dict):
-    """Manual ▶️ Run now: execute + deliver, WITHOUT advancing the schedule."""
-    ok, response, detail = await _execute_schedule(application, s)
-    await _deliver_schedule_result(
-        application, s,
-        response if (response and response.strip()) else (detail or "(no output)"))
-
-
-async def scheduler_loop(application):
-    """Background loop: catch up missed jobs at boot, then run due jobs.
-    Due jobs run concurrently (one slow job no longer blocks the others); the
-    per-user lock still serializes a single user's runs."""
-    import time as _t
     try:
-        schedules_mgr.reconcile_startup(
-            now=_t.time(), catchup=get_setting("schedule_catchup", True))
+        await safe_send(_application.bot, OWNER_CHAT_ID, f"ℹ️ {ev.text}", parse_mode=None)
     except Exception as e:
-        logger.error(f"[SCHED] reconcile failed: {e}")
-    logger.info("[SCHED] scheduler loop started")
+        logger.error(f"[SCHED] alert deliver failed: {e}")
+
+
+_BRIDGE_KIND_LABEL = {"otp": "🔐 One-time code", "password": "🔑 Password",
+                      "text": "✍️ Input needed", "confirm": "❓ Please confirm"}
+
+
+async def _deliver_ask(ev) -> None:
+    """Render a core.Ask event — the human-in-the-loop credential/OTP bridge
+    (docs/dev/CORE_API.md migration step 4). DMs ev.chat_id the same message
+    the old in-bot.py bridge_watcher used to; the reply is captured back in
+    handle_message via core.pending_ask_for()/core.answer_ask()."""
+    if _application is None:
+        return
+    hint = "\n\n<i>Reply with the value — used once.</i>" if ev.is_secret else ""
+    try:
+        await safe_send(
+            _application.bot, ev.chat_id,
+            f"{_BRIDGE_KIND_LABEL.get(ev.kind, '✍️ Input needed')}\n\n"
+            f"{format_for_telegram(ev.prompt)[0]}{hint}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"[BRIDGE] could not DM ask {ev.id}: {e}")
+
+
+async def _deliver_approval_request(ev) -> None:
+    """Render a core.ApprovalRequest event — DM the owner the same
+    'Approval needed' card with ✅/❌ buttons bot.py's old
+    _submit_for_approval used to send directly (docs/dev/CORE_API.md
+    migration step 5). The approve()/deny() calls that resolve ev.id live
+    in _cb_approvals."""
+    if _application is None or not OWNER_CHAT_ID:
+        return
+    preview = ev.prompt if len(ev.prompt) <= 500 else ev.prompt[:500] + "…"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve & run", callback_data=f"appr_ok_{ev.id}"),
+        InlineKeyboardButton("❌ Deny", callback_data=f"appr_no_{ev.id}"),
+    ]])
+    try:
+        await _application.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=(f"🔔 Approval needed\n\n"
+                  f"{ev.name} (limited) wants to run:\n\n"
+                  f"“{preview}”\n\n"
+                  f"Approving runs it on THIS computer and sends them the result."),
+            reply_markup=kb,
+        )
+    except Exception as e:
+        logger.error(f"[APPROVAL] could not notify owner: {e}")
+
+
+async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> None:
+    """Consume core's background event broadcast and render each event the
+    way the old in-bot.py scheduler/bridge_watcher/approval flow used to.
+    Runs for the app's lifetime; cancelled in post_shutdown."""
     while True:
+        ev = await sink.get()
         try:
-            due = schedules_mgr.due()
-            if due:
-                for s in due:
-                    logger.info(f"[SCHED] running {s['id']} ({s.get('title','')[:30]})")
-                await asyncio.gather(
-                    *[_run_and_record(application, s) for s in due],
-                    return_exceptions=True,
-                )
+            if isinstance(ev, zcore.ScheduledResult):
+                await _deliver_scheduled_result(ev)
+            elif isinstance(ev, zcore.Alert):
+                await _deliver_alert(ev)
+            elif isinstance(ev, zcore.Ask):
+                await _deliver_ask(ev)
+            elif isinstance(ev, zcore.ApprovalRequest):
+                await _deliver_approval_request(ev)
         except Exception as e:
-            logger.error(f"[SCHED] loop error: {e}", exc_info=True)
-        await asyncio.sleep(_SCHED_TICK)
+            logger.error(f"[SCHED] event render failed: {e}", exc_info=True)
 
 
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1491,47 +1447,8 @@ async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  MEDIA HANDLERS
 # ══════════════════════════════════════════════════════════
 
-async def _run_cli_turn(update, uid, chat_id, prompt, cancel_event, *,
-                        auto_title=False, skip_permissions=None):
-    """Run one CLI turn against the user's active session and return the response.
-
-    Acquires the per-user lock, pins the session that is active the moment we
-    start (the user may /switch while queued), resumes/tracks its conversation,
-    optionally auto-titles a fresh session, and keeps the message bookkeeping in
-    sync. Shared by the text, voice, photo and document handlers.
-
-    skip_permissions: None → derive from the user's role (admins skip prompts).
-    Owner-approved Approval-mode runs pass True explicitly (the owner already
-    vetted the whole request), and `update` may be None (no live message).
-    """
-    if skip_permissions is None:
-        skip_permissions = auth.can(uid, "admin")
-    async with await _acquire_turn(uid, update):
-        # Pin the session to whatever is active the moment WE start running, and
-        # write every result back to that same session — never the now-active one.
-        _active_cancel[chat_id] = cancel_event
-        sname = sessions.get_active_name(uid)
-        conv_id = _conv_for_run(uid, sname)
-
-        if auto_title:
-            info = sessions.get_session_info(user_id=uid, session_name=sname)
-            if info and info.get("messages", 0) == 0:
-                sessions.auto_title(prompt, user_id=uid, session_name=sname)
-
-        response, detected_id = await run_cli_async(
-            prompt, conv_id,
-            cancel_event=cancel_event,
-            skip_permissions=skip_permissions,
-        )
-
-        if detected_id and detected_id != conv_id:
-            sessions.set_conversation_id(detected_id, user_id=uid, session_name=sname, backend=get_backend())
-
-        final_conv = detected_id or conv_id
-        if final_conv:
-            sessions.set_last_seen_step(get_latest_step(final_conv), user_id=uid, session_name=sname)
-        sessions.increment_messages(user_id=uid, session_name=sname)
-    return response
+# _run_cli_turn moved to zilla/core.py (ZillaCore.handle_message) — the
+# handlers below drive it through _relay_cli_turn.
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1540,7 +1457,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id
     stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
@@ -1554,8 +1470,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if transcript and not transcript.startswith("["):
             await update.message.reply_text(f'🎤 "{transcript}"')
-            response = await _run_cli_turn(
-                update, uid, chat_id, transcript, cancel_event, auto_title=True)
+            response = await _relay_cli_turn(
+                update, uid, chat_id, transcript, auto_title=True)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1569,9 +1485,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task.cancel()
         logger.error(f"Voice error: {e}", exc_info=True)
         await update.message.reply_text(f"Voice error: {str(e)[:200]}")
-    finally:
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1606,7 +1519,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     caption = update.message.caption or ""
     stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     try:
@@ -1627,7 +1539,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        response = await _run_cli_turn(update, uid, chat_id, prompt, cancel_event)
+        response = await _relay_cli_turn(update, uid, chat_id, prompt)
         stop_typing.set()
         typing_task.cancel()
         await send_response(update, context, response, uid, chat_id)
@@ -1636,9 +1548,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task.cancel()
         logger.error(f"Photo error: {e}", exc_info=True)
         await update.message.reply_text(f"Photo error: {str(e)[:200]}")
-    finally:
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1663,7 +1572,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Caption present — extract text and send to CLI
         stop_typing = asyncio.Event()
-        cancel_event = threading.Event()
         typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
         try:
@@ -1682,7 +1590,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Read the file and respond."
                 )
 
-            response = await _run_cli_turn(update, uid, chat_id, prompt, cancel_event)
+            response = await _relay_cli_turn(update, uid, chat_id, prompt)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -1691,9 +1599,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             typing_task.cancel()
             logger.error(f"Document analysis error: {e}", exc_info=True)
             await update.message.reply_text(f"Analysis error: {str(e)[:200]}")
-        finally:
-            if _active_cancel.get(chat_id) is cancel_event:
-                _active_cancel.pop(chat_id, None)
 
     except Exception as e:
         logger.error(f"Document save error: {e}", exc_info=True)
@@ -1843,42 +1748,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Human-in-the-loop bridge: if the agent asked this chat for an OTP / phone /
     # password / confirmation, this message IS the answer — hand it back to the
-    # waiting CLI turn instead of starting a new one.
-    pending = _pending_bridge.get(chat_id)
+    # waiting CLI turn instead of starting a new one. core.pending_ask_for()
+    # also handles TTL release: a stale (orphaned) ask returns None here and
+    # the message falls through to be processed as a normal turn.
+    pending = core.pending_ask_for(chat_id)
     if pending:
-        ask_id, ann_ts = pending[0], pending[1]
-        # Older entries were 2-tuples; treat a missing flag as non-secret.
-        is_secret = pending[2] if len(pending) > 2 else False
-        if time.time() - ann_ts > _BRIDGE_PENDING_TTL:
-            # Orphaned/stale ask — release the chat and process this message
-            # normally instead of swallowing it as an answer.
-            _pending_bridge.pop(chat_id, None)
-            interactive.clear_ask(ask_id)
-        else:
-            text = update.message.text or ""
-            try:
-                interactive.write_answer(ask_id, text)
-                _pending_bridge.pop(chat_id, None)
-                if is_secret:
-                    # An OTP / password must not linger in the chat. In a private
-                    # chat a bot may delete the user's own incoming message; if
-                    # that's ever refused, tell them to remove it themselves.
-                    try:
-                        await update.message.delete()
-                        await safe_send(
-                            context.bot, chat_id,
-                            "✅ Got it — continuing. I removed that message so the "
-                            "code isn't left in the chat.")
-                    except Exception:
-                        await update.message.reply_text(
-                            "✅ Got it — continuing.\n"
-                            "⚠️ Please delete your last message — it holds a "
-                            "sensitive value and I wasn't allowed to remove it.")
-                else:
-                    await update.message.reply_text("✅ Got it — continuing.")
-            except Exception as e:
-                await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
-            return
+        ask_id, is_secret = pending
+        text = update.message.text or ""
+        try:
+            core.answer_ask(ask_id, text)
+            if is_secret:
+                # An OTP / password must not linger in the chat. In a private
+                # chat a bot may delete the user's own incoming message; if
+                # that's ever refused, tell them to remove it themselves.
+                try:
+                    await update.message.delete()
+                    await safe_send(
+                        context.bot, chat_id,
+                        "✅ Got it — continuing. I removed that message so the "
+                        "code isn't left in the chat.")
+                except Exception:
+                    await update.message.reply_text(
+                        "✅ Got it — continuing.\n"
+                        "⚠️ Please delete your last message — it holds a "
+                        "sensitive value and I wasn't allowed to remove it.")
+            else:
+                await update.message.reply_text("✅ Got it — continuing.")
+        except Exception as e:
+            await update.message.reply_text(f"Couldn't record that: {str(e)[:120]}")
+        return
 
     # Owner add-user flow intercept
     if auth.is_owner(uid) and "adduser_flow" in context.user_data:
@@ -1910,7 +1808,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Natural-language schedule? Offer to create it instead of running it now.
-    if auth.can(uid, "admin"):
+    # Recursion guard (HANDOFF P1 scheduler-seam item 7): a turn executed BY a
+    # schedule must not be able to create MORE schedules via this NL path.
+    if auth.can(uid, "admin") and not core.is_scheduled_run(uid):
         parsed = parse_schedule(user_message or "")
         if parsed:
             await _offer_schedule(update, context, parsed)
@@ -1926,7 +1826,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 
     stop_typing = asyncio.Event()
-    cancel_event = threading.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing))
 
     # Bind before the try so a BaseException (e.g. asyncio.CancelledError on
@@ -1934,16 +1833,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # unbound at the send_response call below.
     response = ""
     try:
-        response = await _run_cli_turn(
-            update, uid, chat_id, user_message, cancel_event, auto_title=True)
+        response = await _relay_cli_turn(
+            update, uid, chat_id, user_message, auto_title=True)
     except Exception as e:
         response = _friendly_error(e)
         logger.error(f"Handler error: {e}", exc_info=True)
     finally:
         stop_typing.set()
         typing_task.cancel()
-        if _active_cancel.get(chat_id) is cancel_event:
-            _active_cancel.pop(chat_id, None)
 
     await send_response(update, context, response, uid, chat_id)
 
@@ -2006,9 +1903,7 @@ async def _cb_misc(query, context, data, uid, chat_id):
         await query.edit_message_text(await _health_panel(), reply_markup=kb_back())
 
     elif data == "cancel_active":
-        cancel_ev = _active_cancel.get(chat_id)
-        if cancel_ev and not cancel_ev.is_set():
-            cancel_ev.set()
+        if core.cancel(chat_id):
             await query.edit_message_text("🛑 Canceling…")
         else:
             await query.edit_message_text("Nothing to cancel.")
@@ -2428,7 +2323,7 @@ async def _cb_schedules(query, context, data, uid, chat_id):
         s = schedules_mgr.get(sid)
         if s and s.get("user_id") == uid:
             await query.answer("▶️ Running now…")
-            asyncio.create_task(_run_now(context.application, s))
+            asyncio.create_task(core.run_schedule_now(sid))
         else:
             await query.answer("Not found.", show_alert=True)
 
@@ -2586,65 +2481,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 #  STARTUP
 # ══════════════════════════════════════════════════════════
 
-async def bridge_watcher(application):
-    """Relay the agent's credential/OTP/confirm requests to the owner's Telegram.
-
-    Polls the Bridge dir; for each new ask it DMs the prompt and records that the
-    chat owes an answer (captured by handle_message). Cleans up answered/stale
-    asks. Inert when the agent isn't asking for anything.
-    """
-    _KIND_LABEL = {"otp": "🔐 One-time code", "password": "🔑 Password",
-                   "text": "✍️ Input needed", "confirm": "❓ Please confirm"}
-    logger.info("[BRIDGE] credential/OTP watcher started")
-    while True:
-        try:
-            for ask in interactive.read_pending_asks():
-                if ask.id in _bridge_announced:
-                    continue
-                target = ask.chat_id or OWNER_CHAT_ID
-                if not target:
-                    continue
-                cur = _pending_bridge.get(target)
-                if cur and cur[0] != ask.id:
-                    continue  # one outstanding ask per chat at a time
-                hint = "\n\n<i>Reply with the value — used once.</i>" if ask.is_secret else ""
-                try:
-                    await application.bot.send_message(
-                        chat_id=target,
-                        text=f"{_KIND_LABEL.get(ask.kind, '✍️ Input needed')}\n\n"
-                             f"{format_for_telegram(ask.prompt)[0]}{hint}",
-                        parse_mode="HTML",
-                    )
-                    _bridge_announced.add(ask.id)
-                    _pending_bridge[target] = (ask.id, time.time(), ask.is_secret)
-                    log_event("bridge_ask", kind=ask.kind, chat=target)
-                except Exception as e:
-                    logger.error(f"[BRIDGE] could not DM ask {ask.id}: {e}")
-            interactive.expire_stale()
-            # Forget announced asks that are gone (answered+cleared) so the maps
-            # don't grow unbounded.
-            live = {a.id for a in interactive.read_pending_asks()}
-            for aid in list(_bridge_announced):
-                if aid not in live:
-                    _bridge_announced.discard(aid)
-                    for cid, pv in list(_pending_bridge.items()):
-                        if pv[0] == aid:
-                            _pending_bridge.pop(cid, None)
-        except Exception as e:
-            logger.error(f"[BRIDGE] watcher error: {e}", exc_info=True)
-        await asyncio.sleep(2)
-
-
 async def post_init(application):
+    global _application, _core_events_queue, _core_events_task_handle
+    _application = application
+
     # Register the native Telegram slash-command menu (the "/" autocomplete).
     await _register_commands(application)
 
-    # Start the background scheduler (custom asyncio loop).
-    application.create_task(scheduler_loop(application))
-
-    # Start the human-in-the-loop credential/OTP relay watcher.
-    interactive.ensure_bridge_dir()
-    application.create_task(bridge_watcher(application))
+    # Wire the one Telegram-specific fast path the scheduler needs, then start
+    # the core's scheduler runtime and bridge watcher (zilla/core.py — CORE_API
+    # migration steps 3/4) and subscribe to render its ScheduledResult/Alert/
+    # Ask events.
+    core.schedule_pre_run = _schedule_pre_run_hook
+    _core_events_queue = asyncio.Queue()
+    core.subscribe(_core_events_queue)
+    _core_events_task_handle = application.create_task(
+        _core_events_task(core, _core_events_queue))
+    await core.start()
 
     if OWNER_CHAT_ID:
         try:
@@ -2658,6 +2511,23 @@ async def post_init(application):
             )
         except Exception as e:
             logger.warning(f"[STARTUP] Owner notify failed: {e}")
+
+
+async def post_shutdown(application):
+    """Mirror of post_init's startup wiring: stop the core's scheduler task
+    and the event-render consumer cleanly on shutdown."""
+    global _core_events_task_handle
+    try:
+        await core.stop()
+    except Exception as e:
+        logger.warning(f"[SHUTDOWN] core.stop() failed: {e}")
+    if _core_events_task_handle is not None:
+        _core_events_task_handle.cancel()
+        try:
+            await _core_events_task_handle
+        except (asyncio.CancelledError, Exception):
+            pass
+        _core_events_task_handle = None
 
 
 # Base commands every admin/owner sees in the "/" menu.
@@ -2748,7 +2618,7 @@ def _release_lock():
 
 
 def main():
-    global sessions, auth, schedules_mgr, _lock_file_handle
+    global sessions, auth, schedules_mgr, core, _lock_file_handle
 
     # Single-instance guard — cross-platform (msvcrt on Windows, fcntl on Unix).
     bot_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2792,6 +2662,10 @@ def main():
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)
+    # the turn pipeline + scheduler runtime + bridge watcher (CORE_API
+    # migration steps 2 + 3 + 4)
+    core = zcore.ZillaCore(sessions=sessions, auth=auth, schedules=schedules_mgr,
+                          owner_chat_id=OWNER_CHAT_ID)
     keyboards.auth = auth  # the keyboard builders read auth for role-gated menus
 
     model = get_model()
@@ -2820,7 +2694,14 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .concurrent_updates(True)
+        # PTB defaults are 5s — too tight on slow links (hotspot); a timed-out
+        # send here is how replies silently vanish.
+        .connect_timeout(15)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(10)
         .build()
     )
 
