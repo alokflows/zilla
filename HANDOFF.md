@@ -538,7 +538,7 @@ runtime (payload types / session modes / backend pins / retry ladder), and
 the credential/OTP bridge all live in `zilla/core.py`; **next: approvals
 seam (CORE_API step 5), then health stub (step 6), then P1.5 router.**
 **Working branch:** `claude/zilla-harness-review-0v96bs`
-**Tests:** 204+16+57+57 = **334 green** — `.venv/bin/python test_fixes.py /
+**Tests:** 204+16+75+57 = **352 green** — `.venv/bin/python test_fixes.py /
 test_interactive.py / test_core.py / test_schedules_seam.py` (the last is a
 frozen acceptance spec — never edit it) + `import bot; import zilla.core`.
 **Bot:** live on the owner's MacBook (@Mangomangos_bot; `.env` exists here,
@@ -577,6 +577,7 @@ git-ignored). After changing `bot.py`: `pkill -9 -f "Python bot.py"`, restart
 | 2026-07-16 night | Live smoke: text/photo/doc/cancel ✅; `safe_send` 4× retry + raised PTB timeouts; voice fixed (`brew install flac` on Apple Silicon — add a doctor check in P2); reminder parser broadened; one-off reminders instant, `system_event` payloads (zero model call at fire), exact-time scheduler tick. |
 | 2026-07-17 | Bridge seam → core (`Ask` events over `subscribe()`, `pending_ask_for`/`answer_ask`; bot.py renders only). 334 green; bot restarted live. |
 | 2026-07-17 | `docs/dev/RESEARCH_ORCHESTRATION_REVIEW.md` — verdict: OpenClaw/Hermes have NO reviewer LLM; "effortless" = in-loop tool self-heal + persistence system prompt + deterministic delivery filter. Zilla plan: harness self-heal clause, unify scattered checks into one `review()` seam at both delivery points, surface existing `Progress` events into the ⏳ bubble (free "feels alive" win), steal-list #31–40. |
+| 2026-07-17 | Health stub → `core.health_report(force=False)` snapshot from existing probes (agy/claude reachability, disk, scheduler/bridge attachment); loop itself stays Phase 7. 352 green (test_core 75). |
 
 ### Notes (only what a future session needs)
 
