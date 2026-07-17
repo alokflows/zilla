@@ -522,6 +522,109 @@ def test_bridge_start_stop_without_scheduler():
     asyncio.run(run())
 
 
+# ── 14. health_report — stable keys, no ScheduleManager ──────
+
+class _patched_health:
+    """Monkeypatch zilla.core's agy_reachable / agy_models_live /
+    claude_identity for one test, and record how each was called."""
+
+    def __init__(self, agy_ok=True, claude_status=None):
+        self.calls = {"agy_reachable": 0, "agy_models_live": 0, "claude_identity": []}
+        self._agy_ok = agy_ok
+        self._claude_status = claude_status or {"loggedIn": True}
+
+    def _fake_agy_reachable(self):
+        self.calls["agy_reachable"] += 1
+        return self._agy_ok
+
+    def _fake_agy_models_live(self, force=False):
+        self.calls["agy_models_live"] += 1
+        return []
+
+    def _fake_claude_identity(self, force=False):
+        self.calls["claude_identity"].append(force)
+        return self._claude_status
+
+    def __enter__(self):
+        self._orig = (zcore.agy_reachable, zcore.agy_models_live, zcore.claude_identity)
+        zcore.agy_reachable = self._fake_agy_reachable
+        zcore.agy_models_live = self._fake_agy_models_live
+        zcore.claude_identity = self._fake_claude_identity
+        return self
+
+    def __exit__(self, *exc):
+        zcore.agy_reachable, zcore.agy_models_live, zcore.claude_identity = self._orig
+        return False
+
+
+def test_health_report_stable_keys():
+    print("\n[14] health_report — stable keys, no ScheduleManager attached")
+    core = _fresh_core("health_keys")  # schedules=None (built without a ScheduleManager)
+
+    with _patched_health(agy_ok=True, claude_status={"loggedIn": False, "error": "not logged in"}) as p:
+        report = core.health_report()
+
+    check("top-level keys present",
+          set(report.keys()) == {"backend", "model", "clis", "disk", "scheduler", "bridge"},
+          f"got {sorted(report.keys())}")
+    check("backend is the configured one", report["backend"] == config.get_backend())
+    check("model is a plain string", isinstance(report["model"], str) and report["model"])
+    check("clis has agy + claude", set(report["clis"].keys()) == {"agy", "claude"})
+    check("agy reachable reflects probe", report["clis"]["agy"]["reachable"] is True)
+    check("claude reachable reflects probe", report["clis"]["claude"]["reachable"] is False)
+    check("claude carries auth_error", report["clis"]["claude"]["auth_error"] == "not logged in")
+    check("disk has path/free_bytes/total_bytes",
+          set(report["disk"].keys()) == {"path", "free_bytes", "total_bytes"})
+    check("disk free_bytes is a plain int (or None)",
+          report["disk"]["free_bytes"] is None or isinstance(report["disk"]["free_bytes"], int))
+    check("scheduler not attached (built without a ScheduleManager)",
+          report["scheduler"] == {"attached": False, "schedule_count": 0},
+          f"got {report['scheduler']}")
+    check("bridge dir + exists reported",
+          set(report["bridge"].keys()) == {"dir", "exists"} and isinstance(report["bridge"]["exists"], bool))
+
+
+# ── 15. health_report — force=False never forces a live probe ──
+
+def test_health_report_force_false_is_cached():
+    print("\n[15] health_report — force=False uses cached/cheap probe forms only")
+    core = _fresh_core("health_cache")
+
+    with _patched_health() as p:
+        core.health_report()  # force=False (default)
+    check("agy_models_live NOT called (agy_reachable's cached form used)",
+          p.calls["agy_models_live"] == 0, f"calls={p.calls}")
+    check("agy_reachable called once",
+          p.calls["agy_reachable"] == 1, f"calls={p.calls}")
+    check("claude_identity called with force=False (its own cached form)",
+          p.calls["claude_identity"] == [False], f"calls={p.calls}")
+
+    with _patched_health() as p:
+        core.health_report(force=True)
+    check("force=True DOES refresh agy's live cache",
+          p.calls["agy_models_live"] == 1, f"calls={p.calls}")
+    check("force=True passes through to claude_identity",
+          p.calls["claude_identity"] == [True], f"calls={p.calls}")
+
+
+# ── 16. health_report — with a ScheduleManager attached ─────
+
+def test_health_report_with_schedule_manager():
+    print("\n[16] health_report — scheduler attached + schedule_count reflects it")
+    from zilla.schedules import ScheduleManager
+    sched = ScheduleManager(os.path.join(_tmpdir, "schedules_health.json"))
+    sched.add(OWNER, OWNER, "a scheduled prompt", "daily", {"hh": 9, "mm": 0})
+    sessions = SessionManager(os.path.join(_tmpdir, "sessions_health_sm.json"))
+    auth = AuthManager(os.path.join(_tmpdir, "users_health_sm.json"), OWNER)
+    core = ZillaCore(sessions=sessions, auth=auth, schedules=sched)
+
+    with _patched_health():
+        report = core.health_report()
+    check("scheduler attached", report["scheduler"]["attached"] is True)
+    check("schedule_count reflects the manager", report["scheduler"]["schedule_count"] == 1,
+          f"got {report['scheduler']}")
+
+
 def main():
     tests = [
         test_event_sequence,
@@ -537,6 +640,9 @@ def main():
         test_pending_ask_ttl,
         test_bridge_external_clear_cleanup,
         test_bridge_start_stop_without_scheduler,
+        test_health_report_stable_keys,
+        test_health_report_force_false_is_cached,
+        test_health_report_with_schedule_manager,
     ]
     print("Running zilla.core turn-pipeline tests...\n")
     for t in tests:

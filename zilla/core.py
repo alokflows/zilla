@@ -30,14 +30,20 @@
 
 import asyncio
 import logging
+import os
+import shutil
 import threading
 import time
 import time as _time
 from dataclasses import dataclass, field
 
 import zilla.interactive as interactive
+from zilla.backends import claude_identity
 from zilla.cli_engine import run_cli_async, get_latest_step, detect_limit
-from zilla.config import get_backend, get_model, get_setting
+from zilla.config import (
+    get_backend, get_model, get_setting,
+    agy_reachable, agy_models_live, BRAIN_DIR, HOME_DIR,
+)
 from zilla.formatter import detect_file_paths
 from zilla.harness import log_event
 from zilla.schedules import resolve_session_mode, backend_pin_mismatch
@@ -224,7 +230,10 @@ class ZillaCore:
         """Start background runtime: the scheduler loop (only if a
         ScheduleManager was provided) and the bridge watcher (CORE_API
         migration step 4 — always started; it is independent of the
-        scheduler). Health loop lands here in a later seam (step 6)."""
+        scheduler). The silent self-healing HEALTH LOOP (periodic re-check,
+        self-heal, Alert only when a human must act) is Phase 7
+        (see HANDOFF.md) — deliberately NOT started here yet. Step 6 only
+        adds the point-in-time health_report() snapshot below."""
         if self.schedules is not None and self._sched_task is None:
             self._sched_task = asyncio.create_task(self._scheduler_loop())
         interactive.ensure_bridge_dir(self._bridge_dir)
@@ -251,6 +260,64 @@ class ZillaCore:
             except Exception as e:  # pragma: no cover - defensive
                 logger.error(f"[BRIDGE] stop() cleanup error: {e}")
             self._bridge_task = None
+
+    # ── health snapshot (CORE_API migration step 6 — STUB) ─
+    #
+    #  A point-in-time doctor snapshot assembled from EXISTING probe
+    #  primitives only (config.agy_reachable/agy_models_live,
+    #  backends.claude_identity, shutil.disk_usage) — no new probe logic.
+    #  Deliberately a stub: the silent self-healing HEALTH LOOP (periodic
+    #  re-check, self-heal, Alert events only when a human must act) is
+    #  Phase 7 (see HANDOFF.md) and is NOT built here. Stable, plain-value
+    #  keys so a future doctor command / TUI health screen can render this
+    #  dict directly.
+
+    def health_report(self, force: bool = False) -> dict:
+        """Snapshot of: configured backend/model, per-CLI reachability/login
+        state, disk free space (brain dir, falling back to home dir), and
+        whether a scheduler/bridge are attached.
+
+        force=False (default) uses each probe's cheap/cached form — this
+        must NEVER trigger a live network/subprocess probe on its own (e.g.
+        a TUI health screen rendering on every keystroke). force=True passes
+        through to the probes that support it (claude_identity's own
+        `force` kwarg; agy's `agy_models_live(force=True)` refreshes the
+        cache that `agy_reachable()` then reads)."""
+        backend = get_backend()
+        model = get_model()
+
+        if force:
+            agy_models_live(force=True)
+        agy_ok = agy_reachable()
+
+        claude_status = claude_identity(force=force)
+        claude_ok = bool(claude_status.get("loggedIn"))
+
+        disk_path = BRAIN_DIR if os.path.isdir(BRAIN_DIR) else HOME_DIR
+        try:
+            usage = shutil.disk_usage(disk_path)
+            free_bytes, total_bytes = usage.free, usage.total
+        except OSError:
+            free_bytes = total_bytes = None
+
+        return {
+            "backend": backend,
+            "model": model,
+            "clis": {
+                "agy": {"reachable": agy_ok},
+                "claude": {"reachable": claude_ok, "logged_in": claude_ok,
+                           "auth_error": claude_status.get("error")},
+            },
+            "disk": {"path": disk_path, "free_bytes": free_bytes,
+                     "total_bytes": total_bytes},
+            "scheduler": {
+                "attached": self.schedules is not None,
+                "schedule_count": (len(self.schedules.schedules)
+                                   if self.schedules is not None else 0),
+            },
+            "bridge": {"dir": self._bridge_dir,
+                       "exists": os.path.isdir(self._bridge_dir)},
+        }
 
     # ── background event broadcast ─────────────────────────
 
