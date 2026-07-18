@@ -6,8 +6,10 @@ Telegram — one command gets real things done (log in to services, order to an
 address, run/control the whole computer), asking the human only for
 credentials/OTPs.
 
-Work happens on branch **`security-hardening-and-autonomy`** (checkpointed; not
-pushed). `main` is untouched.
+The security-hardening work described below was merged to `main` via PR #1
+(`4d5b5ce`). Current planning + execution branch:
+`claude/python-cli-bot-planning-80x8a3` — see `PLAN.md` (blueprint) and
+`HANDOFF.md` (status board).
 
 ---
 

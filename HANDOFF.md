@@ -308,9 +308,14 @@ green.** **M2 (Memory layout + injection + `TurnContext` threading) is
 COMPLETE** (PLAN.md §5.M2) — see checklist + session log below.
 **M3 (FTS5 search + memory git + quiet-run mode) is COMPLETE** (PLAN.md
 §5.M3) — see checklist + session log below.
-**NEXT UNIT OF WORK: Phase M4 — Nightly distillation + `/memory` command +
-change surfacing**, full test gate before and after.
-**Working branch (source of truth):** `claude/zilla-harness-review-0v96bs`
+**NEXT UNIT OF WORK: Phase F (F1→F4) — foundation cleanup (PLAN.md §17,
+owner-ordered 2026-07-18): F1 ZILLA_HOME storage layout, F2 dynamic
+backend registry, F3 media importance+retention, F4 system jobs
+invisible+silent. THEN M4.** Full test gate before and after.
+**Working branch (source of truth): `main`** (branches consolidated
+2026-07-18 — the old planning + execution branches were merged into main
+and deleted; if any machine still has local commits from them, rebase
+onto main and push. PUSH TO MAIN EVERY SESSION, no exceptions).
 **Tests:** 260+16+116+57 core + 71 review + 17 tui + 69 cli + 46 harness +
 34 memory_m3 = **686 green** — `.venv/bin/python test_fixes.py /
 test_interactive.py / test_core.py / test_schedules_seam.py /
@@ -358,17 +363,28 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **M1** `store.py` (SQLite+WAL) + first-start migration from the 5 JSON files — DONE 2026-07-18 (6 commits, `store.py`/thin wrappers/migration/doctor DB checks/audit-debt burn-down/secrets hygiene+backup/acceptance tests). 606 green.
 - [x] **M2** Memory layout (`Memory/` — `config.MEMORY_DIR`, repo root, per M1's forward-declaration, not literal `~/AGI-Brain/Memory`) + owner-only injection + `TurnContext` threading — DONE 2026-07-18. 652 green.
 - [x] **M3** FTS5 search + memory git + quiet-run mode — DONE 2026-07-18. 686 green.
-- [ ] **M4** Nightly distillation + `/memory` command + change surfacing — genuinely new. NEXT.
+- [ ] **F1** ZILLA_HOME storage layout replaces AGI-Brain (PLAN §17) — NEXT.
+- [ ] **F2** Dynamic backend registry — no hard-coded backend buttons (PLAN §17).
+- [ ] **F3** Media importance + retention controls (PLAN §17).
+- [ ] **F4** System jobs invisible + silent — fixes the live heartbeat noise the owner screenshotted (PLAN §17).
+- [ ] **M4** Nightly distillation + `/memory` command + change surfacing — genuinely new.
+- [ ] **K1-K4** Relational graph memory (PLAN §6): schema+indexer, entity linking, curiosity loop, /graph views.
+- [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card.
 - [ ] **H1** Heartbeat loop — genuinely new.
 - [ ] **H2** Health probes + assisted re-login — PARTIAL: earlier P7 health-loop WIP exists (stashed, `git stash list` → "P7 health-loop WIP"), built before PLAN.md was found; PLAN.md's H2 spec is more precise (explicit "do not build speculative login automation" ceiling) — treat the stash as reference only, re-derive from PLAN.md's spec rather than popping it verbatim.
 - [ ] **H3** systemd Linux service — genuinely new (this is P10 Ubuntu hardening's old slot, now precisely specified here).
+- [ ] **H4** Self-update with doctor-gated rollback (PLAN §8).
+- [ ] **B1-B2** Background task lane + /tasks; incognito sessions (PLAN §9).
 - [ ] **R1** Triage router refinement — MOSTLY DONE via `zilla/review.py` (P1.5 above); confirm against PLAN.md's exact spec before marking done, don't rebuild.
 - [ ] **R2** Fallback chain — genuinely new.
 - [ ] **R3** opencode adapter — genuinely new (was P8).
 - [ ] **S** Skills from chat, ask-first approval — genuinely new (was P5).
+- [ ] **C1-C3** Brain export/import; connectors screen (MCP/native, per-backend); GitHub cloud backup + bootstrap-from-cloud (PLAN §12).
 - [ ] **G1** Engine facade extraction — PARTIAL via existing `zilla/core.py` (P1 above); the new part is the Unix-socket IPC daemon-attach model. PLAN.md flags this as the riskiest refactor in the plan — do it alone, no parallel fan-out.
 - [ ] **T1** Terminal app (Textual, daemon-attach via IPC) — MOSTLY DONE via existing `zilla/tui/` (P2 above); missing pieces listed there.
-- [ ] **V** Offline voice (faster-whisper — already pip-installed, salvaged from GOD MODE round 2) — genuinely new (was P9).
+- [ ] **V1** Offline voice (faster-whisper — already pip-installed, salvaged from GOD MODE round 2) — genuinely new (was P9).
+- [ ] **V2** Voice replies via local TTS (Piper) (PLAN §14).
+- [ ] **V3** Owner-trained wake-word satellite (PLAN §14).
 
 ### Session log (one line per session — details in git log)
 
