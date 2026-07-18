@@ -66,6 +66,32 @@
    line to the log (date, what shipped, any warning for the next session).
 6. **Commit** with a clear message. Small commits. Tests green before every
    commit. The bot must keep working throughout — the owner demos it.
+7. **Relay to a fresh session, then stop** (owner decree 2026-07-18 night;
+   revised same night — owner wants to SEE the window, not a headless
+   background agent): once — and only once — the full test gate is green,
+   HANDOFF.md/PLAN.md are updated, and the commit is pushed to `origin
+   main`, open a NEW, VISIBLE Terminal.app window running the next
+   session, from the repo root:
+   ```
+   osascript -e 'tell application "Terminal" to activate' \
+             -e 'tell application "Terminal" to do script "cd '"$(pwd)"' && claude --permission-mode bypassPermissions \"read HANDOFF.md and continue\""'
+   ```
+   Then end your own turn immediately after (no further phase work in this
+   session) — do not close your own window (the owner can see and close it
+   themselves; forcing it closed from inside a headless Bash tool call is
+   not reliable). This is the whole point: each session stays small
+   (cheap, fast, no giant accumulated context) instead of one session
+   dragging through every remaining phase, AND the owner can watch each
+   one land in its own window. **Do NOT relay if either is true:** (a) the
+   test gate did not go fully green — stop and leave the failure in the
+   LIVE STATUS BOARD for a human to look at, never auto-relay onto a
+   broken tree; (b) PLAN.md's checklist has nothing left unchecked — the
+   work is actually done, say so, don't spawn a session with nothing to
+   do. The chain also just naturally stops whenever the owner's usage
+   limit is hit (the new window's session simply fails/errors — that is
+   fine, expected, not a bug to chase). Still SERIAL ONLY (see Working
+   Agreements below) — one dispatched session at a time, never fan out
+   several in parallel.
 
 ---
 
