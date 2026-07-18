@@ -37,10 +37,18 @@ For any execution agent, every session:
 | H1 Heartbeat loop | ⬜ | |
 | H2 Health probes + assisted re-login | ⬜ | |
 | H3 systemd service | ⬜ | |
-| R1 Triage router | ⬜ | |
+| H4 Self-update with rollback | ⬜ | planned by Fable, 2026-07-18 |
+| B1 Background task lane + /tasks | ⬜ | |
+| B2 Incognito sessions | ⬜ | |
+| R1 Triage router + effort controller | ⬜ | |
 | R2 Fallback chain | ⬜ | |
 | R3 opencode adapter | ⬜ | |
 | S Skills from chat | ⬜ | |
+| C1 Brain export/import | ⬜ | |
+| C2 Connectors screen (MCP/native) | ⬜ | |
+| C3 Cloud backup + bootstrap-from-cloud | ⬜ | |
 | G1 Engine facade extraction | ⬜ | |
 | T1 Terminal app | ⬜ | |
-| V Offline voice | ⬜ | |
+| V1 Offline transcription | ⬜ | |
+| V2 Voice replies (local TTS) | ⬜ | |
+| V3 Wake-word satellite | ⬜ | |

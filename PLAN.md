@@ -53,7 +53,10 @@ the optimization target. All OS divergence stays in `platform_compat.py`.
                       │  heartbeat.py— proactive loop              │
                       │  skills.py   — skill store + approval      │
                       │  schedules   — timers & recurring jobs     │
-                      │  health.py   — probes + assisted re-login  │
+                      │  tasks.py    — background task lane        │
+                      │  health.py   — probes + re-login + update  │
+                      │  connectors  — per-backend MCP/native mgmt │
+                      │  voice/      — wake-word satellite (V3)    │
                       │  store.py    — SQLite (state + FTS index)  │
                       └───────┬──────────────────┬─────────────────┘
                               │                  │
@@ -168,7 +171,7 @@ AGI-Brain/Memory/            ← `git init` here; NEVER the Zilla repo
   Journal/
     2026-07-17.md            ← one file per day, newest entries appended
   Skills/
-    <slug>/SKILL.md          ← learned skills (see §10); scripts live beside it
+    <slug>/SKILL.md          ← learned skills (see §11); scripts live beside it
 ```
 
 Page format: H1 title on line 1, one-line summary on line 2 (the wiki index
@@ -338,7 +341,7 @@ destructive automated job — the distillation lands in M4, not here.)
    conversation** (fresh conv id, discarded after the run — never advances
    any session's conv id); raw pre-distillation journal text stays
    recoverable via memory git history (M3 — already live by now).
-2. **Memory-change surfacing (the §14.9 injection-surface mitigation):**
+2. **Memory-change surfacing (the §16.9 injection-surface mitigation):**
    `git_autocommit` computes the per-run diff stat. When a run's inputs
    included untrusted content (document-ingest turn, browser-bearing turn)
    or the run was non-owner-originated, DM the owner one line: *"memory
@@ -636,9 +639,67 @@ Seeded template:
    **Accept:** unit file golden test; doctor reports service state; live:
    reboot → bot up, missed schedules caught up (existing reconcile).
 
+### H4 — Self-update with rollback
+1. `/update` (owner) + `zilla update`: deterministic pipeline — record
+   current commit → `git fetch && git pull --ff-only` on the Zilla repo →
+   `pip install -r requirements.txt` (venv) → run store.py migrations →
+   restart service → post-restart `--doctor`. **Doctor fails ⇒ automatic
+   rollback**: checkout recorded commit, reinstall, restart, doctor again,
+   and DM the owner one line with what failed. DB is backed up
+   (`VACUUM INTO`, M1.6) immediately before migrations. Never auto-updates
+   on its own — owner-triggered only (a heartbeat line may *mention* that
+   an update is available; H2 probe checks `git fetch --dry-run` 1×/day).
+   **Accept:** update pipeline test with a simulated bad migration →
+   rollback restores prior commit + DB; doctor-gate test; live smoke of
+   one full update on the Linux service.
+
+## 9. Phase B — Background tasks & incognito (executes after H)
+
+**The gap this closes:** every turn holds the per-uid lock, so a 20-minute
+research job freezes the owner's chat for 20 minutes — the deepest possible
+violation of "never feels dead". Background tasks get their own lane.
+
+### B1 — Background lane
+1. `tasks.py` + table: `tasks(id, uid, prompt, status
+   queued|running|done|failed|canceled, progress, result, created_at,
+   started_at, finished_at)`. Each task runs in its OWN named session
+   (`task:<id>`, backend-tagged per I-CONV, GC'd with H1's sweep) under a
+   task-scoped lock — NOT the owner's chat lock. The chat stays free. The
+   agy global new-conv lock still applies at spawn (unavoidable, brief).
+   Concurrency cap `max_bg_tasks` (default 2, setting) — queued beyond
+   that; quota protection is the cap + usage counters.
+2. Creation, deterministic (P5): `/bg <prompt>` command; or the agent —
+   when the owner *asks* for background work conversationally — ends its
+   reply with `BG_TASK: <prompt>` (marker detected/stripped exactly like
+   `SKILL_PROPOSAL`, rendered as a ZUI confirm button; owner taps ⇒ task
+   created). The model cannot spawn work without a command or a tap.
+3. Completion: result DM'd as a ZUI card (title, duration, result body /
+   FileOut); failure = one calm sentence + a "retry" button. Cancel via
+   `/tasks` buttons (per-task `cancel_event`, I-CANCEL semantics).
+4. `/tasks` board (ZUI): running (with live progress line + cancel),
+   queued, last 5 finished. TUI gets a Tasks screen in Phase T.
+   **Accept:** lock-independence test (bg task running, chat turn completes
+   concurrently); cap/queue test; cancel test; marker detect/strip/confirm
+   test; live smoke — start a long bg task, keep chatting, get the result
+   card.
+
+### B2 — Incognito sessions
+1. `/new incognito` (session flag in `sessions`): the harness omits the
+   journal/memory instructions AND the memory protocol for those turns;
+   **code enforcement**, not model promise: Memory-tree mtime snapshot
+   around each incognito turn — any change ⇒ `git restore` from the memory
+   repo + one-line owner notice. No graph cards injected, no curiosity
+   questions, no FTS of anything said.
+2. Honest ceiling, documented in MANUAL.md: the backend CLI still keeps
+   its own conversation transcript (agy brain dir / claude session) — 
+   incognito guarantees *Zilla's memory* is untouched, and the session's
+   conv dir is deleted on `/close` (or H1 GC).
+   **Accept:** enforcement test (simulated memory write during incognito ⇒
+   reverted + notice); injection-absence test; close-deletes-conv test.
+
 ---
 
-## 9. Phase R — Router & fallback
+## 10. Phase R — Router & fallback
 
 ### R1 — Triage router
 `router.py`, deterministic only (P3), runs before the engine spends a lock:
@@ -688,8 +749,13 @@ Seeded template:
    assert an agy model write during routing.
 
 ### R2 — Fallback chain
-1. Setting `backend_chain` (ordered, default = active backend + others
-   detected on PATH). **A chain entry is eligible only if its last health
+1. Setting `backend_chain` — ordered; **default order is the owner's
+   declared priority: `agy → opencode → claude`**, filtered to what is
+   detected on PATH (the active backend, whatever it is, always leads its
+   own session's turns). `effort_map` defaults follow the same reality:
+   fast/deep pick the cheapest/strongest model among the per-invocation-
+   flag backends actually present (opencode first, claude when enabled).
+   **A chain entry is eligible only if its last health
    probe (H2) showed a fresh login** — a binary on PATH that isn't logged
    in would burn the retry or hang on a login prompt; skip it and log why
    (probe freshness per H2 — stale probe ⇒ on-demand probe, never a dead
@@ -725,7 +791,7 @@ Seeded template:
 
 ---
 
-## 10. Phase S — Skills from chat (ask-first)
+## 11. Phase S — Skills from chat (ask-first)
 
 1. Format: `Memory/Skills/<slug>/SKILL.md` — frontmatter (`name`,
    `description`, `created`, `uses`) + body (when to use, steps); optional
@@ -766,7 +832,71 @@ Seeded template:
 
 ---
 
-## 11. Phase G — Gateway extraction, then Phase T — Terminal app
+## 12. Phase C — Connectors & the portable brain (executes after S)
+
+### C1 — Brain export / import
+1. `zilla export [--encrypt] [path]` → one archive: `Memory/` (incl. its
+   `.git`), a `System/state-snapshot.json` (settings/schedules/users/
+   curiosity dumped from the DB — NOT the DB file; the DB is
+   operational+index and rebuilds), `.env.template` (structure, NO
+   secrets), and `Media/` files under `export_media_max_mb` (default 10)
+   each. `--encrypt` = AES-256 via openssl with a relay-prompted
+   passphrase.
+2. `zilla import <archive|dir>` (and installer/TUI onboarding step
+   "Restore from a backup?"): restore files → import snapshot →
+   rebuild FTS + graph indexes from the files (this is P1's proof — the
+   entire brain reconstitutes from Markdown + one JSON).
+   **Accept:** export→wipe→import round-trip equals original (graph query
+   results identical); encrypted round-trip; snapshot excludes secrets.
+
+### C2 — Connectors screen (MCP + native, per-backend)
+1. Reality, recorded: connectors live at the BACKEND level and differ —
+   agy ships native connectors (Google Workspace etc.) plus MCP config;
+   claude manages MCP via `claude mcp add/list/remove` / `.mcp.json`;
+   opencode declares MCP servers in its JSON config. Zilla does not proxy
+   or re-implement any of this — it MANAGES the per-backend configs
+   deterministically (write + read-back, like `set_model`; exact
+   file/flag shapes verified against installed versions, evidence-first).
+2. `/settings → Connectors`: an availability matrix (connector × backend:
+   native / via MCP / unavailable), add/remove/enable per backend, secrets
+   (MCP server keys) collected via the interactive relay — written only
+   to the backend's own config, never logged, never in memory files.
+   **Owner-approval gate (P5):** adding any connector/MCP server requires
+   an explicit ✅ confirm card showing exactly what will run — MCP servers
+   are third-party code and a prompt-injection/supply-chain surface
+   (→ §16.11).
+3. Router awareness (small, later-proof): `connector_hints` map — a turn
+   that clearly needs a connector only one backend has (e.g. Workspace on
+   agy) is routed to that backend for that turn, same throwaway-conv rules
+   as fallback.
+   **Accept:** config write+read-back tests per backend (mocked binaries);
+   matrix renders truthfully from configs; approval-gate test (no write
+   without confirm); secrets never appear in logs test.
+
+### C3 — Cloud backup + bootstrap-from-cloud
+1. **GitHub is the canonical cloud backup** (recorded decision): the
+   memory repo (M3) gains an optional remote — a PRIVATE repo the owner
+   supplies (URL + PAT via relay; PAT into `.env`, 0600). Auto-push after
+   autocommit, rate-limited (≥ 10 min apart) + always after nightly
+   distillation. C1's `state-snapshot.json` is committed nightly into the
+   repo → **the entire brain is restorable from the repo alone**. Media
+   under the size cap included; oversize files listed in a
+   `Media/SKIPPED.md` (LFS = conscious deferral). Plaintext-in-private-
+   repo vs encrypted-archive tradeoff documented in MANUAL.md; the
+   `--encrypt` export (C1) is the answer for the cautious.
+2. Bootstrap-from-cloud: onboarding (installer + TUI) offers "Restore
+   from GitHub" → URL + PAT → clone → C1 import path → reindex → the new
+   machine wakes up with the owner's full memory, graph, and schedules.
+3. Google Drive / Workspace: **not** the canonical backup path (no
+   deterministic tool without new deps) — recorded decision. Drive is
+   reachable for file operations through C2 connectors on backends that
+   have it; a `drive_backup` skill can exist later as an agent-level
+   convenience, never as the integrity-bearing path.
+   **Accept:** push rate-limit test; nightly snapshot commit test; live
+   smoke — push to a real private repo, clone on a clean dir, import,
+   graph query matches; PAT never logged.
+
+## 13. Phase G — Gateway extraction, then Phase T — Terminal app
 
 ### G1 — Engine facade (prerequisite for T, pure refactor)
 1. Extract from `bot.py` into `engine.py`: the run pipeline (lock →
@@ -812,8 +942,9 @@ Seeded template:
 
 ---
 
-## 12. Phase V — Offline voice
+## 14. Phase V — Voice (offline STT → voice replies → wake-word satellite)
 
+### V1 — Offline transcription
 1. `faster-whisper` optional dependency (`pip install zilla[voice]` /
    requirements-voice.txt). Setting `transcribe = auto|local|online`
    (default `auto` = local if importable, else current online path).
@@ -823,9 +954,40 @@ Seeded template:
    **Accept:** branch tests with mocked model; live smoke: voice note on
    Linux transcribed offline (network blocked) and answered.
 
+### V2 — Voice replies (local TTS)
+1. Piper TTS (local, fast, no keys) as another `zilla[voice]` extra.
+   Setting `voice_replies = auto|always|off` (default `auto`: voice note
+   in ⇒ voice reply out, plus the text). Rendered from the reply text
+   AFTER ZUI blocks are stripped; long replies voice only a spoken-length
+   summary line + full text below (setting `tts_max_secs`, default 45).
+   **Accept:** mode-matrix tests; strip-before-speak test; live smoke —
+   voice note in, voice answer back in Telegram.
+
+### V3 — Wake-word satellite (`zilla-voice`, on the Linux box)
+1. Always-on local loop, zero cloud: **openWakeWord** with a wake word
+   trained on the OWNER's voice — guided enrollment (`zilla voice-train`
+   or via Telegram: "record your wake phrase N times", accepts voice
+   notes), threshold tunable, chime on wake so false accepts are audible,
+   not silent. Silero VAD for end-pointing.
+2. Loop: wake → chime → capture until silence → V1 STT → engine as an
+   owner turn on the active session (normal pipeline: memory, graph,
+   router — the voice is just another connector, per the Gateway
+   principle) → V2 TTS out through the speaker.
+3. Half-duplex, honestly specified: mic input is ignored while speaking
+   EXCEPT the wake-word detector stays live — saying the wake word
+   interrupts playback (barge-in). No full-duplex conversation claim.
+4. Priority: its own systemd unit with `Nice=-5` + high `CPUWeight` (and
+   rtkit for the audio thread when available) so wake→response stays
+   snappy under load; the main Zilla service is NOT reprioritized.
+   Runs only where a mic/speaker exists; auto-disabled headless.
+   **Accept:** wake-detector unit tests on recorded fixtures (owner
+   samples + negatives); barge-in test; end-pointing test; live smoke —
+   wake word from across the room, spoken answer, chat transcript of the
+   exchange visible in Telegram session history.
+
 ---
 
-## 13. Cross-cutting engineering rules
+## 15. Cross-cutting engineering rules
 
 - **Testing:** every phase adds deterministic no-network tests to the suite
   (`test_fixes.py` / new `test_<module>.py` files wired into it). Suite
@@ -845,7 +1007,7 @@ Seeded template:
 - **Secrets:** existing redaction filter covers new logs; memory protocol
   forbids credentials in Markdown; relay answers keep their wipe behavior.
 
-## 14. Risk register (with mitigations already in the plan)
+## 16. Risk register (with mitigations already in the plan)
 
 1. **G1 refactor breaks invariants** → isolated phase, behavior-freeze
    smoke checklist, small commits.
@@ -859,7 +1021,7 @@ Seeded template:
    deterministic empty-file skip, try-acquire (never blocks the owner).
 6. **Memory privacy leak to non-owner users** → §4 scope guard: injection
    is owner-turn-only, enforced by uid with a negative test.
-7. **TUI↔daemon transport under-engineered** → §11 specifies the Unix-socket
+7. **TUI↔daemon transport under-engineered** → §13 specifies the Unix-socket
    JSONL protocol up front; WebBridge explicitly ruled out as transport.
 8. **Fallback to present-but-unauthenticated backend** → chain eligibility
    gated on H2 login-freshness probes (own timer, on-demand refresh).
@@ -878,9 +1040,21 @@ Seeded template:
    already forbids secrets in memory files; additionally `/memory purge
    <pattern>` (owner-only) is specified in M4's scope as a documented
    `git filter-repo` wrapper — destructive, confirm-gated, exact steps in
-   MANUAL.md.
+   MANUAL.md. With C3's remote, purge must force-push and the MANUAL
+   documents that a leaked-then-pushed secret is rotate-not-purge.
+11. **MCP servers / connectors are third-party code** — a supply-chain and
+   prompt-injection surface inside the backends. Mitigation: C2's
+   owner-confirm gate on every addition, per-backend config isolation,
+   secrets via relay only, and M4's memory-change surfacing already
+   covers the "connector content writes memory" path.
+12. **Background tasks can burn quota unattended** → `max_bg_tasks` cap,
+   queueing, usage counters per backend, and creation only via command or
+   explicit owner tap (no model-initiated spawning).
+13. **Wake-word false accepts** (satellite hears TV, triggers a turn) →
+   owner-trained model + tunable threshold + audible chime + everything it
+   heard lands visibly in the session transcript — never a silent action.
 
-## 15. Execution order & progress
+## 17. Execution order & progress
 
 Execute strictly top-to-bottom. Check items off here (this file) as they land.
 
@@ -898,10 +1072,18 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [ ] H1 Heartbeat loop
 - [ ] H2 Health probes + assisted re-login
 - [ ] H3 systemd service
-- [ ] R1 Triage router
+- [ ] H4 Self-update with rollback
+- [ ] B1 Background task lane + /tasks
+- [ ] B2 Incognito sessions
+- [ ] R1 Triage router + effort controller
 - [ ] R2 Fallback chain
 - [ ] R3 opencode adapter
 - [ ] S  Skills from chat
+- [ ] C1 Brain export/import
+- [ ] C2 Connectors screen (MCP/native)
+- [ ] C3 Cloud backup + bootstrap-from-cloud
 - [ ] G1 Engine facade extraction
 - [ ] T1 Terminal app
-- [ ] V  Offline voice
+- [ ] V1 Offline transcription
+- [ ] V2 Voice replies (local TTS)
+- [ ] V3 Wake-word satellite
