@@ -1249,7 +1249,7 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] F1 ZILLA_HOME replaces AGI-Brain (§17) *(done, 894 green)*
 - [x] F2 Dynamic backend registry — no hard-coded backends (§17) *(done, 950 green)*
 - [x] F3 Media importance + retention controls (§17) *(done, 980 green; also built the H1.4b retention-sweep mechanism itself, which H1 never actually shipped)*
-- [ ] F4 System jobs invisible + silent (§17)
+- [x] F4 System jobs invisible + silent (§17) *(done, 1000 green; fixed the real heartbeat-noise bug — non-HEARTBEAT_OK responses no longer broadcast the full raw response, only an explicit OWNER_ALERT: line, cooldown-gated via H2's should_alert/mark_alerted)*
 - [ ] K1 Graph schema + indexer
 - [ ] K2 Entity linking + neighborhood injection
 - [ ] K3 Curiosity loop

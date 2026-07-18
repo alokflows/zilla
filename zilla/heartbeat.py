@@ -67,7 +67,10 @@ def build_beat_prompt(now: datetime, last_run: float | None, tz_name: str,
     return (
         f"{prefix}It is {now.strftime('%Y-%m-%d %H:%M')} ({tz_name}). Last beat: {last}. "
         "Read HEARTBEAT.md. Do anything due; update the file (stamps, checkoffs, "
-        "prune stale items). If nothing needs the owner, reply HEARTBEAT_OK."
+        "prune stale items). Nothing you write here reaches the owner's chat — "
+        "except a line starting exactly \"OWNER_ALERT: <one calm sentence>\", "
+        "the only way to reach them; use it sparingly, only when something "
+        "truly needs them right now. Otherwise reply HEARTBEAT_OK."
     )
 
 
@@ -106,7 +109,7 @@ def ensure_heartbeat_schedule(schedules_mgr: ScheduleManager, owner_chat_id: int
     module's dependency-injection-via-parameter style for `base`."""
     minutes = get_setting(HEARTBEAT_INTERVAL_SETTING, DEFAULT_HEARTBEAT_MINUTES)
     existing = None
-    for row in schedules_mgr.list(owner_chat_id):
+    for row in schedules_mgr.list(owner_chat_id, include_system=True):
         if row.get("system") and row.get("title") == HEARTBEAT_TITLE:
             existing = row
             break

@@ -102,7 +102,7 @@ from keyboards import (
     kb_settings_storage, kb_keep,
     kb_back, kb_error, kb_users, kb_user_detail,
     kb_inbox_categories, kb_inbox_list, kb_outbox_categories, kb_outbox_list,
-    kb_schedules, _can_change_model, _fmt_next,
+    kb_schedules, kb_health, kb_sysjobs, _can_change_model, _fmt_next,
     _IDLE_OPTIONS, _RETENTION_OPTIONS, INBOX_PAGE, INBOX_CAT_META, OUTBOX_CAT_META,
 )
 
@@ -716,6 +716,23 @@ def _schedule_panel_text(items: list) -> str:
     return "\n".join(lines)
 
 
+def _sysjobs_panel_text(items: list) -> str:
+    """Phase F4 (PLAN.md §17): /health → System jobs — the internals
+    /schedules deliberately no longer shows (heartbeat, nightly
+    distillation, any future Zilla-owned job). Status + last run only;
+    no 'next run' countdown clutter, no delete — see kb_sysjobs."""
+    if not items:
+        return "🗄️ System jobs\n══════════════\n\nNone configured."
+    lines = [f"🗄️ System jobs ({len(items)})\n══════════════"]
+    for s in items:
+        state = "✅ running" if s.get("enabled") else "⏸ paused"
+        lines.append(f"{state} — {s.get('title','')[:40]}")
+        lines.append(f"    last run {_fmt_next(s.get('last_run'))}")
+    lines.append("\nTap a row to pause/resume. These never appear in /schedules "
+                 "and their output stays in the log unless something needs you.")
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════
 #  RESPONSE PIPELINE
 # ══════════════════════════════════════════════════════════
@@ -1153,8 +1170,11 @@ DISTILLATION_TITLE = "Nightly memory distillation"
 DISTILLATION_PROMPT = (
     "Read yesterday's Journal file. Move durable facts into the right Wiki "
     "pages (create pages as needed), update MEMORY.md if a standing fact "
-    "changed, then rewrite the journal entry down to its essentials. Reply "
-    "HEARTBEAT_OK when done."
+    "changed, then rewrite the journal entry down to its essentials. Nothing "
+    "you write here reaches the owner's chat — except a line starting "
+    "exactly \"OWNER_ALERT: <one calm sentence>\" (use only for something "
+    "that genuinely needs them, e.g. a conflict you can't resolve). "
+    "Otherwise reply HEARTBEAT_OK when done."
 )
 
 
@@ -2147,7 +2167,25 @@ async def _cb_misc(query, context, data, uid, chat_id):
         )
 
     elif data == "menu_health":
-        await query.edit_message_text(await _health_panel(), reply_markup=kb_back())
+        await query.edit_message_text(await _health_panel(), reply_markup=kb_health())
+
+    elif data == "menu_sysjobs":
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        items = schedules_mgr.list_system(uid)
+        await query.edit_message_text(_sysjobs_panel_text(items), reply_markup=kb_sysjobs(items))
+
+    elif data.startswith("sysjob_toggle_"):
+        if not auth.can(uid, "admin"):
+            await query.answer("Admin access required.", show_alert=True)
+            return
+        sid = data.removeprefix("sysjob_toggle_")
+        s = schedules_mgr.get(sid)
+        if s and s.get("system") and s.get("user_id") == uid:
+            schedules_mgr.set_enabled(sid, uid, not s.get("enabled"))
+        items = schedules_mgr.list_system(uid)
+        await query.edit_message_text(_sysjobs_panel_text(items), reply_markup=kb_sysjobs(items))
 
     elif data == "cancel_active":
         if core.cancel(chat_id, uid):

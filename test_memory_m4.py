@@ -132,7 +132,8 @@ def test_distillation_schedule_seeded_exactly_once():
     s3 = ensure_system_schedule(mgr3, OWNER, title, prompt, "daily", {"hh": 3, "mm": 30})
     check("third 'restart' call still returns the same id", s3["id"] == s1["id"])
 
-    matches = [s for s in mgr3.list(OWNER) if s.get("system") and s.get("title") == title]
+    matches = [s for s in mgr3.list(OWNER, include_system=True)
+               if s.get("system") and s.get("title") == title]
     check("exactly one matching system schedule exists after 3 restarts",
           len(matches) == 1, matches)
     check("seeded schedule runs isolated (throwaway conv, never advances a session)",

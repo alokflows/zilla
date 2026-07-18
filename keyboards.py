@@ -239,6 +239,33 @@ def kb_back():
     ])
 
 
+def kb_health():
+    """Phase F4 (PLAN.md §17): /health gains one entry point into the
+    System jobs sub-panel (heartbeat/distillation/etc — deliberately
+    absent from /schedules now)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗄️ System jobs", callback_data="menu_sysjobs")],
+        [InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()],
+    ])
+
+
+def kb_sysjobs(items: list):
+    """Row per system job: [state · title · last run] toggles pause/resume.
+    Never a delete button — system jobs are pausable only (ScheduleManager.
+    remove refuses them)."""
+    rows = []
+    for s in items:
+        state = "✅" if s.get("enabled") else "⏸"
+        title = s.get("title", "")[:40]
+        rows.append([InlineKeyboardButton(
+            f"{state} {title} · last {_fmt_next(s.get('last_run'))}",
+            callback_data=f"sysjob_toggle_{s['id']}",
+        )])
+
+    rows.append([InlineKeyboardButton("◀ Health", callback_data="menu_health"), _close_btn()])
+    return InlineKeyboardMarkup(rows)
+
+
 def kb_error():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Retry", callback_data="err_retry"),

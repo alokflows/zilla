@@ -237,7 +237,7 @@ def ensure_system_schedule(mgr: "ScheduleManager", owner_chat_id: int, title: st
     schedules, so calling this on every startup never creates a second
     copy — the accept criterion is "exists exactly once after double
     restart". Returns the existing or newly created schedule dict."""
-    for s in mgr.list(owner_chat_id):
+    for s in mgr.list(owner_chat_id, include_system=True):
         if s.get("system") and s.get("title") == title:
             return s
     return mgr.add(owner_chat_id, owner_chat_id, prompt, kind, spec,
@@ -330,11 +330,24 @@ class ScheduleManager:
         self._store.schedules_update(sid, **fields)
         return True
 
-    def list(self, user_id: int) -> list[dict]:
+    def list(self, user_id: int, include_system: bool = False) -> list[dict]:
+        """Phase F4 (PLAN.md §17): system=1 rows (heartbeat, nightly
+        distillation, any future Zilla-owned job) are hidden by default —
+        /schedules is for the owner's OWN schedules only. Internal callers
+        that need to find-or-create/reconcile a system row (ensure_system_
+        schedule, ensure_heartbeat_schedule) pass include_system=True."""
         rows = self._store.schedules_list(user_id)
         items = [_to_dict(r) for r in rows]
+        if not include_system:
+            items = [s for s in items if not s.get("system")]
         items.sort(key=lambda s: (not s.get("enabled"), s.get("next_run") or 1e18))
         return items
+
+    def list_system(self, user_id: int) -> list[dict]:
+        """Phase F4: the counterpart to list()'s now-filtered default view —
+        every Zilla-owned job, for /health → System jobs (status/last run/
+        pause; never deletable, see remove())."""
+        return [s for s in self.list(user_id, include_system=True) if s.get("system")]
 
     def touch_run(self, sid: str, now: float | None = None):
         """Mark a schedule as just-run and advance to its next occurrence."""

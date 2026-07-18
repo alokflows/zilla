@@ -517,6 +517,57 @@ def _read_bot_source() -> str:
         return f.read()
 
 
+# ══════════════════════════════════════════════════════════
+#  F4 (PLAN.md §17) — system jobs invisible + silent
+# ══════════════════════════════════════════════════════════
+
+def test_kb_health_links_to_sysjobs():
+    import keyboards
+    markup = keyboards.kb_health()
+    callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    check("health kb: has a way into System jobs", "menu_sysjobs" in callbacks, callbacks)
+
+
+def test_kb_sysjobs_renders_status_and_toggle_no_delete():
+    import keyboards
+    items = [
+        {"id": "abc123", "title": "Heartbeat beat", "enabled": True, "last_run": None},
+        {"id": "def456", "title": "Nightly memory distillation", "enabled": False, "last_run": None},
+    ]
+    markup = keyboards.kb_sysjobs(items)
+    labels = [btn.text for row in markup.inline_keyboard for btn in row]
+    callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    check("sysjobs kb: enabled job shows a running marker",
+          any("✅" in lbl and "Heartbeat" in lbl for lbl in labels), labels)
+    check("sysjobs kb: paused job shows a paused marker",
+          any("⏸" in lbl and "distillation" in lbl for lbl in labels), labels)
+    check("sysjobs kb: toggle callback per job",
+          "sysjob_toggle_abc123" in callbacks and "sysjob_toggle_def456" in callbacks, callbacks)
+    check("sysjobs kb: no delete callback anywhere (never deletable)",
+          not any("del" in (c or "") for c in callbacks), callbacks)
+
+
+def test_bot_wires_sysjobs_callbacks():
+    # Structural grep-gate, same style as test_bot_wires_storage_and_keep_callbacks.
+    bot_src = _read_bot_source()
+    for needle in ('data == "menu_sysjobs"', 'data.startswith("sysjob_toggle_")'):
+        check(f"bot.py: {needle} branch present", needle in bot_src, needle)
+    check("bot.py: menu_health renders kb_health() (the System jobs entry point)",
+          "await query.edit_message_text(await _health_panel(), reply_markup=kb_health())"
+          in bot_src)
+    check("bot.py: sysjobs panel driven by schedules_mgr.list_system(), "
+          "not the owner-schedule list()",
+          "schedules_mgr.list_system(uid)" in bot_src)
+
+
+def test_schedule_manager_list_system_method_exists():
+    # Cheap smoke test that the F4 store-layer method this whole panel is
+    # built on actually exists and returns a list (full behavioral coverage
+    # is in test_fixes.py's schedule tests, which have DB isolation).
+    from zilla.schedules import ScheduleManager
+    check("ScheduleManager exposes list_system", hasattr(ScheduleManager, "list_system"))
+
+
 def main():
     tests = [
         test_mask_token,
@@ -554,6 +605,10 @@ def main():
         test_kb_settings_storage_renders_current_selection,
         test_kb_keep_uses_stable_token_callback,
         test_bot_wires_storage_and_keep_callbacks,
+        test_kb_health_links_to_sysjobs,
+        test_kb_sysjobs_renders_status_and_toggle_no_delete,
+        test_bot_wires_sysjobs_callbacks,
+        test_schedule_manager_list_system_method_exists,
     ]
     print("Running zilla.cli / configmenu / security / doctor tests...\n")
     global _failed

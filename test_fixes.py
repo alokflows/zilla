@@ -796,6 +796,43 @@ def test_schedule_remove_and_owner_scope():
 
 
 # ════════════════════════════════════════════════════════════
+#  F4 (PLAN.md §17) — system jobs invisible + silent
+# ════════════════════════════════════════════════════════════
+
+def test_schedule_list_hides_system_jobs_by_default():
+    # This IS the "migration" accept criterion (PLAN.md §17/F4 step 2):
+    # a system=1 row created before this phase existed (M4's distillation,
+    # H1's heartbeat both pre-date F4) is already correctly flagged in the
+    # DB — list()'s new default filter alone strips it from the owner-
+    # schedule view, no data migration needed.
+    sm = _sm()
+    user = sm.add(9, 9, "my own reminder", "daily", {"hh": 9, "mm": 0})
+    sys_job = sm.add(9, 9, "beat", "interval", {"seconds": 60}, system=True)
+    check("sched: list() hides the system row by default",
+          [s["id"] for s in sm.list(9)] == [user["id"]])
+    check("sched: list(include_system=True) shows both",
+          {s["id"] for s in sm.list(9, include_system=True)} == {user["id"], sys_job["id"]})
+    check("sched: list_system() shows ONLY the system row",
+          [s["id"] for s in sm.list_system(9)] == [sys_job["id"]])
+
+
+def test_ensure_system_schedule_still_finds_existing_across_restart():
+    # F4 changed list()'s default; ensure_system_schedule's own internal
+    # lookup must keep passing include_system=True or it would "forget"
+    # every existing system job and duplicate it on every restart.
+    from schedules import ensure_system_schedule
+    sm = _sm()
+    first = ensure_system_schedule(sm, 9, "Nightly memory distillation",
+                                   "placeholder", "daily", {"hh": 3, "mm": 30})
+    second = ensure_system_schedule(sm, 9, "Nightly memory distillation",
+                                    "placeholder", "daily", {"hh": 3, "mm": 30})
+    check("ensure_system_schedule: idempotent even though list() now filters by default",
+          first["id"] == second["id"])
+    check("sched: exactly one system row exists, not two",
+          len(sm.list_system(9)) == 1)
+
+
+# ════════════════════════════════════════════════════════════
 #  NL PARSER + LIMIT DETECTION
 # ════════════════════════════════════════════════════════════
 
@@ -1465,6 +1502,8 @@ def main():
         test_schedule_reconcile_catchup,
         test_schedule_failure_retry,
         test_schedule_remove_and_owner_scope,
+        test_schedule_list_hides_system_jobs_by_default,
+        test_ensure_system_schedule_still_finds_existing_across_restart,
         test_parse_schedule_forms,
         test_parse_schedule_command_forms,
         test_detect_limit,

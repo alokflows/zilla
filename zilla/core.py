@@ -35,6 +35,7 @@
 import asyncio
 import logging
 import os
+import re
 import secrets
 import shutil
 import threading
@@ -148,6 +149,12 @@ def _quiet_heartbeat_suppressed(s: dict, response: str) -> bool:
     if not stripped:
         return False
     return stripped.splitlines()[-1].strip().casefold() == "heartbeat_ok"
+
+
+# Phase F4 (PLAN.md §17): the ONE way a system job's output can reach the
+# owner's chat (see ZillaCore._maybe_alert_owner_from_system_job below) —
+# everything else a system job writes is log-only by design.
+_OWNER_ALERT_RE = re.compile(r"^OWNER_ALERT:\s*(.+)$", re.MULTILINE)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1130,17 +1137,37 @@ class ZillaCore:
         await self._autocommit_memory(f"schedule — {title}"[:80], untrusted=sched_untrusted)
         self.schedules.touch_run(sid)
         if ok:
-            log_event("schedule_ok", id=sid, title=title[:40])
-            if _quiet_heartbeat_suppressed(s, response):
-                log_event("schedule_quiet", id=sid, title=title[:40])
-                return
-            self._broadcast(ScheduledResult(
-                title=title, response=response, chat_id=s["chat_id"], user_id=s["user_id"],
-                schedule_id=sid, session=meta.get("session"), conv_id=meta.get("conv_id"),
-            ))
+            # Phase F4 (PLAN.md §17) output contract: a system job never
+            # announces itself — no "⏰ Scheduled — <title>" header, no
+            # result DM, ever (this SUPERSEDES the old HEARTBEAT_OK
+            # quiet-run distinction for system jobs: EVERY successful
+            # system-job output is silent by default now, not just the
+            # ones ending in that exact token). The full output still
+            # goes to the log; the only thing that can reach the owner's
+            # chat is a cooldown-gated OWNER_ALERT: line.
+            log_event("schedule_ok", id=sid, title=title[:40], response=(response or "")[:500])
+            self._maybe_alert_owner_from_system_job(sid, response)
             return
         log_event("schedule_failed", id=sid, title=title[:40], detail=(detail or "")[:200])
         # No retry ladder, no give-up DM — see docstring above.
+
+    def _maybe_alert_owner_from_system_job(self, sid: str, response: str) -> None:
+        """Phase F4 (PLAN.md §17): extract the first OWNER_ALERT: line (if
+        any) from a system job's response and DM just that — one calm
+        line, never the raw output. Cooldown-gated per schedule, reusing
+        H2's should_alert/mark_alerted (health.py), so a job that keeps
+        finding the same thing worth flagging pings once per cooldown
+        window instead of every tick."""
+        match = _OWNER_ALERT_RE.search(response or "")
+        if not match:
+            return
+        from zilla import health as _health
+        kind = f"schedule_alert:{sid}"
+        if not _health.should_alert(kind):
+            return
+        self._broadcast(Alert(text=match.group(1).strip()))
+        _health.mark_alerted(kind)
+        log_event("schedule_owner_alert", id=sid)
 
     async def _run_and_record(self, s: dict) -> None:
         """Tick-loop path: run a due schedule, broadcast the result, and

@@ -76,7 +76,7 @@ import zilla.memory as memory  # noqa: E402
 import zilla.core as zcore  # noqa: E402
 import zilla.cli_engine as cli_engine  # noqa: E402
 import zilla.heartbeat as heartbeat  # noqa: E402
-from zilla.core import ZillaCore, ScheduledResult  # noqa: E402
+from zilla.core import ZillaCore, ScheduledResult, Alert  # noqa: E402
 from zilla.sessions import SessionManager  # noqa: E402
 from zilla.users import AuthManager  # noqa: E402
 from zilla.schedules import ScheduleManager, ensure_system_schedule  # noqa: E402
@@ -169,6 +169,8 @@ def test_build_beat_prompt_format():
     check("last=never when no prior run", "Last beat: never." in p_never)
     check("instructs reading HEARTBEAT.md", "Read HEARTBEAT.md" in p_never)
     check("instructs the HEARTBEAT_OK ack", "reply HEARTBEAT_OK" in p_never)
+    check("F4: teaches the OWNER_ALERT: escape hatch as the only way out",
+          'OWNER_ALERT: <one calm sentence>' in p_never, p_never)
 
     last_ts = datetime(2026, 7, 18, 8, 35).timestamp()
     p_prior = heartbeat.build_beat_prompt(now, last_ts, "PDT")
@@ -214,7 +216,7 @@ def test_ensure_heartbeat_schedule_idempotent_and_toggle():
 
     mgr1 = ScheduleManager(db_path)
     heartbeat.ensure_heartbeat_schedule(mgr1, OWNER, get_setting_30)
-    matches = [s for s in mgr1.list(OWNER)
+    matches = [s for s in mgr1.list(OWNER, include_system=True)
                if s.get("system") and s.get("title") == heartbeat.HEARTBEAT_TITLE]
     check("first call creates exactly one heartbeat schedule", len(matches) == 1, matches)
     sid = matches[0]["id"]
@@ -230,7 +232,7 @@ def test_ensure_heartbeat_schedule_idempotent_and_toggle():
     heartbeat.ensure_heartbeat_schedule(mgr2, OWNER, get_setting_30)
     mgr3 = ScheduleManager(db_path)
     heartbeat.ensure_heartbeat_schedule(mgr3, OWNER, get_setting_30)
-    matches3 = [s for s in mgr3.list(OWNER)
+    matches3 = [s for s in mgr3.list(OWNER, include_system=True)
                 if s.get("system") and s.get("title") == heartbeat.HEARTBEAT_TITLE]
     check("still exactly one after two more restarts", len(matches3) == 1, matches3)
     check("same schedule id preserved", matches3[0]["id"] == sid)
@@ -456,8 +458,9 @@ def test_run_and_record_system_skips_when_heartbeat_empty():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_run_and_record_system_fires_with_injected_prompt_and_delivers():
-    print("\n[11] _run_and_record_system — actionable file -> injected prompt, non-OK response delivered")
+def test_run_and_record_system_fires_with_injected_prompt_and_stays_silent():
+    print("\n[11] _run_and_record_system — actionable file -> injected prompt, "
+         "non-OWNER_ALERT response stays silent (F4: no more heartbeat noise)")
     tmp, old = _iso_mem_dir()
     try:
         memory.ensure_tree()  # real template -> actionable
@@ -482,7 +485,7 @@ def test_run_and_record_system_fires_with_injected_prompt_and_delivers():
         async def run():
             with _patched(fake_run):
                 await core._run_and_record(s)
-            return await _drain(sink, 1, timeout=1.0)
+            return await _drain(sink, 1, timeout=0.5)
 
         events = asyncio.run(run())
         check("the CLI WAS invoked (file had actionable content)", len(seen_prompts) == 1)
@@ -491,10 +494,124 @@ def test_run_and_record_system_fires_with_injected_prompt_and_delivers():
               seen_prompts)
         check("beat prompt tells the agent to read HEARTBEAT.md",
               seen_prompts and "Read HEARTBEAT.md" in seen_prompts[0], seen_prompts)
-        check("non-OK response IS delivered", len(events) == 1, events)
-        check("delivered event carries the real response",
-              events and isinstance(events[0], ScheduledResult)
-              and "invoice" in events[0].response, events)
+        check("beat prompt teaches the OWNER_ALERT: escape hatch",
+              seen_prompts and "OWNER_ALERT:" in seen_prompts[0], seen_prompts)
+        check("F4: a plain non-OK response with no OWNER_ALERT: line delivers NOTHING "
+              "(no more '⏰ Scheduled — Heartbeat beat' noise)", events == [], events)
+    finally:
+        memory.MEMORY_DIR = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_run_and_record_system_owner_alert_line_delivers_as_alert():
+    print("\n[11b] _run_and_record_system — OWNER_ALERT: line -> one calm Alert, "
+         "rest of the response never leaves the log")
+    tmp, old = _iso_mem_dir()
+    try:
+        memory.ensure_tree()
+        sessions = SessionManager(os.path.join(_tmpdir, "sessions_h1_alert.json"))
+        auth = AuthManager(os.path.join(_tmpdir, "users_h1_alert.json"), OWNER)
+        schedules = ScheduleManager(os.path.join(_tmpdir, "schedules_h1_alert.json"))
+        core = ZillaCore(sessions=sessions, auth=auth, schedules=schedules)
+        sink = asyncio.Queue()
+        core.subscribe(sink)
+
+        async def fake_run(prompt, conv_id, progress_callback=None,
+                           cancel_event=None, skip_permissions=False, ctx=None):
+            return ("checked the invoice thread, nothing new\n"
+                    "OWNER_ALERT: the electricity bill is 3x normal this month\n"
+                    "updated HEARTBEAT.md"), "conv-y2"
+
+        s = schedules.add(OWNER, OWNER, "placeholder", "interval",
+                          {"seconds": 1800, "_catchup": "skip"},
+                          title=heartbeat.HEARTBEAT_TITLE, system=True)
+
+        async def run():
+            with _patched(fake_run):
+                await core._run_and_record(s)
+            return await _drain(sink, 1, timeout=0.5)
+
+        events = asyncio.run(run())
+        check("exactly one event reached the owner", len(events) == 1, events)
+        check("it's an Alert, not a ScheduledResult (no '⏰ Scheduled —' header)",
+              events and isinstance(events[0], Alert), events)
+        check("it carries ONLY the OWNER_ALERT line, not the whole response",
+              events and events[0].text == "the electricity bill is 3x normal this month",
+              events)
+    finally:
+        memory.MEMORY_DIR = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_run_and_record_system_owner_alert_is_cooldown_gated():
+    print("\n[11c] _run_and_record_system — a repeated OWNER_ALERT: for the same "
+         "schedule only DMs once per cooldown window")
+    tmp, old = _iso_mem_dir()
+    try:
+        memory.ensure_tree()
+        from zilla import health as health_mod
+        health_mod.reset_cache()
+        sessions = SessionManager(os.path.join(_tmpdir, "sessions_h1_cd.json"))
+        auth = AuthManager(os.path.join(_tmpdir, "users_h1_cd.json"), OWNER)
+        schedules = ScheduleManager(os.path.join(_tmpdir, "schedules_h1_cd.json"))
+        core = ZillaCore(sessions=sessions, auth=auth, schedules=schedules)
+        sink = asyncio.Queue()
+        core.subscribe(sink)
+
+        async def fake_run(prompt, conv_id, progress_callback=None,
+                           cancel_event=None, skip_permissions=False, ctx=None):
+            return "OWNER_ALERT: same thing again", "conv-y3"
+
+        s = schedules.add(OWNER, OWNER, "placeholder", "interval",
+                          {"seconds": 1800, "_catchup": "skip"},
+                          title=heartbeat.HEARTBEAT_TITLE, system=True)
+
+        async def run_twice():
+            with _patched(fake_run):
+                await core._run_and_record(s)
+                await core._run_and_record(s)
+            return await _drain(sink, 2, timeout=0.5)
+
+        events = asyncio.run(run_twice())
+        check("only the FIRST fire's alert made it through the cooldown",
+              len(events) == 1, events)
+    finally:
+        health_mod.reset_cache()
+        memory.MEMORY_DIR = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_run_and_record_system_silence_is_not_title_specific():
+    print("\n[11d] _run_and_record_system — the silence contract applies to ANY "
+         "system=1 job, not just the heartbeat (a future 'snapshot' job etc.)")
+    tmp, old = _iso_mem_dir()
+    try:
+        memory.ensure_tree()
+        sessions = SessionManager(os.path.join(_tmpdir, "sessions_h1_generic.json"))
+        auth = AuthManager(os.path.join(_tmpdir, "users_h1_generic.json"), OWNER)
+        schedules = ScheduleManager(os.path.join(_tmpdir, "schedules_h1_generic.json"))
+        core = ZillaCore(sessions=sessions, auth=auth, schedules=schedules)
+        sink = asyncio.Queue()
+        core.subscribe(sink)
+
+        async def fake_run(prompt, conv_id, progress_callback=None,
+                           cancel_event=None, skip_permissions=False, ctx=None):
+            return "did some routine internal upkeep, nothing owner-facing", conv_id
+
+        # Deliberately NOT heartbeat.HEARTBEAT_TITLE — prepare_beat() passes
+        # any other title through unchanged, so this exercises the plain
+        # message-payload path a hypothetical future system job would use.
+        s = schedules.add(OWNER, OWNER, "do the routine thing", "interval",
+                          {"seconds": 3600}, title="Some future system job", system=True)
+
+        async def run():
+            with _patched(fake_run):
+                await core._run_and_record(s)
+            return await _drain(sink, 1, timeout=0.5)
+
+        events = asyncio.run(run())
+        check("no ScheduledResult (or anything else) for a non-heartbeat "
+              "system job's plain output", events == [], events)
     finally:
         memory.MEMORY_DIR = old
         shutil.rmtree(tmp, ignore_errors=True)
@@ -605,7 +722,10 @@ if __name__ == "__main__":
         test_gc_orphaned_conv_dirs_missing_brain_dir_is_safe_noop,
         test_all_conversation_ids,
         test_run_and_record_system_skips_when_heartbeat_empty,
-        test_run_and_record_system_fires_with_injected_prompt_and_delivers,
+        test_run_and_record_system_fires_with_injected_prompt_and_stays_silent,
+        test_run_and_record_system_owner_alert_line_delivers_as_alert,
+        test_run_and_record_system_owner_alert_is_cooldown_gated,
+        test_run_and_record_system_silence_is_not_title_specific,
         test_run_and_record_system_suppresses_heartbeat_ok,
         test_run_and_record_system_busy_lock_skips_without_running,
         test_harness_has_heartbeat_protocol_line,
