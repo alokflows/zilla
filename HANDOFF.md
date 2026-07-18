@@ -304,22 +304,35 @@ code existed, so its phase list doesn't know P1.5/CLI/TUI/approvals are
 already done — the reconciliation checklist below maps PLAN.md's phases
 onto that reality. **M1 (`store.py` + migration) is COMPLETE — every
 step and every accept-criteria test from PLAN.md §5.M1 is committed and
-green.** **NEXT UNIT OF WORK: Phase M2 — Memory layout
-(`AGI-Brain/Memory/`) + injection** (PLAN.md §5.M2), full test gate
-before and after.
+green.** **M2 (Memory layout + injection + `TurnContext` threading) is
+COMPLETE** (PLAN.md §5.M2) — see checklist + session log below.
+**NEXT UNIT OF WORK: Phase M3 — FTS5 search + memory git + quiet-run
+mode**, full test gate before and after.
 **Working branch (source of truth):** `claude/zilla-harness-review-0v96bs`
-**Tests:** 260+16+116+57 core + 71 review + 17 tui + 69 cli = **606 green**
-— `.venv/bin/python test_fixes.py / test_interactive.py / test_core.py /
-test_schedules_seam.py / test_review.py / test_tui.py / test_zilla_cli.py`
-(test_schedules_seam.py is a frozen acceptance spec — never edit it) +
-`import bot; import zilla.core; import zilla.cli; import zilla.tui.app`.
+**Tests:** 260+16+116+57 core + 71 review + 17 tui + 69 cli + 46 harness =
+**652 green** — `.venv/bin/python test_fixes.py / test_interactive.py /
+test_core.py / test_schedules_seam.py / test_review.py / test_tui.py /
+test_zilla_cli.py / test_harness.py` (test_schedules_seam.py is a frozen
+acceptance spec — never edit it) + `import bot; import zilla.core; import
+zilla.cli; import zilla.tui.app`.
 M1 note: importing `bot` now safely exercises `_harden_file_perms`/
 `_maybe_backup_db` against tmp paths (see `bot._harden_file_perms`'s
 `base=` param) — never the real repo's `.env`/`sessions.json`/`zilla.db`.
+M2 note: `test_harness.py` isolates `zilla.memory.MEMORY_DIR` AND
+`config.DB_FILE`/`SETTINGS_FILE` before calling `build_preamble` — the
+latter is a real trap: `operating_contract()`/`get_backend()` read
+`get_setting()` which lazily creates the real repo `zilla.db` on first
+touch if `SETTINGS_FILE` isn't redirected first (caught live during this
+session — a stray real `zilla.db` got created and had to be deleted;
+confirmed empty, no migration ran, safe).
 **Bot:** live on the owner's MacBook (@Mangomangos_bot; `.env` exists here,
 git-ignored). After changing `bot.py`: `zilla stop` + `zilla start` (or
 `.venv/bin/python -m zilla.cli stop/start`), confirm "Application started"
-in its log.
+in its log. **M2 has not yet been live-smoked against the real bot process**
+(that needs the owner's Telegram token/session — starting it is the
+owner's call, not something to trigger unattended); do that before or
+during the M3 session — first message after restart should show the
+first-run interview line if `Memory/MEMORY.md` is still the template.
 
 ### Checklist
 
@@ -333,8 +346,8 @@ in its log.
 
 **PLAN.md phases (strict order, §13 — do not skip ahead):**
 - [x] **M1** `store.py` (SQLite+WAL) + first-start migration from the 5 JSON files — DONE 2026-07-18 (6 commits, `store.py`/thin wrappers/migration/doctor DB checks/audit-debt burn-down/secrets hygiene+backup/acceptance tests). 606 green.
-- [ ] **M2** Memory layout (`AGI-Brain/Memory/`) + injection + `TurnContext` threading — genuinely new. NEXT.
-- [ ] **M3** FTS5 search + memory git + quiet-run mode — genuinely new.
+- [x] **M2** Memory layout (`Memory/` — `config.MEMORY_DIR`, repo root, per M1's forward-declaration, not literal `~/AGI-Brain/Memory`) + owner-only injection + `TurnContext` threading — DONE 2026-07-18. 652 green.
+- [ ] **M3** FTS5 search + memory git + quiet-run mode — genuinely new. NEXT.
 - [ ] **M4** Nightly distillation + `/memory` command + change surfacing — genuinely new.
 - [ ] **H1** Heartbeat loop — genuinely new.
 - [ ] **H2** Health probes + assisted re-login — PARTIAL: earlier P7 health-loop WIP exists (stashed, `git stash list` → "P7 health-loop WIP"), built before PLAN.md was found; PLAN.md's H2 spec is more precise (explicit "do not build speculative login automation" ceiling) — treat the stash as reference only, re-derive from PLAN.md's spec rather than popping it verbatim.
@@ -364,6 +377,7 @@ in its log.
 | 2026-07-17 pm | P1.5 router merged (built in parallel worktree): `zilla/review.py` gate + triage, harness `_SELF_HEAL`, smalltalk fast path (`claude --model haiku`), share→wiki journal, steal #36, 👀 ack + Progress→⏳-bubble. Orchestrator patched `_SELF_HEAL` post-merge to restore the spec's destructive/irreversible/costs-money stop-condition. Bot restarted on merged code. Awaiting owner live smoke. |
 | 2026-07-17 eve | GOD MODE round 2 FAILED: 5 parallel Sonnet executors (P7/P2-onboarding/P8/P9/P6) killed by the shared usage limit in ~5 min, zero commits; worktrees deleted (only scrap: partial tui/wizard.py, discarded). Salvage: `faster-whisper` is already pip-installed in `.venv` (P9/V can skip that step). Owner decree: parallel fan-out BANNED → serial execution protocol. Antigravity suggestions reviewed → verdicts in Notes; P11 WhatsApp connector parked. |
 | 2026-07-18 | **M1 COMPLETE** (6 commits): `store.py` (SQLite+WAL, typed accessors); sessions/schedules/users/config swapped to thin store wrappers; first-start migration of the 5 legacy JSON files (idempotent, rename-after-commit); `install.py --doctor` DB checks; audit-debt burn-down (tz-aware `compute_next_run` via `zoneinfo`, `_active_cancel` keyed `(chat_id, uid)`, `max_media_mb` ingest cap); secrets hygiene (`_harden_file_perms` covers `zilla.db*`/`Memory/`, nightly `VACUUM INTO` → `zilla.db.bak`+`.bak.1` rotation via a new `_backup_loop` task); every PLAN.md accept-criteria test committed (concurrent-mutation, reader-never-blocks, DST both directions, cancel-keying, media-cap, perms, doctor-OK). 606 green. Production `sessions.json`/`schedules.json` confirmed untouched throughout — no real `zilla.db` was ever created by a test run. |
+| 2026-07-18 | **M2 COMPLETE**: `zilla/memory.py` (Markdown knowledge tier — `ensure_tree`/`read_core`/`is_template`/`wiki_index_text`/`append_journal`, idempotent, never clobbers an owner's edits); `TurnContext` dataclass (`uid`/`role`/`is_owner`/`origin`) threaded explicitly (never a module-level global — an adversarially-reviewed constraint, since the 4-thread executor pool would race an ambient global) through `handle_message` → `run_cli_async` → `_run_blocking` → `_dispatch_turn` → `run_cli`/`run_claude` → `wrap_prompt`/`build_preamble`; owner-only "Your memory" block injected every owner turn (MEMORY.md + wiki index + memory protocol), soft-cap warning (2400 chars) + hard-cap truncation (4000 chars) + first-run interview line while MEMORY.md is still the template + a memsearch.py line that self-activates once M3 ships it (checks the file exists, no code change needed then); P1.5 'share' route redirected from the old `WIKI_JOURNAL_DIR` to `Memory/Journal/` and gated owner-only (a non-owner's "share"-shaped message now falls through to the full route instead of writing into the owner's journal); retired `WIKI_DIR`/`WIKI_JOURNAL_DIR` from `config.py` (only consumer was the route just redirected). New `test_harness.py` (46 tests: tree/idempotency, template detection, wiki index format+cap, journal append, TurnContext shape, injection gating, first-run line, caps, memsearch conditional, and a real-thread concurrent two-principal isolation test proving an owner turn and a non-owner turn interleaved on the executor never cross-contaminate). 652 green. Production `sessions.json`/`schedules.json` confirmed untouched; a stray real `zilla.db` got created mid-session by an under-isolated `test_harness.py` draft (traced to `get_setting()` touching `config.DB_FILE` before it was redirected) — deleted (confirmed empty, no migration ran) and the test fixed. **Known gap, owner-confirmed deferral:** `_execute_message_schedule`'s `run_cli_async` call is NOT wired with `ctx=` — `test_schedules_seam.py` is a frozen acceptance spec whose `fake_run` mocks have fixed signatures with no room for a new kwarg. Schedule-triggered turns get no memory injection until a later phase revisits the frozen spec.
 | 2026-07-17 night | Paused mid-build on a P7 health-loop (stashed, uncommitted — `zilla/core.py` health task + `bot.py` alert-runbook rendering) when the owner surfaced `PLAN.md`: a separate, from-scratch, adversarially-reviewed plan (Fable + owner) found on remote branch `claude/python-cli-bot-planning-80x8a3` (not yet fetched locally before this session — discovered via `git fetch --prune`). That branch forked at `85d5893`, before P1.5/CLI/TUI/approvals existed, and has no code changes of its own — docs only. Owner decision (asked directly): bring PLAN.md onto this shipped-code branch rather than switch branches or discard either plan. PLAN.md copied here as a new file; this file's old §6 (P0-P10) and status board reconciled to point at PLAN.md's M/H/R/S/G/T/V order (see notice at top). Old antigravity verdict rejecting SQLite (below) is now superseded — PLAN.md's adoption of SQLite+WAL for M1 is the settled decision. |
 
 ### Notes (only what a future session needs)
@@ -410,3 +424,11 @@ in its log.
   4. *Instructor/Pydantic auto-retry* — REJECTED: we don't force JSON out
      of CLIs (review() is deterministic on plain text), and silent model
      retries burn the usage budget we just learned is scarce.
+- **M2 known gap (owner-confirmed 2026-07-18, via explicit AskUserQuestion):
+  schedule-triggered turns get no memory injection.** `_execute_message_schedule`
+  in `core.py` calls `run_cli_async` without a `ctx=`/`TurnContext` — wiring
+  it would require `test_schedules_seam.py`'s frozen `fake_run` mocks to
+  accept a new kwarg, and that file is marked "never edit it." Live chat
+  and Approval-mode runs (the actual PLAN.md §5.M2 accept-criteria paths)
+  are fully wired. Revisit only if a future phase either needs schedule-path
+  memory or gets explicit owner sign-off to touch the frozen spec.
