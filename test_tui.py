@@ -153,7 +153,7 @@ def test_home_to_chat_round_trip():
     app = _app(core)
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         if progress_callback:
             progress_callback("Reading files…")
         return f"Echo: {prompt}", "conv-tui-1"

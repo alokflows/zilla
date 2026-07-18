@@ -44,13 +44,18 @@ with open(_fake_agy, "w", encoding="utf-8") as f:
     json.dump({"model": "Gemini 3.1 Pro (High)"}, f)
 os.environ["AGY_SETTINGS_FILE"] = _fake_agy
 os.environ["BACKEND"] = "agy"
-# P1.5 'share' route writes into the wiki journal — point it at the same
-# throwaway tmpdir so a test run never touches the real ~/AGI-Brain.
-os.environ["WIKI_DIR"] = os.path.join(_tmpdir, "wiki")
 
 import zilla.config as config  # noqa: E402
 config.SETTINGS_FILE = os.path.join(_tmpdir, "bot_settings.json")
 config._settings_cache = None
+
+import zilla.memory as memory  # noqa: E402
+# P1.5 'share' route + harness memory injection both read/write
+# zilla.memory's own module-level MEMORY_DIR (bound at import time from
+# zilla.config) — point it at the same throwaway tmpdir so a test run
+# never touches the real repo Memory/ tree (same pattern bot.py's
+# _harden_file_perms tests use for MEMORY_DIR).
+memory.MEMORY_DIR = os.path.join(_tmpdir, "Memory")
 
 import zilla.core as zcore  # noqa: E402
 from zilla.core import (  # noqa: E402
@@ -113,7 +118,7 @@ def test_event_sequence():
     core = _fresh_core("seq")
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         if progress_callback:
             progress_callback("Reading files…")
             progress_callback("Writing answer…")
@@ -150,7 +155,7 @@ def test_session_bookkeeping():
     uid = OWNER
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         return "done", "conv-new-1"
 
     async def run():
@@ -174,7 +179,7 @@ def test_session_bookkeeping():
     seen = {}
 
     async def fake_run2(prompt, conv_id, progress_callback=None,
-                        cancel_event=None, skip_permissions=False):
+                        cancel_event=None, skip_permissions=False, ctx=None):
         seen["conv"] = conv_id
         return "again", "conv-new-1"
 
@@ -195,7 +200,7 @@ def test_lock_serialization():
     running = {"now": 0, "max": 0, "order": []}
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         running["now"] += 1
         running["max"] = max(running["max"], running["now"])
         running["order"].append(f"start:{prompt}")
@@ -220,7 +225,7 @@ def test_lock_serialization():
     running2 = {"now": 0, "max": 0}
 
     async def fake_run2(prompt, conv_id, progress_callback=None,
-                        cancel_event=None, skip_permissions=False):
+                        cancel_event=None, skip_permissions=False, ctx=None):
         running2["now"] += 1
         running2["max"] = max(running2["max"], running2["now"])
         await asyncio.sleep(0.05)
@@ -248,7 +253,7 @@ def test_cancel():
     uid = OWNER
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         # Behave like the engine: run until canceled, then hand back the
         # transcript-only partial with a status header (I-CANCEL shape).
         for _ in range(200):
@@ -297,7 +302,7 @@ def test_cancel_group_chat_keying():
     user_a, user_b = 201, 202
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         for _ in range(200):
             if cancel_event.is_set():
                 return "🛑 Canceled — partial result so far.", None
@@ -344,7 +349,7 @@ def test_error_cleanup():
     core = _fresh_core("err")
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         raise RuntimeError("CLI exploded")
 
     async def run():
@@ -734,7 +739,7 @@ def test_approval_approve_runs_and_clears():
     uid = 555
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         check("skip_permissions passed through (owner already vetted)",
               skip_permissions is True)
         return f"ran: {prompt}", "conv-appr-1"
@@ -790,7 +795,7 @@ def test_approval_shares_per_user_lock():
     running = {"now": 0, "max": 0, "order": []}
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         running["now"] += 1
         running["max"] = max(running["max"], running["now"])
         running["order"].append(f"start:{prompt}")
@@ -836,7 +841,7 @@ def test_triage_share_route_journals_and_zero_model_calls():
     called = {"n": 0}
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         called["n"] += 1
         return "SHOULD NOT BE CALLED", None
 
@@ -851,7 +856,7 @@ def test_triage_share_route_journals_and_zero_model_calls():
     check("ack text", responses and responses[0].text == "📝 Noted.",
           responses[0].text if responses else None)
 
-    journal_path = os.path.join(config.WIKI_JOURNAL_DIR,
+    journal_path = os.path.join(memory.MEMORY_DIR, memory.JOURNAL_DIRNAME,
                                 time.strftime("%Y-%m-%d.md"))
     check("journal file created", os.path.isfile(journal_path), journal_path)
     with open(journal_path, encoding="utf-8") as f:
@@ -868,7 +873,7 @@ def test_triage_smalltalk_fast_path():
     called = {"n": 0}
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         called["n"] += 1
         return "SHOULD NOT BE CALLED", None
 
@@ -897,7 +902,7 @@ def test_triage_smalltalk_fallback_to_full_path():
     called = {"n": 0}
 
     async def fake_run(prompt, conv_id, progress_callback=None,
-                       cancel_event=None, skip_permissions=False):
+                       cancel_event=None, skip_permissions=False, ctx=None):
         called["n"] += 1
         return "full pipeline answered", "conv-fallback-1"
 
