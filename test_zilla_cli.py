@@ -167,6 +167,20 @@ def test_menu_fallback_toggle():
     check("fallback: restored off", config.get_setting("fallback_enabled") is False)
 
 
+def test_menu_round_trip_retention():
+    # F3 (PLAN.md §17): media storage retention, menu item 9. RETENTION_CHOICES
+    # = ["0 (off)", "30", "60", "90"] — picking "3" selects "60", "2" selects "30".
+    check("retention: default is 30", config.get_media_retention_days() == 30,
+          detail=f"got {config.get_media_retention_days()!r}")
+    inputs = iter(["9", "3", "0"])
+    configmenu.run_menu(input_fn=lambda _p="": next(inputs), print_fn=lambda *a: None)
+    check("retention: menu wrote 60", config.get_media_retention_days() == 60,
+          detail=f"got {config.get_media_retention_days()!r}")
+    inputs2 = iter(["9", "2", "0"])
+    configmenu.run_menu(input_fn=lambda _p="": next(inputs2), print_fn=lambda *a: None)
+    check("retention: restored to 30", config.get_media_retention_days() == 30)
+
+
 # ══════════════════════════════════════════════════════════
 #  security — checks against a throwaway tmp dir (never the live install)
 # ══════════════════════════════════════════════════════════
@@ -448,6 +462,56 @@ def test_command_registry_1to1_with_telegram_handlers():
           menu_names <= registry_names)
 
 
+# ══════════════════════════════════════════════════════════
+#  F3 (PLAN.md §17) — Storage settings render + Keep button wiring
+# ══════════════════════════════════════════════════════════
+
+def test_kb_settings_storage_renders_current_selection():
+    import keyboards
+    config.set_setting("media_retention_days", 60)
+    try:
+        markup = keyboards.kb_settings_storage()
+        labels = [btn.text for row in markup.inline_keyboard for btn in row]
+        check("storage kb: shows a checkmark on the current (60d) option",
+              any(lbl.startswith("✅") and "60" in lbl for lbl in labels), labels)
+        check("storage kb: other options have no checkmark",
+              sum(lbl.startswith("✅") for lbl in labels) == 1, labels)
+        callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+        check("storage kb: one button per retention value",
+              "set_retention_0" in callbacks and "set_retention_30" in callbacks
+              and "set_retention_60" in callbacks and "set_retention_90" in callbacks,
+              callbacks)
+    finally:
+        config.set_setting("media_retention_days", 30)
+
+
+def test_kb_keep_uses_stable_token_callback():
+    import keyboards
+    from zilla.media import keep_token
+    path = "/tmp/does-not-need-to-exist/report.pdf"
+    markup = keyboards.kb_keep(path)
+    btn = markup.inline_keyboard[0][0]
+    check("keep kb: label is Keep", "Keep" in btn.text, btn.text)
+    check("keep kb: callback_data matches media.keep_token(path)",
+          btn.callback_data == f"ibx_keep_{keep_token(path)}", btn.callback_data)
+    check("keep kb: callback_data is well under Telegram's 64-byte limit",
+          len(btn.callback_data.encode()) <= 64, btn.callback_data)
+
+
+def test_bot_wires_storage_and_keep_callbacks():
+    # Structural grep-gate, same style as test_command_registry_1to1_with_
+    # telegram_handlers: confirm the F3 callback branches exist and that
+    # handle_callback's dispatcher actually routes to them.
+    bot_src = _read_bot_source()
+    for needle in ('data == "set_storage"', 'data.startswith("set_retention_")',
+                   'data.startswith("ibx_keep_")'):
+        check(f"bot.py: {needle} branch present", needle in bot_src, needle)
+    check("bot.py: set_ prefix (storage/retention) routed to _cb_settings",
+          'data == "menu_settings" or data.startswith("set_")' in bot_src)
+    check("bot.py: ibx_ prefix (keep) routed to _cb_inbox",
+          'data == "menu_inbox" or data.startswith("ibx_")' in bot_src)
+
+
 def _read_bot_source() -> str:
     with open(_bot.__file__, "r", encoding="utf-8") as f:
         return f.read()
@@ -464,6 +528,7 @@ def main():
         test_menu_invalid_choice_reprompts_then_exits,
         test_menu_quit_synonyms,
         test_menu_fallback_toggle,
+        test_menu_round_trip_retention,
         test_check_file_perms,
         test_check_secrets_not_in_logs,
         test_check_webbridge_loopback,
@@ -486,6 +551,9 @@ def main():
         test_command_registry_scopes_valid,
         test_command_registry_owner_only_handlers_are_owner_scoped,
         test_command_registry_1to1_with_telegram_handlers,
+        test_kb_settings_storage_renders_current_selection,
+        test_kb_keep_uses_stable_token_callback,
+        test_bot_wires_storage_and_keep_callbacks,
     ]
     print("Running zilla.cli / configmenu / security / doctor tests...\n")
     global _failed

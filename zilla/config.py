@@ -94,6 +94,9 @@ INBOX_IMAGES = os.path.join(INBOX_DIR, "images")
 INBOX_AUDIO = os.path.join(INBOX_DIR, "audio")
 INBOX_DOCUMENTS = os.path.join(INBOX_DIR, "documents")
 MEDIA_KEPT_DIR = os.path.join(MEDIA_DIR, "Kept")  # F3: permanent, sweep-exempt
+# F3: Inbox/Outbox files older than this get swept; 0 = sweep disabled.
+# Kept/ is never touched by the sweep regardless of this value.
+MEDIA_RETENTION_DAYS = int(os.getenv("MEDIA_RETENTION_DAYS", "30"))
 OUTBOX_DIR = os.path.join(ZILLA_HOME, "Outbox")
 OUTBOX_DOCUMENTS = os.path.join(OUTBOX_DIR, "documents")
 OUTBOX_IMAGES = os.path.join(OUTBOX_DIR, "images")
@@ -513,6 +516,11 @@ def set_model(model_name: str) -> str:
 def get_idle_kill_after() -> int:
     """Idle reaper threshold in seconds. 0 = never kill."""
     return get_setting("idle_kill_after", IDLE_KILL_AFTER)
+
+
+def get_media_retention_days() -> int:
+    """F3: Inbox/Outbox sweep threshold in days. 0 = sweep disabled."""
+    return get_setting("media_retention_days", MEDIA_RETENTION_DAYS)
 
 
 def ensure_dirs():

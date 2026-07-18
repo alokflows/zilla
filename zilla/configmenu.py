@@ -35,6 +35,10 @@ BACKEND_CHOICES = backend_names()
 VOICE_CHOICES = ["offline", "online"]
 WEB_CHOICES = ["headless", "my-browser", "off"]
 ALERT_CHOICES = ["silent", "verbose"]
+# F3 (PLAN.md §17): Inbox/Outbox retention sweep. 0 = off/keep forever.
+# Media/Kept is never affected by this setting regardless of value.
+RETENTION_CHOICES = ["0 (off)", "30", "60", "90"]
+RETENTION_VALUES = [0, 30, 60, 90]
 
 
 # ── pure parsing helpers (unit-tested directly) ────────────
@@ -114,6 +118,7 @@ def _current_state() -> dict:
         "web": config.get_setting("web_mode", "off"),
         "alert": config.get_setting("alert_policy", "silent"),
         "autostart": bool(config.get_setting("autostart_enabled", False)),
+        "retention": config.get_media_retention_days(),
     }
 
 
@@ -133,6 +138,8 @@ def _print_menu(print_fn, state: dict, env: dict):
               f"{mask_token(env.get('TELEGRAM_BOT_TOKEN', ''))} | "
               f"owner: {env.get('TELEGRAM_OWNER_ID') or '(not set)'})")
     print_fn(f"  8) Autostart                           ({'on' if state['autostart'] else 'off'})")
+    print_fn(f"  9) Media storage retention              "
+              f"({state['retention']} days, 0=off; Kept/ is always exempt)")
     print_fn("  0) Exit")
     _hr(print_fn)
 
@@ -226,17 +233,31 @@ def _menu_autostart(input_fn, print_fn, state):
     print_fn(f"  Saved. autostart = {'on' if want else 'off'}")
 
 
+def _menu_retention(input_fn, print_fn, state):
+    cur = state["retention"]
+    cur_label = RETENTION_CHOICES[RETENTION_VALUES.index(cur)] if cur in RETENTION_VALUES else str(cur)
+    print_fn(f"  Media retention (days): {', '.join(RETENTION_CHOICES)}")
+    raw = input_fn(f"  Choose [{cur_label}]: ")
+    picked = parse_pick_from(raw, RETENTION_CHOICES) if raw.strip() else cur_label
+    if picked is None:
+        print_fn(f"  Not saved — choose one of: {', '.join(RETENTION_CHOICES)}")
+        return
+    days = RETENTION_VALUES[RETENTION_CHOICES.index(picked)]
+    config.set_setting("media_retention_days", days)
+    print_fn(f"  Saved. media_retention_days = {config.get_media_retention_days()}")
+
+
 def run_menu(input_fn=input, print_fn=print) -> None:
     """Main interactive loop. Exits on choice 0 (or q/quit/exit)."""
     while True:
         state = _current_state()
         env = install.read_env()
         _print_menu(print_fn, state, env)
-        raw = input_fn("Choose [0-8]: ")
+        raw = input_fn("Choose [0-9]: ")
         if raw.strip().lower() in ("q", "quit", "exit"):
             print_fn("  Bye.")
             return
-        choice = parse_choice(raw, 8)
+        choice = parse_choice(raw, 9)
         if choice is None:
             print_fn("  Not a valid choice.\n")
             continue
@@ -263,4 +284,6 @@ def run_menu(input_fn=input, print_fn=print) -> None:
             _menu_telegram(input_fn, print_fn)
         elif choice == 8:
             _menu_autostart(input_fn, print_fn, state)
+        elif choice == 9:
+            _menu_retention(input_fn, print_fn, state)
         print_fn("")

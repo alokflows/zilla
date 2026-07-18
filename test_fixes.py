@@ -497,6 +497,108 @@ def test_outbox_delete_is_path_scoped():
     check("outbox-del: outside file untouched", os.path.exists(outside))
 
 
+# ════════════════════════════════════════════════════════════
+#  F3 — MEDIA IMPORTANCE (Keep button + harness path) + RETENTION SWEEP
+# ════════════════════════════════════════════════════════════
+
+import time  # noqa: E402
+
+
+def _setup_kept():
+    base = os.path.join(_tmpdir, f"kept_{os.urandom(4).hex()}")
+    os.makedirs(base, exist_ok=True)
+    media.MEDIA_KEPT_DIR = base
+    return base
+
+
+def test_media_keep_file_copies_into_kept():
+    img, aud, doc = _setup_inbox()
+    kept = _setup_kept()
+    src = os.path.join(doc, "report.pdf")
+    dest = media.keep_file(src)
+    check("keep: copy lands inside Kept", dest is not None and os.path.dirname(dest) == kept, str(dest))
+    check("keep: original stays in Inbox (copy, not move)", os.path.exists(src))
+    check("keep: copy exists in Kept", dest is not None and os.path.exists(dest))
+
+
+def test_media_keep_file_refuses_outside_inbox():
+    _setup_inbox()
+    _setup_kept()
+    outside = os.path.join(_tmpdir, "keep_outside_secret.txt")
+    open(outside, "w").close()
+    check("keep: refuses a path outside inbox", media.keep_file(outside) is None)
+
+
+def test_media_keep_file_collision_gets_suffix():
+    img, aud, doc = _setup_inbox()
+    _setup_kept()
+    src = os.path.join(doc, "report.pdf")
+    first = media.keep_file(src)
+    second = media.keep_file(src)
+    check("keep: repeated keep does not overwrite", first is not None and second is not None and first != second,
+          f"{first} vs {second}")
+    check("keep: both copies exist on disk",
+          bool(first and second and os.path.exists(first) and os.path.exists(second)))
+
+
+def test_media_keep_token_roundtrip():
+    img, aud, doc = _setup_inbox()
+    _setup_kept()
+    target = os.path.join(doc, "report.pdf")
+    token = media.keep_token(target)
+    resolved = media.resolve_keep_token(token)
+    check("keep-token: resolves back to the same file",
+          resolved is not None and os.path.realpath(resolved) == os.path.realpath(target))
+    check("keep-token: unknown token resolves to None",
+          media.resolve_keep_token("0" * 16) is None)
+
+
+def test_media_sweep_deletes_stale_and_keeps_fresh():
+    img, aud, doc = _setup_inbox()
+    _setup_outbox()
+    _setup_kept()
+    stale = os.path.join(doc, "report.pdf")
+    fresh = os.path.join(img, "p1.jpg")
+    now = time.time()
+    old_time = now - 40 * 86400  # 40 days old
+    os.utime(stale, (old_time, old_time))
+    removed = media.sweep_stale_media(30, now=now)
+    check("sweep: removed the stale file", not os.path.exists(stale))
+    check("sweep: left the fresh file", os.path.exists(fresh))
+    check("sweep: removed count reflects the deletion", removed >= 1, str(removed))
+
+
+def test_media_sweep_disabled_is_noop():
+    img, aud, doc = _setup_inbox()
+    _setup_outbox()
+    _setup_kept()
+    target = os.path.join(doc, "report.pdf")
+    os.utime(target, (0.0, 0.0))
+    removed = media.sweep_stale_media(0, now=time.time())
+    check("sweep: retention_days=0 removes nothing", removed == 0 and os.path.exists(target))
+
+
+def test_media_sweep_never_touches_kept():
+    img, aud, doc = _setup_inbox()
+    _setup_outbox()
+    kept = _setup_kept()
+    src = os.path.join(doc, "report.pdf")
+    dest = media.keep_file(src)
+    os.utime(dest, (0.0, 0.0))
+    os.utime(src, (0.0, 0.0))
+    removed = media.sweep_stale_media(30, now=time.time())
+    check("sweep: kept copy survives even when ancient", os.path.exists(dest))
+    check("sweep: the inbox original IS swept (only Kept is exempt)", not os.path.exists(src))
+
+
+def test_media_retention_days_setting_default_and_persist():
+    check("retention: default is 30", config.get_media_retention_days() == 30,
+          str(config.get_media_retention_days()))
+    config.set_setting("media_retention_days", 60)
+    check("retention: persists after set_setting", config.get_media_retention_days() == 60)
+    config.set_setting("media_retention_days", 30)  # restore default for any later test
+
+
 def test_detect_file_paths_posix():
     # The Windows-only extractor silently delivered ZERO files on macOS/Linux.
     # This guards the cross-platform delivery fix.
@@ -1343,6 +1445,14 @@ def main():
         test_media_size_cap_unknown_size_is_allowed,
         test_outbox_lists_and_classifies,
         test_outbox_delete_is_path_scoped,
+        test_media_keep_file_copies_into_kept,
+        test_media_keep_file_refuses_outside_inbox,
+        test_media_keep_file_collision_gets_suffix,
+        test_media_keep_token_roundtrip,
+        test_media_sweep_deletes_stale_and_keeps_fresh,
+        test_media_sweep_disabled_is_noop,
+        test_media_sweep_never_touches_kept,
+        test_media_retention_days_setting_default_and_persist,
         test_detect_file_paths_posix,
         test_next_run_daily,
         test_next_run_interval_and_once,

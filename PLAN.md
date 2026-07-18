@@ -1241,11 +1241,15 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] M1 SQLite store + migration *(done on execution branch, 606 green)*
 - [x] M2 Memory layout + injection *(done, 652 green)*
 - [x] M3 FTS5 + memory git + quiet runs *(done, 686 green)*
+- [x] M4 Nightly distillation + /memory + change surfacing *(done out of listed order —
+      shipped before F1/F2 existed, retrofitted per F1's documented deviation note; 717 green)*
+- [x] H1 Heartbeat loop *(done out of listed order, same reason as M4; 778 green)*
+- [x] H2 Health probes + assisted re-login *(done out of listed order; 835 green)*
+- [x] H3 systemd service *(done out of listed order; 858 green)*
 - [x] F1 ZILLA_HOME replaces AGI-Brain (§17) *(done, 894 green)*
 - [x] F2 Dynamic backend registry — no hard-coded backends (§17) *(done, 950 green)*
-- [ ] F3 Media importance + retention controls (§17)
+- [x] F3 Media importance + retention controls (§17) *(done, 980 green; also built the H1.4b retention-sweep mechanism itself, which H1 never actually shipped)*
 - [ ] F4 System jobs invisible + silent (§17)
-- [ ] M4 Nightly distillation + /memory + change surfacing
 - [ ] K1 Graph schema + indexer
 - [ ] K2 Entity linking + neighborhood injection
 - [ ] K3 Curiosity loop
@@ -1254,9 +1258,6 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [ ] U2 Agent ZUI education + contacts loop
 - [ ] U3 Design system (STYLE.md + menu refactor)
 - [ ] U4 Presence (pinned status card, silent restarts)
-- [ ] H1 Heartbeat loop
-- [ ] H2 Health probes + assisted re-login
-- [ ] H3 systemd service
 - [ ] H4 Self-update with rollback
 - [ ] B1 Background task lane + /tasks
 - [ ] B2 Incognito sessions

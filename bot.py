@@ -89,6 +89,7 @@ from media import (
     get_inbox_stats, get_inbox_items, get_inbox_counts, delete_inbox_file,
     get_outbox_items, get_outbox_counts, delete_outbox_file,
     format_file_size, extract_text, MediaTooLargeError,
+    keep_file, resolve_keep_token,
 )
 from formatter import format_for_telegram, detect_file_paths
 from harness import log_summary
@@ -98,10 +99,11 @@ from schedule_parse import parse_schedule, parse_schedule_command
 import keyboards
 from keyboards import (
     kb_menu, kb_sessions, kb_session_delete, kb_model, kb_settings,
+    kb_settings_storage, kb_keep,
     kb_back, kb_error, kb_users, kb_user_detail,
     kb_inbox_categories, kb_inbox_list, kb_outbox_categories, kb_outbox_list,
     kb_schedules, _can_change_model, _fmt_next,
-    _IDLE_OPTIONS, INBOX_PAGE, INBOX_CAT_META, OUTBOX_CAT_META,
+    _IDLE_OPTIONS, _RETENTION_OPTIONS, INBOX_PAGE, INBOX_CAT_META, OUTBOX_CAT_META,
 )
 
 # ── Logging ────────────────────────────────────────────────
@@ -1679,7 +1681,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stop_typing.set()
             typing_task.cancel()
             msg = transcript if transcript else "Transcription unavailable."
-            await update.message.reply_text(f"🎤 Voice saved.\n{msg}")
+            await update.message.reply_text(
+                f"🎤 Voice saved.\n{msg}", reply_markup=kb_keep(filepath))
     except MediaTooLargeError as e:
         stop_typing.set()
         typing_task.cancel()
@@ -1709,7 +1712,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if transcript and not transcript.startswith("["):
             await update.message.reply_text(f'🎵 Transcribed:\n"{transcript}"')
         else:
-            await update.message.reply_text(f"🎵 Audio saved: {os.path.basename(filepath)}")
+            await update.message.reply_text(
+                f"🎵 Audio saved: {os.path.basename(filepath)}", reply_markup=kb_keep(filepath))
     except MediaTooLargeError as e:
         stop_typing.set()
         typing_task.cancel()
@@ -1744,7 +1748,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"📸 Photo saved.\n{os.path.basename(filepath)} "
                 f"({format_file_size(os.path.getsize(filepath))})\n"
-                "Add a caption to get analysis."
+                "Add a caption to get analysis.",
+                reply_markup=kb_keep(filepath),
             )
             return
 
@@ -1779,7 +1784,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not caption:
             await update.message.reply_text(
                 f"📄 Saved: {fname} ({fsize})\n"
-                "Add a caption with your question to analyze it."
+                "Add a caption with your question to analyze it.",
+                reply_markup=kb_keep(filepath),
             )
             return
 
@@ -1828,7 +1834,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         filepath = await save_video(context.bot, update.message.video)
         await update.message.reply_text(
-            f"🎬 Video saved. ({format_file_size(os.path.getsize(filepath))})"
+            f"🎬 Video saved. ({format_file_size(os.path.getsize(filepath))})",
+            reply_markup=kb_keep(filepath),
         )
     except MediaTooLargeError as e:
         await update.message.reply_text(f"🚫 {e}")
@@ -2337,6 +2344,35 @@ async def _cb_settings(query, context, data, uid, chat_id):
         set_setting("schedule_catchup", not current)
         await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
 
+    elif data == "set_storage":
+        if not auth.is_owner(uid):
+            await query.answer("Owner only.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "🗄️ Storage\n═══════════\n"
+            "Inbox/Outbox files older than this get auto-deleted. "
+            "Media/Kept is never touched.",
+            reply_markup=kb_settings_storage(),
+        )
+
+    elif data.startswith("set_retention_"):
+        if not auth.is_owner(uid):
+            await query.answer("Owner only.", show_alert=True)
+            return
+        rest = data.removeprefix("set_retention_")
+        valid = {v for v, _ in _RETENTION_OPTIONS}
+        days = int(rest) if rest.isdigit() and int(rest) in valid else None
+        if days is None:
+            await query.answer("Invalid option.", show_alert=True)
+            return
+        set_setting("media_retention_days", days)
+        await query.edit_message_text(
+            "🗄️ Storage\n═══════════\n"
+            "Inbox/Outbox files older than this get auto-deleted. "
+            "Media/Kept is never touched.",
+            reply_markup=kb_settings_storage(),
+        )
+
     elif data.startswith("set_backend_"):
         if not auth.is_owner(uid):
             await query.answer("Owner only.", show_alert=True)
@@ -2427,6 +2463,22 @@ async def _cb_inbox(query, context, data, uid, chat_id):
                 f"{label} — {len(items)} file(s)\nShowing {off + 1}–{shown}.",
                 reply_markup=kb_inbox_list(cat, items, off),
             )
+
+    elif data.startswith("ibx_keep_"):
+        # F3: deterministic twin of the harness's importance-recognition
+        # protocol — "same graduation" (PLAN.md §17), no model judgment.
+        token = data.removeprefix("ibx_keep_")
+        src = resolve_keep_token(token)
+        dest = keep_file(src) if src else None
+        if dest:
+            memory.append_journal(f"Kept media file: {os.path.basename(dest)}")
+            await query.answer("⭐ Kept — copied to Media/Kept/.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        else:
+            await query.answer("File no longer available.", show_alert=True)
 
 
 async def _cb_outbox(query, context, data, uid, chat_id):
@@ -2997,6 +3049,9 @@ def main():
     # health probe loop (real `agy models`/`claude -p ping` subprocesses on
     # a background timer) actually runs.
     core.health_probes_enabled = True
+    # Phase F3: same opt-in pattern — real production is the only place the
+    # media retention sweep (real file deletes on a background timer) runs.
+    core.media_sweep_enabled = True
     keyboards.auth = auth  # the keyboard builders read auth for role-gated menus
 
     model = get_model()

@@ -441,6 +441,13 @@ class ZillaCore:
         self.health_probes_enabled = False
         self._health_task: asyncio.Task | None = None
 
+        # F3 (PLAN.md §17): the media retention sweep is OFF by default —
+        # same opt-in pattern as health_probes_enabled/memory_autocommit_enabled
+        # above, for the same reason: a test-constructed ZillaCore must never
+        # delete real Inbox/Outbox files on a background timer.
+        self.media_sweep_enabled = False
+        self._media_sweep_task: asyncio.Task | None = None
+
     # ── lifecycle ───────────────────────────────────────────
 
     async def start(self):
@@ -458,10 +465,12 @@ class ZillaCore:
             self._bridge_task = asyncio.create_task(self._bridge_watcher_loop())
         if self.health_probes_enabled and self._health_task is None:
             self._health_task = asyncio.create_task(self._health_loop())
+        if self.media_sweep_enabled and self._media_sweep_task is None:
+            self._media_sweep_task = asyncio.create_task(self._media_sweep_loop())
 
     async def stop(self):
-        """Stop the scheduler loop, the bridge watcher, and the health
-        probe loop, cleanly."""
+        """Stop the scheduler loop, the bridge watcher, the health
+        probe loop, and the media sweep loop, cleanly."""
         if self._sched_task is not None:
             self._sched_task.cancel()
             try:
@@ -489,6 +498,15 @@ class ZillaCore:
             except Exception as e:  # pragma: no cover - defensive
                 logger.error(f"[HEALTH] stop() cleanup error: {e}")
             self._health_task = None
+        if self._media_sweep_task is not None:
+            self._media_sweep_task.cancel()
+            try:
+                await self._media_sweep_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(f"[MEDIA] stop() cleanup error: {e}")
+            self._media_sweep_task = None
 
     # ── health snapshot (CORE_API migration step 6 — STUB) ─
     #
@@ -1289,3 +1307,34 @@ class ZillaCore:
             except Exception as e:
                 logger.error(f"[HEALTH] loop error: {e}", exc_info=True)
             await asyncio.sleep(self._HEALTH_TICK)
+
+    # ── media retention sweep (F3, PLAN.md §17) ────────────
+
+    _MEDIA_SWEEP_TICK = 3600  # 1 hour — retention is in days, no need to poll faster
+
+    async def _media_sweep_tick(self) -> None:
+        """Delete stale Inbox/Outbox files per the owner's configured
+        retention window. Reads the setting fresh every tick so a change
+        via /settings takes effect on the next hour, no restart needed.
+        Media/Kept is structurally exempt (media.sweep_stale_media never
+        scans it) — see F3 spec."""
+        from zilla import config as _config
+        from zilla import media as _media
+        try:
+            days = await asyncio.to_thread(_config.get_media_retention_days)
+            removed = await asyncio.to_thread(_media.sweep_stale_media, days)
+            if removed:
+                log_event("media_swept", removed=removed, retention_days=days)
+        except Exception as e:
+            logger.error(f"[MEDIA] sweep tick failed: {e}", exc_info=True)
+
+    async def _media_sweep_loop(self) -> None:
+        logger.info("[MEDIA] retention sweep loop started")
+        while True:
+            try:
+                await self._media_sweep_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[MEDIA] sweep loop error: {e}", exc_info=True)
+            await asyncio.sleep(self._MEDIA_SWEEP_TICK)

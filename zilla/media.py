@@ -5,13 +5,16 @@
 #  one clean module. Handles all Telegram media.
 # ============================================================
 
+import hashlib
 import os
+import shutil
+import time
 import logging
 from datetime import datetime
 
 from zilla.config import (
     FFMPEG_PATH, INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS,
-    OUTBOX_DOCUMENTS, OUTBOX_IMAGES,
+    OUTBOX_DOCUMENTS, OUTBOX_IMAGES, MEDIA_KEPT_DIR,
     TELEGRAM_MAX_SEND_FILE, get_setting,
 )
 
@@ -292,6 +295,76 @@ def delete_inbox_file(path: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def keep_token(path: str) -> str:
+    """Short, stable, callback_data-safe (well under Telegram's 64-byte
+    limit) identifier for an inbox file — used by the F3 Keep button so it
+    doesn't depend on list position/ordering the way ibx_* index buttons do
+    (this button is attached to a fresh single-file ack, not a browsed
+    list)."""
+    return hashlib.sha1(os.path.realpath(path).encode()).hexdigest()[:16]
+
+
+def resolve_keep_token(token: str) -> str | None:
+    """Re-scan the current Inbox for the file whose keep_token matches.
+    Stateless by design — no index/session to go stale. None if the file
+    was already deleted/kept/moved."""
+    for item in get_inbox_items():
+        if keep_token(item["path"]) == token:
+            return item["path"]
+    return None
+
+
+def keep_file(path: str) -> str | None:
+    """F3: copy a file from Inbox into Media/Kept (permanent, sweep-exempt).
+    Path-validated like delete_inbox_file — refuses anything outside the
+    inbox roots. The original stays in Inbox (a plain copy, matching the
+    model-driven "importance recognition" path); a name collision in Kept
+    gets a numeric suffix rather than overwriting. Returns the new path,
+    or None if the source isn't a real inbox file or the copy failed."""
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return None
+    roots = [os.path.realpath(d) for d in (INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS)]
+    if not any(real == r or real.startswith(r + os.sep) for r in roots):
+        return None
+    if not os.path.isfile(real):
+        return None
+    os.makedirs(MEDIA_KEPT_DIR, exist_ok=True)
+    fname = os.path.basename(real)
+    dest = os.path.join(MEDIA_KEPT_DIR, fname)
+    if os.path.exists(dest):
+        stem, ext = os.path.splitext(fname)
+        n = 2
+        while os.path.exists(dest):
+            dest = os.path.join(MEDIA_KEPT_DIR, f"{stem}_{n}{ext}")
+            n += 1
+    try:
+        shutil.copy2(real, dest)
+        return dest
+    except OSError:
+        return None
+
+
+def sweep_stale_media(retention_days: int, now: float | None = None) -> int:
+    """F3: delete Inbox/Outbox files older than retention_days. 0 disables
+    the sweep entirely (no-op). Media/Kept is never scanned here — it isn't
+    one of the folders get_inbox_items/get_outbox_items look at — so a kept
+    file can never be swept regardless of its age. Returns count removed."""
+    if not retention_days:
+        return 0
+    now = now if now is not None else time.time()
+    cutoff = now - retention_days * 86400
+    removed = 0
+    for item in get_inbox_items():
+        if item["mtime"] < cutoff and delete_inbox_file(item["path"]):
+            removed += 1
+    for item in get_outbox_items():
+        if item["mtime"] < cutoff and delete_outbox_file(item["path"]):
+            removed += 1
+    return removed
 
 
 def get_inbox_counts() -> dict:

@@ -17,8 +17,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import (
     get_setting, get_idle_kill_after, get_backend, model_catalog,
+    get_media_retention_days,
 )
-from media import format_file_size
+from media import format_file_size, keep_token
 from zilla.backend_registry import installed_backends
 
 # Injected by bot.py at startup (see module docstring).
@@ -30,6 +31,15 @@ _IDLE_OPTIONS = [
     (180, "3 min — Default"),
     (300, "5 min — Patient"),
     (0, "No reaper"),
+]
+
+# F3: media retention sweep options (owner-facing, button values only —
+# never free text, per PLAN.md §17). 0 = sweep disabled.
+_RETENTION_OPTIONS = [
+    (0, "Off — keep forever"),
+    (30, "30 days"),
+    (60, "60 days"),
+    (90, "90 days"),
 ]
 
 # Inbox/Outbox pagination + category metadata.
@@ -64,6 +74,13 @@ def _idle_label(val: int) -> str:
         if v == val:
             return label
     return f"{val}s"
+
+
+def _retention_label(days: int) -> str:
+    for v, label in _RETENTION_OPTIONS:
+        if v == days:
+            return label
+    return f"{days}d"
 
 
 def _fmt_next(ts) -> str:
@@ -193,7 +210,26 @@ def kb_settings(uid: int = 0):
         ]
         if switch_row:
             rows.append(switch_row)
+        rows.append([InlineKeyboardButton(
+            f"🗄️ Storage: {_retention_label(get_media_retention_days())}",
+            callback_data="set_storage",
+        )])
     rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_settings_storage():
+    """F3: owner-only Inbox/Outbox retention picker — button values only.
+    Media/Kept is never affected by this setting (permanent, sweep-exempt)."""
+    current = get_media_retention_days()
+    rows = [
+        [InlineKeyboardButton(
+            ("✅ " if v == current else "") + label,
+            callback_data=f"set_retention_{v}",
+        )]
+        for v, label in _RETENTION_OPTIONS
+    ]
+    rows.append([InlineKeyboardButton("◀ Settings", callback_data="menu_settings"), _close_btn()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -280,6 +316,16 @@ def kb_inbox_list(category: str, items: list, offset: int):
         rows.append(nav)
     rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_inbox"), _close_btn()])
     return InlineKeyboardMarkup(rows)
+
+
+def kb_keep(path: str):
+    """F3: single button attached to a fresh media-save acknowledgment —
+    the deterministic ("no model judgment") twin of the harness's
+    importance-recognition protocol. Token-based (see media.keep_token),
+    not index-based, since this isn't a browsed list."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⭐ Keep", callback_data=f"ibx_keep_{keep_token(path)}"),
+    ]])
 
 
 def kb_outbox_categories(counts: dict):

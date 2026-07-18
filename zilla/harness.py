@@ -330,7 +330,7 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         return ""
 
     from zilla import memory as _memory
-    from zilla.config import MEMORY_DIR
+    from zilla.config import MEMORY_DIR, MEDIA_KEPT_DIR
 
     # Phase M3: keep the FTS5 search index current before the turn starts —
     # cheap when nothing changed (mtime+size stat per file), and this is the
@@ -369,6 +369,10 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         "preferences, append one line to today's Journal file: `- HH:MM — fact`.",
         "- When the owner asks you to keep an eye on / remind / follow up on "
         "something recurring, add it to HEARTBEAT.md.",
+        "- When the owner says a file they just sent matters (e.g. \"this is "
+        f"my passport\", \"save this bill\"), copy it into {MEDIA_KEPT_DIR} "
+        "(it's permanent — never auto-deleted) and append one line to today's "
+        "Journal noting what it is and why it's kept.",
         "- Never store credentials, OTPs, or tokens in any memory file.",
     ]
     if was_template:
