@@ -76,6 +76,7 @@ from config import (
     DB_FILE, MEMORY_DIR,
 )
 from zilla.store import get_store
+from zilla import memory
 from sessions import SessionManager
 import zilla.core as zcore
 from zilla.cli_engine import detect_limit, backend_status
@@ -2819,6 +2820,10 @@ def main():
         sys.exit(1)
 
     ensure_dirs()
+    # Memory/ tree (PLAN.md §5 M2 step 1) — ensure-tree-on-start, idempotent,
+    # never overwrites an owner's edits. Must land before _harden_file_perms()
+    # below so the freshly created tree gets locked to 0700/0600 immediately.
+    memory.ensure_tree()
     # SECURITY: keep secrets/state owner-only (the bot token lives in .env; state
     # files carry conversation ids + auto-titled message snippets).
     _harden_file_perms()

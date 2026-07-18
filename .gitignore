@@ -20,6 +20,15 @@ settings.json
 selected_model.txt
 zilla.pid
 zilla.stop
+zilla.db
+zilla.db-wal
+zilla.db-shm
+zilla.db.bak
+zilla.db.bak.1
+
+# Memory/ (PLAN.md §3.2) is its own git repo (M3 git-inits it) — never
+# tracked by the code repo, and it's the owner's private knowledge besides.
+Memory/
 
 # CLI working data created in the bot folder
 .antigravitycli/
