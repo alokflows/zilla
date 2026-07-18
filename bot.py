@@ -90,7 +90,7 @@ from media import (
 from formatter import format_for_telegram, detect_file_paths
 from harness import log_summary
 from users import AuthManager
-from schedules import ScheduleManager, describe as describe_schedule
+from schedules import ScheduleManager, describe as describe_schedule, ensure_system_schedule
 from schedule_parse import parse_schedule, parse_schedule_command
 import keyboards
 from keyboards import (
@@ -342,7 +342,8 @@ class _ProgressBubble:
 
 async def _relay_cli_turn(update, uid, chat_id, prompt, *,
                           auto_title=False, skip_permissions=None,
-                          progress: "_ProgressBubble | None" = None) -> str:
+                          progress: "_ProgressBubble | None" = None,
+                          untrusted_input: bool = False) -> str:
     """Drive one core turn (zilla.core.handle_message) and return the final
     response text. Shared by the text, voice, photo, document and approval
     paths — the Telegram translation of the core's event stream.
@@ -350,14 +351,16 @@ async def _relay_cli_turn(update, uid, chat_id, prompt, *,
     progress: optional _ProgressBubble — when given, each Progress event's
     text is written into it so keep_typing (running concurrently) can render
     it into the visible ⏳ Working status message. The Response event's text
-    feeds the existing send_response path in each handler."""
+    feeds the existing send_response path in each handler.
+    untrusted_input: pass True for a document-ingest turn (PLAN.md §5.M4
+    step 2) — see core.handle_message's own docstring."""
     await _notify_if_busy(uid, update)
     response = ""
     # aclosing: if we die mid-stream (Telegram error), close the generator so
     # the core releases its lock/cancel bookkeeping deterministically.
     async with aclosing(core.handle_message(
-            uid, prompt, chat_key=chat_id,
-            auto_title=auto_title, skip_permissions=skip_permissions)) as stream:
+            uid, prompt, chat_key=chat_id, auto_title=auto_title,
+            skip_permissions=skip_permissions, untrusted_input=untrusted_input)) as stream:
         async for event in stream:
             if isinstance(event, zcore.Response):
                 response = event.text
@@ -945,7 +948,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👥 OWNER:",
             "  /adduser <id> [name] — add an admin",
             "  /removeuser <id> — remove an admin",
-            "  /listusers — manage admins\n",
+            "  /listusers — manage admins",
+            "  /memory — MEMORY.md, today's journal, recent memory commits",
+            "  /memory diff — latest memory change\n",
         ]
     await update.message.reply_text("\n".join(lines))
 
@@ -1085,9 +1090,81 @@ async def cmd_brain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PLAN.md §5.M4 step 3: owner-only, read-only view of the Markdown
+    knowledge tier — MEMORY.md, today's journal, and the last 5 memory
+    commits with diff stats. `/memory diff` shows the latest change's full
+    unified diff instead."""
+    uid = update.effective_user.id
+    if not auth.is_owner(uid):
+        await update.message.reply_text("Owner only.")
+        return
+
+    if context.args and context.args[0].lower() == "diff":
+        diff = await asyncio.to_thread(memory.git_diff_latest)
+        if not diff.strip():
+            await update.message.reply_text("No memory changes recorded yet.")
+            return
+        for chunk in split_message(f"```\n{diff[:12000]}\n```"):
+            await update.message.reply_text(chunk)
+        return
+
+    core_text = await asyncio.to_thread(memory.read_core)
+    journal_file = memory.journal_path()
+    journal_text = ""
+    if os.path.exists(journal_file):
+        with open(journal_file, "r", encoding="utf-8") as f:
+            journal_text = f.read()
+    commits = await asyncio.to_thread(memory.git_log, 5)
+
+    lines = ["🧠 Memory\n═════════", "", "MEMORY.md:", core_text.strip() or "(empty)", ""]
+    lines.append(f"Today's journal ({os.path.basename(journal_file)}):")
+    lines.append(journal_text.strip() or "(nothing yet today)")
+    lines.append("")
+    lines.append("Last memory commits:")
+    if commits:
+        for c in commits:
+            n = len(c["files"])
+            lines.append(
+                f"  {c['hash']} {c['date']} +{c['insertions']}/-{c['deletions']} "
+                f"({n} file{'s' if n != 1 else ''}) — {c['subject']}"
+            )
+    else:
+        lines.append("  (no memory commits yet)")
+    lines.append("")
+    lines.append("Use /memory diff to see the latest change.")
+    for chunk in split_message("\n".join(lines)):
+        await update.message.reply_text(chunk)
+
+
 # ══════════════════════════════════════════════════════════
 #  SCHEDULES
 # ══════════════════════════════════════════════════════════
+
+# Phase M4 step 1 (PLAN.md §5.M4): the nightly memory-distillation job.
+# Seeded idempotently at startup (see ensure_distillation_schedule below) —
+# title is the match key, so it must stay stable across releases.
+DISTILLATION_TITLE = "Nightly memory distillation"
+DISTILLATION_PROMPT = (
+    "Read yesterday's Journal file. Move durable facts into the right Wiki "
+    "pages (create pages as needed), update MEMORY.md if a standing fact "
+    "changed, then rewrite the journal entry down to its essentials. Reply "
+    "HEARTBEAT_OK when done."
+)
+
+
+def ensure_distillation_schedule(schedules_mgr: ScheduleManager, owner_chat_id: int) -> None:
+    """Idempotently seed the nightly 03:30 distillation schedule for the
+    owner (PLAN.md §5.M4 step 1). Runs in an isolated session (fresh conv
+    id every fire, never written back to any session — see
+    resolve_session_mode/core._sname_for_mode), so it's a throwaway
+    conversation by construction. Pausable via the normal schedule toggle,
+    not deletable (ScheduleManager.remove refuses system jobs)."""
+    ensure_system_schedule(
+        schedules_mgr, owner_chat_id, DISTILLATION_TITLE, DISTILLATION_PROMPT,
+        "daily", {"hh": 3, "mm": 30},
+    )
+
 
 def _kb_confirm_schedule():
     return InlineKeyboardMarkup([
@@ -1724,7 +1801,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Read the file and respond."
                 )
 
-            response = await _relay_cli_turn(update, uid, chat_id, prompt, progress=progress)
+            response = await _relay_cli_turn(update, uid, chat_id, prompt, progress=progress,
+                                             untrusted_input=True)
             stop_typing.set()
             typing_task.cancel()
             await send_response(update, context, response, uid, chat_id)
@@ -2839,6 +2917,9 @@ def main():
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)
+    # Phase M4 step 1: idempotent — a no-op after the first successful start,
+    # so a double restart still leaves exactly one distillation schedule.
+    ensure_distillation_schedule(schedules_mgr, OWNER_CHAT_ID)
     # the turn pipeline + scheduler runtime + bridge watcher (CORE_API
     # migration steps 2 + 3 + 4)
     core = zcore.ZillaCore(sessions=sessions, auth=auth, schedules=schedules_mgr,
@@ -2902,6 +2983,7 @@ def main():
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("brain", cmd_brain))
+    app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("schedules", cmd_schedule))
     app.add_handler(CommandHandler("browse", cmd_browse))

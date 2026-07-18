@@ -43,6 +43,7 @@ import time as _time
 from dataclasses import dataclass, field
 
 import zilla.interactive as interactive
+from zilla.autoharness import needs_browser
 from zilla.backends import claude_identity
 from zilla.cli_engine import run_cli_async, get_latest_step
 from zilla.config import (
@@ -625,7 +626,7 @@ class ZillaCore:
 
     async def handle_message(self, user_id: int, text: str, *, chat_key: int = None,
                              auto_title: bool = False, skip_permissions: bool = None,
-                             origin: str = "user"):
+                             origin: str = "user", untrusted_input: bool = False):
         """Run one CLI turn against the user's active session, yielding events.
 
         Async generator: yields zero-or-more Progress events while the backend
@@ -646,6 +647,12 @@ class ZillaCore:
         (_execute_message_schedule) that does not build a TurnContext yet —
         a known, deliberate gap (frozen test_schedules_seam.py fakes can't
         accept a new kwarg; see HANDOFF.md).
+        untrusted_input: True when the frontend already knows this turn's
+        prompt carries untrusted content beyond plain typed text (e.g. an
+        uploaded document's extracted text) — combined with a non-owner
+        principal and browser-intent detection to decide whether a memory
+        write this turn triggers gets surfaced to the owner (PLAN.md §5.M4
+        step 2). Never gates anything else — plain visibility.
         """
         # ── P1.5 triage: deterministic, zero-model-call route decision BEFORE
         # the heavy CLI turn / lock (HANDOFF.md P1.5). 'full' is the safe
@@ -781,7 +788,8 @@ class ZillaCore:
                 meta={"session": sname, "conv_id": final_conv,
                       "canceled": cancel_event.is_set()},
             )
-            await self._autocommit_memory(f"chat turn — uid {user_id}")
+            untrusted = untrusted_input or not ctx.is_owner or needs_browser(text)
+            await self._autocommit_memory(f"chat turn — uid {user_id}", untrusted=untrusted)
         finally:
             if self._active_cancel.get(key) is cancel_event:
                 self._active_cancel.pop(key, None)
@@ -876,16 +884,34 @@ class ZillaCore:
             return "main"
         return None  # "isolated" (or any unrecognized mode, safest default)
 
-    async def _autocommit_memory(self, context: str) -> None:
+    async def _autocommit_memory(self, context: str, *, untrusted: bool = False) -> None:
         """Phase M3.3: git-commit Memory/ if this turn/run changed it. A
         no-op unless memory_autocommit_enabled (see __init__ for why it
         defaults off). Runs the git subprocess calls off the event loop —
         memory.git_autocommit() itself never raises, so this can't break a
-        reply/delivery either way."""
+        reply/delivery either way.
+
+        Phase M4 step 2 (PLAN.md §5.M4, the §12.9 injection-surface
+        mitigation): when `untrusted` is True (this run's inputs included
+        untrusted content — a document-ingest or browser-bearing turn — or
+        the run was non-owner-originated) AND a commit actually happened,
+        DM the owner one line surfacing the change. Deterministic,
+        code-level: detection and visibility, not prevention."""
         if not self.memory_autocommit_enabled:
             return
         from zilla import memory as _memory
-        await asyncio.to_thread(_memory.git_autocommit, context)
+        committed = await asyncio.to_thread(_memory.git_autocommit, context)
+        if not (committed and untrusted):
+            return
+        stat = await asyncio.to_thread(_memory.git_last_commit_stat)
+        if not stat:
+            return
+        files = ", ".join(stat["files"][:5])
+        if len(stat["files"]) > 5:
+            files += f" (+{len(stat['files']) - 5} more)"
+        self._broadcast(Alert(
+            text=f"🔏 memory changed during this run: {files} ({stat['hash']})"
+        ))
 
     async def _execute_message_schedule(self, s: dict) -> tuple:
         """payload_type == 'message': a full CLI turn, same as a live chat
@@ -1025,7 +1051,8 @@ class ZillaCore:
         ok, response, detail, meta = await self._execute_schedule(s)
         if meta.get("pin_mismatch"):
             self._maybe_notify_backend_pin(s)
-        await self._autocommit_memory(f"schedule — {title}"[:80])
+        sched_untrusted = not (self.auth and self.auth.is_owner(s.get("user_id")))
+        await self._autocommit_memory(f"schedule — {title}"[:80], untrusted=sched_untrusted)
         if ok:
             self.schedules.mark_success(sid)
             log_event("schedule_ok", id=sid, title=title[:40])
@@ -1064,7 +1091,8 @@ class ZillaCore:
         ok, response, detail, meta = await self._execute_schedule(s)
         if meta.get("pin_mismatch"):
             self._maybe_notify_backend_pin(s)
-        await self._autocommit_memory(f"schedule — {s.get('title', '')}"[:80])
+        sched_untrusted = not (self.auth and self.auth.is_owner(s.get("user_id")))
+        await self._autocommit_memory(f"schedule — {s.get('title', '')}"[:80], untrusted=sched_untrusted)
         if ok and _quiet_heartbeat_suppressed(s, response):
             log_event("schedule_quiet", id=sid, title=s.get("title", "")[:40])
             return

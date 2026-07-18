@@ -228,6 +228,23 @@ def _to_dict(row: dict) -> dict:
     }
 
 
+def ensure_system_schedule(mgr: "ScheduleManager", owner_chat_id: int, title: str,
+                           prompt: str, kind: str, spec: dict,
+                           session: str = "isolated") -> dict | None:
+    """Idempotently seed a Zilla-owned (system=True) schedule for the owner
+    (M4's nightly distillation; a future H1 heartbeat beat would reuse this
+    too). Matches by exact title among the owner's existing system
+    schedules, so calling this on every startup never creates a second
+    copy — the accept criterion is "exists exactly once after double
+    restart". Returns the existing or newly created schedule dict."""
+    for s in mgr.list(owner_chat_id):
+        if s.get("system") and s.get("title") == title:
+            return s
+    return mgr.add(owner_chat_id, owner_chat_id, prompt, kind, spec,
+                   title=title, session=session, payload_type="message",
+                   is_owner=True, system=True)
+
+
 class ScheduleManager:
     """Persistent store of automation jobs."""
 
@@ -292,6 +309,12 @@ class ScheduleManager:
     def remove(self, sid: str, user_id: int) -> bool:
         row = self._store.schedules_get(sid)
         if not row or row["uid"] != user_id:
+            return False
+        if row.get("system"):
+            # A Zilla-owned job (H1's heartbeat, M4's nightly distillation) is
+            # pausable (set_enabled) but never deletable through this path —
+            # PLAN.md §5.M4 step 1 decree for the distillation schedule,
+            # applied to every system job on the same deterministic rule.
             return False
         return self._store.schedules_delete(sid, user_id)
 

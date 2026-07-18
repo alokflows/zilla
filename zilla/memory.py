@@ -333,3 +333,100 @@ def git_autocommit(context: str, base: str | None = None) -> bool:
     except Exception as e:
         logger.debug(f"[MEMORY] git_autocommit failed: {e}")
         return False
+
+
+def _numstat_to_files(numstat_output: str) -> tuple[list[str], int, int]:
+    """Parse `git ... --numstat` output into (files, insertions, deletions).
+    A binary file reports '-' for both counts (git convention) — counted as
+    a touched file with 0/0 rather than crashing on int()."""
+    files: list[str] = []
+    insertions = deletions = 0
+    for line in numstat_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        added, removed, path = parts
+        files.append(path)
+        insertions += int(added) if added.isdigit() else 0
+        deletions += int(removed) if removed.isdigit() else 0
+    return files, insertions, deletions
+
+
+def git_last_commit_stat(base: str | None = None) -> dict | None:
+    """{'hash', 'files', 'insertions', 'deletions'} for HEAD — read right
+    after a git_autocommit() that returned True, for the M4 change-
+    surfacing DM. None if there is no repo, no commit, or on any failure
+    (never raises — this feeds a best-effort notification, not a core
+    reply)."""
+    import subprocess
+    mem_dir = _mem_dir(base)
+    if not os.path.isdir(os.path.join(mem_dir, ".git")):
+        return None
+    try:
+        h = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=mem_dir,
+                           capture_output=True, text=True, timeout=10)
+        if h.returncode != 0:
+            return None
+        numstat = subprocess.run(["git", "show", "--numstat", "--format=", "HEAD"],
+                                 cwd=mem_dir, capture_output=True, text=True, timeout=10)
+        files, insertions, deletions = _numstat_to_files(numstat.stdout)
+        return {"hash": h.stdout.strip(), "files": files,
+                "insertions": insertions, "deletions": deletions}
+    except Exception as e:
+        logger.debug(f"[MEMORY] git_last_commit_stat failed: {e}")
+        return None
+
+
+def git_log(limit: int = 5, base: str | None = None) -> list[dict]:
+    """Last `limit` Memory/ commits, newest first: {'hash', 'date',
+    'subject', 'files', 'insertions', 'deletions'}. [] if there is no repo,
+    no commits, or on any failure — powers the M4 `/memory` command."""
+    import subprocess
+    mem_dir = _mem_dir(base)
+    if not os.path.isdir(os.path.join(mem_dir, ".git")):
+        return []
+    try:
+        log = subprocess.run(
+            ["git", "log", f"-{max(1, int(limit))}", "--format=%h%x1f%ad%x1f%s", "--date=short"],
+            cwd=mem_dir, capture_output=True, text=True, timeout=10,
+        )
+        if log.returncode != 0:
+            return []
+        entries = []
+        for line in log.stdout.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split("\x1f")
+            if len(fields) != 3:
+                continue
+            commit_hash, date, subject = fields
+            numstat = subprocess.run(
+                ["git", "show", "--numstat", "--format=", commit_hash],
+                cwd=mem_dir, capture_output=True, text=True, timeout=10,
+            )
+            files, insertions, deletions = _numstat_to_files(numstat.stdout)
+            entries.append({"hash": commit_hash, "date": date, "subject": subject,
+                            "files": files, "insertions": insertions, "deletions": deletions})
+        return entries
+    except Exception as e:
+        logger.debug(f"[MEMORY] git_log failed: {e}")
+        return []
+
+
+def git_diff_latest(base: str | None = None) -> str:
+    """Full unified diff of the most recent Memory/ commit (for `/memory
+    diff`). '' if there is no repo, no commits, or on any failure."""
+    import subprocess
+    mem_dir = _mem_dir(base)
+    if not os.path.isdir(os.path.join(mem_dir, ".git")):
+        return ""
+    try:
+        r = subprocess.run(["git", "show", "--format=", "HEAD"], cwd=mem_dir,
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception as e:
+        logger.debug(f"[MEMORY] git_diff_latest failed: {e}")
+        return ""
