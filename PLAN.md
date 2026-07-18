@@ -162,13 +162,13 @@ is retried safely on next start. Never delete originals.
 ```
 AGI-Brain/Memory/            ← `git init` here; NEVER the Zilla repo
   MEMORY.md                  ← core memory: owner facts, standing prefs. ≤ 2000 chars.
-  HEARTBEAT.md               ← agent-owned proactive checklist (see §7)
+  HEARTBEAT.md               ← agent-owned proactive checklist (see §8)
   Wiki/                      ← archival memory, one page per topic
     People/  Projects/  Preferences/  Places/  Systems/
   Journal/
     2026-07-17.md            ← one file per day, newest entries appended
   Skills/
-    <slug>/SKILL.md          ← learned skills (see §9); scripts live beside it
+    <slug>/SKILL.md          ← learned skills (see §10); scripts live beside it
 ```
 
 Page format: H1 title on line 1, one-line summary on line 2 (the wiki index
@@ -338,7 +338,7 @@ destructive automated job — the distillation lands in M4, not here.)
    conversation** (fresh conv id, discarded after the run — never advances
    any session's conv id); raw pre-distillation journal text stays
    recoverable via memory git history (M3 — already live by now).
-2. **Memory-change surfacing (the §13.9 injection-surface mitigation):**
+2. **Memory-change surfacing (the §14.9 injection-surface mitigation):**
    `git_autocommit` computes the per-run diff stat. When a run's inputs
    included untrusted content (document-ingest turn, browser-bearing turn)
    or the run was non-owner-originated, DM the owner one line: *"memory
@@ -469,7 +469,81 @@ states an intent ("I need to sort out my passport") → the reply proactively
 surfaces the right person → `/graph` on the phone shows the connection
 visually → exactly one curiosity question was asked along the way.
 
-## 7. Phase H — Heartbeat & self-healing
+## 7. Phase U — Generative UI & design system (executes after K, before H)
+
+**The idea:** the agent should be able to answer with *interface*, not just
+text — cards, tables, tappable buttons, real contact cards — the way cloud
+chat UIs do. **The mechanism (P5-compatible):** formatting is never
+hard-coded per feature and never left to raw model output. The agent emits a
+small declarative block; Zilla validates it against a strict schema and
+renders it with native Telegram widgets. The agent decides *when* and *what*;
+Zilla's code decides *how* and enforces *limits*. Invalid block → the block
+is stripped and the text still delivers (P4: a bad card never kills a reply).
+
+### U1 — The ZUI protocol (declarative block → native widgets)
+1. Grammar: the agent may embed at most 2 fenced blocks per reply:
+   ````
+   ```zui
+   {"kind": "buttons", "items": [
+     {"label": "Book the ticket", "say": "book the 6pm ticket"},
+     {"label": "Open site", "url": "https://…"}]}
+   ```
+   ````
+   Kinds (v1, exhaustive): `card` (title, subtitle, fields[], footer —
+   rendered as clean HTML with consistent typography), `table` (headers +
+   rows — monospace `<pre>` with column alignment; auto-degrades to
+   field-per-line beyond phone width), `contacts` (refs to graph entities —
+   rendered via Telegram `send_contact`, i.e. REAL contact cards with
+   tappable numbers and "save to contacts"; numbers resolved from the
+   entity page's `phone::` attribute, never free-typed by the model),
+   `buttons` (rows of inline buttons), `location` (lat/lon or a place
+   entity → Telegram venue card).
+2. Button verbs (whitelist, exhaustive): `say` (tap ⇒ the text is
+   submitted as the tapping owner's next message through the normal
+   pipeline — this is what makes replies feel alive: the agent offers next
+   actions as taps), `url` (http/https only — existing href guard),
+   `copy` (tap ⇒ value sent back as monospace for long-press copy).
+   No other verb exists; unknown verbs are dropped at validation.
+3. Deterministic validation in `formatter.py`: JSON schema, caps (≤ 2
+   blocks, ≤ 8 buttons, label ≤ 32 chars, table ≤ 8×20), scheme
+   whitelist, identity check on `say` callbacks (only the addressed uid's
+   taps are accepted — reuse the existing callback-identity pattern),
+   `contacts` only resolvable via graph nodes. Everything else stripped.
+   **Accept:** schema/caps/verb-whitelist tests incl. malicious blocks
+   (javascript: url, forged callback uid, free-typed phone number — all
+   rejected); golden renders for each kind; invalid-JSON block → text
+   still delivered.
+
+### U2 — Teach the agent (protocol, not hard-coding)
+1. Harness gains a compact ZUI reference with 3 worked examples and usage
+   guidance: options/next-steps → `buttons`; a person's reachable info →
+   `contacts`; comparisons/lists of records → `table`; a structured
+   answer (booking, plan, summary of an entity) → `card`. Plain prose
+   stays plain — no widget for widget's sake.
+2. The "get me contacts" loop lands here end-to-end: owner asks for a
+   person/plumber/whoever → agent runs memgraph/memsearch → replies with
+   `contacts` block(s) → owner taps → phone's native call/save sheet.
+   **Accept:** live smoke — "send me Ramesh's contact" yields a real
+   tappable contact card; "what should we do about X" yields tappable
+   next-step buttons that actually submit.
+
+### U3 — Design system (professional, Apple-grade restraint)
+1. `docs/dev/STYLE.md` — the visual constitution for every surface
+   (Telegram menus, ZUI renders, TUI later): typography hierarchy (bold
+   title / plain body / italic captions), ONE accent emoji per screen as
+   an icon — never emoji confetti, sentence case everywhere, primary
+   action first and `✕ Close` always last-row-right, consistent spacing
+   lines, no exclamation marks in UI copy, error copy = one calm sentence
+   + one action. Numbers right-aligned in tables. Every menu fits one
+   phone screen without scrolling.
+2. Refactor pass: existing `/settings`, `/sessions`, `/schedules`,
+   `/skills`, `/memory` menus and all ZUI renderers audited against
+   STYLE.md; deviations fixed. STYLE.md is binding for every later phase
+   (T inherits it wholesale).
+   **Accept:** style-lint checklist applied to every menu (documented in
+   STATUS.md with before/after screenshots in the live smoke).
+
+## 8. Phase H — Heartbeat & self-healing
 
 **Design (owner-confirmed):** ONE agent-owned file, `HEARTBEAT.md`, holds
 everything — briefings, watches, follow-ups, notes-to-self. The agent reads
@@ -564,7 +638,7 @@ Seeded template:
 
 ---
 
-## 8. Phase R — Router & fallback
+## 9. Phase R — Router & fallback
 
 ### R1 — Triage router
 `router.py`, deterministic only (P3), runs before the engine spends a lock:
@@ -582,8 +656,34 @@ Seeded template:
    `normal` — everything else, full injection, session backend.
 2. Misclassification safety: if a `trivial` reply comes back empty/error,
    silently rerun as `normal`. Router decisions logged.
-   **Accept:** classifier table-driven tests (≥ 30 cases); fast-profile
-   turn does not mutate session conv id; rerun-on-empty test.
+3. **Adaptive effort controller (owner-directed, never model-trusted):**
+   per-turn effort ∈ {fast, standard, deep}, resolved by deterministic
+   rules in priority order — the model NEVER decides its own effort
+   (P3/P5; a model grading its own homework under-thinks hard problems):
+   (a) **owner emphasis wins absolutely**: markers like "think hard /
+   deeply / carefully / properly", "take your time", or an explicit
+   `!deep` prefix ⇒ `deep`; (b) `trivial` class ⇒ `fast`; (c) everything
+   else ⇒ `standard`. Effort maps to backend+model per a `effort_map`
+   setting (defaults: fast = cheapest chain model, e.g. claude haiku;
+   standard = session backend as configured; deep = the chain's strongest
+   model, e.g. claude opus / Gemini High). `deep` turns get a "thinking
+   deeply…" progress note (P4).
+4. **agy model-switching constraint (recorded reality):** agy's active
+   model is a GLOBAL display string in its settings file — per-turn
+   switching would race with every other agy terminal on the machine (the
+   owner has personally hit this headache). Rule: effort-based model
+   switching happens ONLY on backends with a per-invocation model flag
+   (claude `--model`, opencode). On agy, effort routing changes *which
+   backend* runs the turn, never the agy model mid-session; agy model
+   changes remain an explicit owner action in `/settings` (existing
+   atomic write + read-back). Document in MANUAL.md that external agy
+   terminals share agy's model setting by agy's design — Zilla won't
+   silently mutate it.
+   **Accept:** classifier table-driven tests (≥ 30 cases); effort-
+   priority tests (emphasis beats trivial-class; `!deep` on a one-word
+   message still goes deep); effort_map dispatch test; fast-profile turn
+   does not mutate session conv id; rerun-on-empty test; NO test may
+   assert an agy model write during routing.
 
 ### R2 — Fallback chain
 1. Setting `backend_chain` (ordered, default = active backend + others
@@ -623,7 +723,7 @@ Seeded template:
 
 ---
 
-## 9. Phase S — Skills from chat (ask-first)
+## 10. Phase S — Skills from chat (ask-first)
 
 1. Format: `Memory/Skills/<slug>/SKILL.md` — frontmatter (`name`,
    `description`, `created`, `uses`) + body (when to use, steps); optional
@@ -664,7 +764,7 @@ Seeded template:
 
 ---
 
-## 10. Phase G — Gateway extraction, then Phase T — Terminal app
+## 11. Phase G — Gateway extraction, then Phase T — Terminal app
 
 ### G1 — Engine facade (prerequisite for T, pure refactor)
 1. Extract from `bot.py` into `engine.py`: the run pipeline (lock →
@@ -710,7 +810,7 @@ Seeded template:
 
 ---
 
-## 11. Phase V — Offline voice
+## 12. Phase V — Offline voice
 
 1. `faster-whisper` optional dependency (`pip install zilla[voice]` /
    requirements-voice.txt). Setting `transcribe = auto|local|online`
@@ -723,7 +823,7 @@ Seeded template:
 
 ---
 
-## 12. Cross-cutting engineering rules
+## 13. Cross-cutting engineering rules
 
 - **Testing:** every phase adds deterministic no-network tests to the suite
   (`test_fixes.py` / new `test_<module>.py` files wired into it). Suite
@@ -743,7 +843,7 @@ Seeded template:
 - **Secrets:** existing redaction filter covers new logs; memory protocol
   forbids credentials in Markdown; relay answers keep their wipe behavior.
 
-## 13. Risk register (with mitigations already in the plan)
+## 14. Risk register (with mitigations already in the plan)
 
 1. **G1 refactor breaks invariants** → isolated phase, behavior-freeze
    smoke checklist, small commits.
@@ -757,7 +857,7 @@ Seeded template:
    deterministic empty-file skip, try-acquire (never blocks the owner).
 6. **Memory privacy leak to non-owner users** → §4 scope guard: injection
    is owner-turn-only, enforced by uid with a negative test.
-7. **TUI↔daemon transport under-engineered** → §10 specifies the Unix-socket
+7. **TUI↔daemon transport under-engineered** → §11 specifies the Unix-socket
    JSONL protocol up front; WebBridge explicitly ruled out as transport.
 8. **Fallback to present-but-unauthenticated backend** → chain eligibility
    gated on H2 login-freshness probes (own timer, on-demand refresh).
@@ -778,7 +878,7 @@ Seeded template:
    `git filter-repo` wrapper — destructive, confirm-gated, exact steps in
    MANUAL.md.
 
-## 14. Execution order & progress
+## 15. Execution order & progress
 
 Execute strictly top-to-bottom. Check items off here (this file) as they land.
 
@@ -790,6 +890,9 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [ ] K2 Entity linking + neighborhood injection
 - [ ] K3 Curiosity loop
 - [ ] K4 Graph views (/graph HTML)
+- [ ] U1 ZUI protocol (cards/tables/contacts/buttons)
+- [ ] U2 Agent ZUI education + contacts loop
+- [ ] U3 Design system (STYLE.md + menu refactor)
 - [ ] H1 Heartbeat loop
 - [ ] H2 Health probes + assisted re-login
 - [ ] H3 systemd service

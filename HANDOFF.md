@@ -31,6 +31,9 @@ For any execution agent, every session:
 | K2 Entity linking + neighborhood injection | ⬜ | |
 | K3 Curiosity loop | ⬜ | |
 | K4 Graph views (/graph HTML) | ⬜ | |
+| U1 ZUI protocol (cards/tables/contacts/buttons) | ⬜ | planned by Fable, 2026-07-18 |
+| U2 Agent ZUI education + contacts loop | ⬜ | |
+| U3 Design system (STYLE.md + menu refactor) | ⬜ | |
 | H1 Heartbeat loop | ⬜ | |
 | H2 Health probes + assisted re-login | ⬜ | |
 | H3 systemd service | ⬜ | |
