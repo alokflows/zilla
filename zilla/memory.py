@@ -271,6 +271,11 @@ def reindex(base: str | None = None) -> int:
         for seen_row in db.mem_seen_all():
             if seen_row["path"] not in on_disk:
                 db.fts_delete(seen_row["path"])
+        try:
+            from zilla import graph as _graph
+            _graph.reindex_graph(db, mem_dir)
+        except Exception as e:
+            logger.debug(f"[MEMORY] graph reindex failed: {e}")
         return touched
     except Exception as e:
         logger.debug(f"[MEMORY] reindex failed: {e}")

@@ -1370,7 +1370,7 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] F3 Media importance + retention controls (§17) *(done, 980 green; also built the H1.4b retention-sweep mechanism itself, which H1 never actually shipped)*
 - [x] F4 System jobs invisible + silent (§17) *(done, 1000 green; fixed the real heartbeat-noise bug — non-HEARTBEAT_OK responses no longer broadcast the full raw response, only an explicit OWNER_ALERT: line, cooldown-gated via H2's should_alert/mark_alerted)*
 - [x] F5 Conversational schedule access (§17) — done 2026-07-18, 1014 green *(fresh full-gate count; the "1000" baseline this session inherited was already stale for reasons unrelated to F5 — see HANDOFF note)*
-- [ ] K1 Graph schema + indexer
+- [x] K1 Graph schema + indexer *(done 2026-07-18, 1050 green — nodes/aliases/edges in store.py; zilla/graph.py parser+indexer+BFS traversal; memgraph.py CLI: neighbors/path/find)*
 - [ ] K2 Entity linking + neighborhood injection
 - [ ] K3 Curiosity loop
 - [ ] K4 Graph views (/graph HTML)

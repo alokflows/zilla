@@ -91,6 +91,29 @@ CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(
     path, title, body, tokenize='porter unicode61'
 );
 CREATE TABLE IF NOT EXISTS mem_seen (path TEXT PRIMARY KEY, mtime REAL, size INTEGER);
+CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE,
+    type TEXT, title TEXT, bio TEXT,
+    is_ghost INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_nodes_title ON nodes(title);
+CREATE TABLE IF NOT EXISTS aliases (
+    alias TEXT NOT NULL, node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_aliases_alias ON aliases(alias);
+CREATE INDEX IF NOT EXISTS idx_aliases_node ON aliases(node_id);
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY,
+    src INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    rel TEXT NOT NULL,
+    dst INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    valid_from TEXT, valid_to TEXT,
+    provenance TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
+CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 """
 
 
@@ -535,6 +558,140 @@ class Store:
         actually on disk to find deletions)."""
         rows = self._r().execute("SELECT path, mtime, size FROM mem_seen").fetchall()
         return [dict(row) for row in rows]
+
+    # ── graph (nodes / aliases / edges — Phase K1) ───────────────────────
+    # Disposable, rebuildable from Memory/Wiki/**.md — the pages are the
+    # truth (PLAN.md §6). zilla/graph.py owns parsing + indexing; these are
+    # thin table-shaped primitives only.
+
+    def graph_node_get(self, node_id: int) -> dict | None:
+        row = self._r().execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        return dict(row) if row else None
+
+    def graph_node_get_by_path(self, path: str) -> dict | None:
+        row = self._r().execute("SELECT * FROM nodes WHERE path=?", (path,)).fetchone()
+        return dict(row) if row else None
+
+    def graph_node_get_by_title(self, title: str) -> dict | None:
+        """Case-insensitive exact title match — used both to resolve a
+        [[Wiki-link]] to an existing node and to find a ghost eligible for
+        promotion when its real page is indexed."""
+        row = self._r().execute(
+            "SELECT * FROM nodes WHERE title=? COLLATE NOCASE LIMIT 1", (title,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def graph_node_insert(self, *, path: str | None, type: str | None,
+                          title: str, bio: str | None, is_ghost: bool) -> int:
+        def _do(conn):
+            cur = conn.execute(
+                "INSERT INTO nodes (path, type, title, bio, is_ghost) VALUES (?, ?, ?, ?, ?)",
+                (path, type, title, bio, 1 if is_ghost else 0),
+            )
+            return cur.lastrowid
+        return self._write(_do)
+
+    def graph_node_update(self, node_id: int, *, type: str | None, title: str,
+                          bio: str | None, is_ghost: bool) -> None:
+        def _do(conn):
+            conn.execute(
+                "UPDATE nodes SET type=?, title=?, bio=?, is_ghost=? WHERE id=?",
+                (type, title, bio, 1 if is_ghost else 0, node_id),
+            )
+        self._write(_do)
+
+    def graph_node_promote(self, node_id: int, *, path: str, type: str | None,
+                           title: str, bio: str | None) -> None:
+        """A ghost node's real page has appeared — stamp its path and
+        clear is_ghost in one call (graph_node_update never touches path,
+        so a plain update alone can't do this)."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE nodes SET path=?, type=?, title=?, bio=?, is_ghost=0 WHERE id=?",
+                (path, type, title, bio, node_id),
+            )
+        self._write(_do)
+
+    def graph_node_demote_to_ghost(self, node_id: int) -> None:
+        """A real page was deleted but other pages still reference this
+        node — keep it as a hollow ghost rather than orphaning edges."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE nodes SET path=NULL, type=NULL, bio=NULL, is_ghost=1 WHERE id=?",
+                (node_id,),
+            )
+        self._write(_do)
+
+    def graph_node_delete(self, node_id: int) -> None:
+        def _do(conn):
+            conn.execute("DELETE FROM nodes WHERE id=?", (node_id,))
+        self._write(_do)
+
+    def graph_nodes_all(self) -> list[dict]:
+        rows = self._r().execute("SELECT * FROM nodes").fetchall()
+        return [dict(row) for row in rows]
+
+    def graph_clear(self) -> None:
+        """Wipe the entire graph — the rebuild-from-scratch path. Disposable
+        by design; the Markdown pages are re-parsed right after this."""
+        def _do(conn):
+            conn.execute("DELETE FROM edges")
+            conn.execute("DELETE FROM aliases")
+            conn.execute("DELETE FROM nodes")
+        self._write(_do)
+
+    def graph_aliases_set(self, node_id: int, aliases: list[str]) -> None:
+        """Replace this node's alias set wholesale."""
+        def _do(conn):
+            conn.execute("DELETE FROM aliases WHERE node_id=?", (node_id,))
+            for alias in aliases:
+                conn.execute(
+                    "INSERT INTO aliases (alias, node_id) VALUES (?, ?)", (alias, node_id)
+                )
+        self._write(_do)
+
+    def graph_alias_lookup(self, name: str) -> int | None:
+        """Resolve a bare name to a node id via aliases OR the node's own
+        title (case-insensitive exact match), aliases first."""
+        row = self._r().execute(
+            "SELECT node_id FROM aliases WHERE alias=? COLLATE NOCASE LIMIT 1", (name,)
+        ).fetchone()
+        if row:
+            return row["node_id"]
+        row = self._r().execute(
+            "SELECT id FROM nodes WHERE title=? COLLATE NOCASE LIMIT 1", (name,)
+        ).fetchone()
+        return row["id"] if row else None
+
+    def graph_edges_replace_for_path(self, path: str, edges: list[dict]) -> None:
+        """Drop every edge previously contributed by this page (provenance
+        prefix 'path:') and insert the freshly parsed set — re-indexing one
+        page never touches edges another page contributed."""
+        prefix = f"{path}:%"
+
+        def _do(conn):
+            conn.execute("DELETE FROM edges WHERE provenance LIKE ?", (prefix,))
+            for e in edges:
+                conn.execute(
+                    "INSERT INTO edges (src, rel, dst, valid_from, valid_to, provenance) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (e["src"], e["rel"], e["dst"], e.get("valid_from"), e.get("valid_to"),
+                     e.get("provenance")),
+                )
+        self._write(_do)
+
+    def graph_edges_all(self, *, history: bool = False) -> list[dict]:
+        """Every edge, current-facts-only unless history=True."""
+        if history:
+            rows = self._r().execute("SELECT * FROM edges").fetchall()
+        else:
+            rows = self._r().execute("SELECT * FROM edges WHERE valid_to IS NULL").fetchall()
+        return [dict(row) for row in rows]
+
+    def graph_edges_incoming_count(self, node_id: int) -> int:
+        return self._r().execute(
+            "SELECT COUNT(*) AS n FROM edges WHERE dst=?", (node_id,)
+        ).fetchone()["n"]
 
     # ── introspection (used by install.py --doctor, Phase M1 step 4) ────────
 
