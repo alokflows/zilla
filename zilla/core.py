@@ -433,24 +433,35 @@ class ZillaCore:
         # schedule-triggered turn can never create more schedules.
         self._scheduled_running: set[int] = set()
 
+        # Phase H2 (PLAN.md §6): the health probe loop is OFF by default —
+        # same opt-in pattern as memory_autocommit_enabled above. Every
+        # test-constructed ZillaCore (including ones that call start()) must
+        # NOT spawn real `agy models`/`claude -p ping` subprocesses on a
+        # background timer; only bot.py's real main() turns this on.
+        self.health_probes_enabled = False
+        self._health_task: asyncio.Task | None = None
+
     # ── lifecycle ───────────────────────────────────────────
 
     async def start(self):
         """Start background runtime: the scheduler loop (only if a
-        ScheduleManager was provided) and the bridge watcher (CORE_API
+        ScheduleManager was provided), the bridge watcher (CORE_API
         migration step 4 — always started; it is independent of the
-        scheduler). The silent self-healing HEALTH LOOP (periodic re-check,
-        self-heal, Alert only when a human must act) is Phase 7
-        (see HANDOFF.md) — deliberately NOT started here yet. Step 6 only
-        adds the point-in-time health_report() snapshot below."""
+        scheduler), and — only if health_probes_enabled — the H2 health
+        probe loop (see HANDOFF.md). Step 6 originally only added the
+        point-in-time health_report() snapshot; H2 adds the periodic,
+        self-healing, alert-on-human-needed loop on top of it."""
         if self.schedules is not None and self._sched_task is None:
             self._sched_task = asyncio.create_task(self._scheduler_loop())
         interactive.ensure_bridge_dir(self._bridge_dir)
         if self._bridge_task is None:
             self._bridge_task = asyncio.create_task(self._bridge_watcher_loop())
+        if self.health_probes_enabled and self._health_task is None:
+            self._health_task = asyncio.create_task(self._health_loop())
 
     async def stop(self):
-        """Stop the scheduler loop and the bridge watcher, cleanly."""
+        """Stop the scheduler loop, the bridge watcher, and the health
+        probe loop, cleanly."""
         if self._sched_task is not None:
             self._sched_task.cancel()
             try:
@@ -469,6 +480,15 @@ class ZillaCore:
             except Exception as e:  # pragma: no cover - defensive
                 logger.error(f"[BRIDGE] stop() cleanup error: {e}")
             self._bridge_task = None
+        if self._health_task is not None:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(f"[HEALTH] stop() cleanup error: {e}")
+            self._health_task = None
 
     # ── health snapshot (CORE_API migration step 6 — STUB) ─
     #
@@ -1204,3 +1224,68 @@ class ZillaCore:
             except Exception:
                 pass
             await asyncio.sleep(delay)
+
+    # ── H2: health probe loop (PLAN.md §6/H2) ───────────────
+    #
+    #  Its OWN timer, independent of _SCHED_TICK/heartbeat_interval — a
+    #  heartbeat_interval=0 (beat disabled) must never silence the probes.
+    #  Cheap probes (disk/db/binary-on-PATH/agy-login) are safe to redo every
+    #  tick; health.py's own per-kind TTL caching keeps the tick itself cheap
+    #  even so. The expensive one (claude ping) self-limits to 1x/6h inside
+    #  health.probe_claude_login regardless of tick frequency.
+
+    _HEALTH_TICK = 300  # 5 minutes between probe rounds
+
+    async def _self_heal_disk(self) -> bool:
+        """The only probe with a known silent fix today (PLAN.md §6/H2 step
+        2): prune agy brain dirs harder than H1's normal 7-day startup sweep
+        (1 day here, since a health-triggered heal means space is needed
+        NOW). Returns whether disk clears the threshold after the sweep —
+        the caller decides whether that still needs a human DM."""
+        try:
+            from zilla.cli_engine import gc_orphaned_conv_dirs
+            referenced = self.sessions.all_conversation_ids() if self.sessions else set()
+            removed = await asyncio.to_thread(gc_orphaned_conv_dirs, referenced, 1)
+            if removed:
+                logger.info(f"[HEALTH] disk self-heal: removed {removed} orphaned brain dir(s)")
+        except Exception as e:
+            logger.warning(f"[HEALTH] disk self-heal (brain-dir GC) failed: {e}")
+        from zilla import health as _health
+        return _health.probe_disk(force=True)["ok"]
+
+    async def _health_tick(self) -> None:
+        """One round of probes → silent self-heal where possible → a single
+        cooldown-gated Alert DM for anything that still needs a human."""
+        from zilla import config as _config
+        from zilla import health as _health
+        try:
+            results = await asyncio.to_thread(
+                _health.run_probes, get_backend(), _config.DB_FILE)
+        except Exception as e:
+            logger.error(f"[HEALTH] probe round failed: {e}", exc_info=True)
+            return
+        for kind, res in results.items():
+            if res.get("ok"):
+                _health.clear_alert(kind)
+                continue
+            if kind == "disk" and await self._self_heal_disk():
+                _health.clear_alert(kind)
+                continue
+            if _health.should_alert(kind):
+                self._broadcast(Alert(
+                    text=f"⚠️ {kind}: {res.get('detail', '')}\n"
+                         f"{_health.recovery_instructions(kind)}"
+                ))
+                _health.mark_alerted(kind)
+                log_event("health_alert", kind=kind, detail=(res.get("detail") or "")[:200])
+
+    async def _health_loop(self) -> None:
+        logger.info("[HEALTH] probe loop started")
+        while True:
+            try:
+                await self._health_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[HEALTH] loop error: {e}", exc_info=True)
+            await asyncio.sleep(self._HEALTH_TICK)

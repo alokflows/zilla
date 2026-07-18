@@ -53,14 +53,19 @@ def should_skip(base: str | None = None) -> bool:
     return not has_actionable_content(memory.read_heartbeat(base))
 
 
-def build_beat_prompt(now: datetime, last_run: float | None, tz_name: str) -> str:
-    """The exact per-fire beat prompt (PLAN.md §6/H1 step 3)."""
+def build_beat_prompt(now: datetime, last_run: float | None, tz_name: str,
+                      flags: list[str] | None = None) -> str:
+    """The exact per-fire beat prompt (PLAN.md §6/H1 step 3). `flags` are
+    H2's already-DM'd health-probe lines (PLAN.md §6/H2 step 3) prepended
+    so the agent doesn't duplicate an alert Zilla's own health loop
+    already sent."""
     last = (
         datetime.fromtimestamp(last_run).strftime("%Y-%m-%d %H:%M")
         if last_run else "never"
     )
+    prefix = "".join(f"{line}\n" for line in (flags or []))
     return (
-        f"It is {now.strftime('%Y-%m-%d %H:%M')} ({tz_name}). Last beat: {last}. "
+        f"{prefix}It is {now.strftime('%Y-%m-%d %H:%M')} ({tz_name}). Last beat: {last}. "
         "Read HEARTBEAT.md. Do anything due; update the file (stamps, checkoffs, "
         "prune stale items). If nothing needs the owner, reply HEARTBEAT_OK."
     )
@@ -80,8 +85,10 @@ def prepare_beat(s: dict, base: str | None = None) -> dict | None:
         return None
     now = datetime.now().astimezone()
     tz_name = now.tzname() or "local"
+    from zilla import health as _health
+    flags = _health.beat_flag_lines()
     s = dict(s)
-    s["prompt"] = build_beat_prompt(now, s.get("last_run"), tz_name)
+    s["prompt"] = build_beat_prompt(now, s.get("last_run"), tz_name, flags=flags)
     return s
 
 

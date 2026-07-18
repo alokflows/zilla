@@ -2940,6 +2940,10 @@ def main():
     # ZillaCore.__init__'s comment on memory_autocommit_enabled for why
     # every test leaves it off.
     core.memory_autocommit_enabled = True
+    # Phase H2: same opt-in pattern — real production is the only place the
+    # health probe loop (real `agy models`/`claude -p ping` subprocesses on
+    # a background timer) actually runs.
+    core.health_probes_enabled = True
     keyboards.auth = auth  # the keyboard builders read auth for role-gated menus
 
     model = get_model()
