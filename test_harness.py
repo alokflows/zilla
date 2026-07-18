@@ -292,6 +292,38 @@ def test_memsearch_line_appears_only_when_script_exists():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── 9b. schedule_query.py forward-compat line (Phase F5) ──
+
+def test_schedule_query_line_appears_only_when_script_exists_and_owner_only():
+    print("\n[9b] memory block — schedule_query.py line only when the script "
+          "exists, and only for the owner")
+    tmp, old = _iso_mem_dir()
+    old_here = harness._HERE
+    harness._HERE = tmp
+    try:
+        memory.ensure_tree()
+        owner_ctx = TurnContext(uid=111, role="owner", is_owner=True)
+        other_ctx = TurnContext(uid=222, role="limited", is_owner=False)
+
+        pre_without = build_preamble(is_new=False, ctx=owner_ctx)
+        check("no schedule_query.py -> no schedule instruction",
+              "schedule_query.py" not in pre_without, pre_without)
+
+        with open(os.path.join(tmp, "schedule_query.py"), "w", encoding="utf-8") as f:
+            f.write("# stub\n")
+        pre_with = build_preamble(is_new=False, ctx=owner_ctx)
+        check("schedule_query.py present -> instruction line included",
+              "schedule_query.py" in pre_with, pre_with)
+
+        pre_other = build_preamble(is_new=False, ctx=other_ctx)
+        check("schedule_query.py present but non-owner -> no instruction line",
+              "schedule_query.py" not in pre_other, pre_other)
+    finally:
+        harness._HERE = old_here
+        memory.MEMORY_DIR = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ── 10. concurrent two-principal isolation ──
 
 def test_concurrent_owner_and_non_owner_no_leakage():
@@ -341,6 +373,7 @@ def main():
         test_first_run_interview_line,
         test_memory_block_caps,
         test_memsearch_line_appears_only_when_script_exists,
+        test_schedule_query_line_appears_only_when_script_exists_and_owner_only,
         test_concurrent_owner_and_non_owner_no_leakage,
     ]
     print("Running zilla.memory / zilla.harness memory-injection tests...\n")

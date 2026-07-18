@@ -354,6 +354,16 @@ def _memory_block(ctx: "TurnContext | None") -> str:
     else:
         recall_line += "."
 
+    schedule_query_path = os.path.join(_HERE, "schedule_query.py")
+    schedule_line = None
+    if os.path.exists(schedule_query_path):
+        schedule_line = (
+            f"- You can inspect the owner's schedules with `python {schedule_query_path}` "
+            f"(or `python {schedule_query_path} <id>` for one), when asked what's "
+            "scheduled, upcoming, or about a specific reminder — answer directly in "
+            "plain language instead of pointing at a menu."
+        )
+
     parts = [
         "## Your memory (persistent, yours to maintain)",
         core_text.strip() or "(empty)",
@@ -375,6 +385,8 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         "Journal noting what it is and why it's kept.",
         "- Never store credentials, OTPs, or tokens in any memory file.",
     ]
+    if schedule_line:
+        parts.append(schedule_line)
     if was_template:
         parts.append(
             "\nMEMORY.md is still empty — briefly interview the owner "

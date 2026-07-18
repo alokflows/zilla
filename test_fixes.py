@@ -622,6 +622,7 @@ from datetime import datetime, timedelta  # noqa: E402
 import schedules as sched_mod  # noqa: E402
 from schedules import ScheduleManager, compute_next_run, RETRY_LADDER  # noqa: E402
 from schedule_parse import parse_schedule, parse_schedule_command  # noqa: E402
+import schedule_query  # noqa: E402
 from cli_engine import detect_limit  # noqa: E402
 
 
@@ -830,6 +831,48 @@ def test_ensure_system_schedule_still_finds_existing_across_restart():
           first["id"] == second["id"])
     check("sched: exactly one system row exists, not two",
           len(sm.list_system(9)) == 1)
+
+
+# ════════════════════════════════════════════════════════════
+#  F5 (PLAN.md §17) — conversational schedule access (schedule_query.py)
+# ════════════════════════════════════════════════════════════
+
+def test_schedule_query_render_list_excludes_system_and_matches_next_run():
+    sm = _sm()
+    now = _epoch(2026, 6, 2, 8, 0)
+    mine = sm.add(9, 9, "water the plants", "daily", {"hh": 9, "mm": 0}, now=now)
+    sm.add(9, 9, "beat", "interval", {"seconds": 60}, now=now, system=True)
+    text = schedule_query.render_list(sm, 9)
+    check("schedule_query: list mentions the owner's own schedule",
+          "water the plants" in text, text)
+    check("schedule_query: list never mentions a system job",
+          "beat" not in text, text)
+    check("schedule_query: list shows the exact stored next_run",
+          schedule_query._fmt_ts(mine["next_run"]) in text, text)
+    check("schedule_query: no schedules -> plain message",
+          schedule_query.render_list(sm, 404) == "No schedules.")
+
+
+def test_schedule_query_render_detail_matches_and_scoped_to_owner():
+    sm = _sm()
+    now = _epoch(2026, 6, 2, 8, 0)
+    s = sm.add(9, 9, "call mom", "weekly", {"days": [0], "hh": 9, "mm": 0}, now=now)
+    text = schedule_query.render_detail(sm, 9, s["id"])
+    check("schedule_query: detail includes title", "call mom" in text, text)
+    check("schedule_query: detail includes next run",
+          schedule_query._fmt_ts(s["next_run"]) in text, text)
+    check("schedule_query: detail includes fail count", "fail count: 0" in text, text)
+    check("schedule_query: another user's id -> not found",
+          schedule_query.render_detail(sm, 999, s["id"]) == "No such schedule.")
+    check("schedule_query: unknown id -> not found",
+          schedule_query.render_detail(sm, 9, "nope") == "No such schedule.")
+
+
+def test_schedule_query_render_detail_hides_system_job():
+    sm = _sm()
+    s = sm.add(9, 9, "beat", "interval", {"seconds": 60}, system=True)
+    check("schedule_query: a system job's own id is never resolvable here",
+          schedule_query.render_detail(sm, 9, s["id"]) == "No such schedule.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1504,6 +1547,9 @@ def main():
         test_schedule_remove_and_owner_scope,
         test_schedule_list_hides_system_jobs_by_default,
         test_ensure_system_schedule_still_finds_existing_across_restart,
+        test_schedule_query_render_list_excludes_system_and_matches_next_run,
+        test_schedule_query_render_detail_matches_and_scoped_to_owner,
+        test_schedule_query_render_detail_hides_system_job,
         test_parse_schedule_forms,
         test_parse_schedule_command_forms,
         test_detect_limit,
