@@ -1104,13 +1104,88 @@ violation of "never feels dead". Background tasks get their own lane.
    owner-trained model + tunable threshold + audible chime + everything it
    heard lands visibly in the session transcript — never a silent action.
 
-## 17. Execution order & progress
+## 17. Phase F — Foundation cleanup (EXECUTES IMMEDIATELY AFTER M3, before M4)
+
+Owner-ordered corrections to things already built or about to calcify.
+Positioned early on purpose: every later phase writes paths, menus, and
+system jobs — fix the foundation before more code lands on it.
+
+### F1 — `AGI-Brain` dies; `ZILLA_HOME` is born
+1. The data home becomes **`~/Zilla`** (env override `ZILLA_HOME`) —
+   visible and owner-facing, not a dot-dir; the knowledge is the product:
+   `Memory/` (the git repo) · `Inbox/` · `Outbox/` · `Runtime/`
+   (`zilla.db`, backups, pid, sock, logs). All path constants resolve
+   through config from `ZILLA_HOME`; nothing composes "AGI-Brain" ever
+   again.
+2. Migration, deterministic, first start: legacy `~/AGI-Brain` exists and
+   `~/Zilla` doesn't ⇒ move contents into the new layout, then leave a
+   symlink `AGI-Brain → ~/Zilla` for one release (external references,
+   old transcripts). Path fences (`safe_send_file`, inbox realpath
+   checks) re-anchored to the new roots.
+3. **Separation of ownership, recorded:** backend conversation stores
+   (agy's brain dir, claude's sessions) are the BACKENDS' property and
+   stay wherever the backend puts them (`BRAIN_DIR` stays a distinct
+   setting). Zilla's home holds knowledge and operations — conversations
+   belong to brains, knowledge belongs to you.
+   **Accept:** migration test (seeded legacy tree → moved + symlink +
+   fences hold); full suite green on new paths; doctor shows the home.
+
+### F2 — No hard-coded backends anywhere (dynamic registry)
+1. Each backend adapter self-describes: `{name, binary, probe(),
+   login_cmd, model_flag: bool, models()}` in a registry. **Every**
+   surface derives from a PATH+login probe of that registry at
+   render time: the `/settings` backend buttons (a CLI that isn't
+   installed simply isn't a button; installed-but-logged-out renders with
+   a `login` action wired to H2.4's `/login`), the chain editor,
+   `effort_map` validation, doctor, and the connectors matrix. Zero
+   hard-coded backend lists in `keyboards.py` or anywhere else.
+2. Adding a future backend = registering one adapter; every menu and
+   validator picks it up with no UI edits. (R3's opencode adapter lands
+   as the proof: register it, watch the button appear.)
+   **Accept:** registry probe tests (present/absent/logged-out binaries
+   mocked); menu-generation test — buttons exactly match probe results;
+   grep-gate: no literal backend-name button lists outside the registry.
+
+### F3 — Media importance + retention controls
+1. Settings (owner, `/settings → Storage`): auto-sweep **on/off** and
+   duration picker **30 / 60 / 90 days** (values, not free text; 0=off
+   equivalent). Sweep behavior itself is H1.4b.
+2. **Importance recognition:** harness protocol line — when context says
+   a received file matters ("this is my passport", "save this bill"),
+   the agent copies it to `Memory/Media/` and journals one line. Plus a
+   deterministic path: every media acknowledgment carries a ZUI `Keep`
+   button ⇒ same graduation, no model judgment. `Memory/Media/` is
+   sweep-exempt, git-tracked, cloud-backed (C3).
+   **Accept:** settings render/persist tests; Keep-button graduation
+   test; sweep honors off/30/60/90 and never touches `Memory/Media/`.
+
+### F4 — System jobs are invisible internals (the heartbeat-noise fix)
+1. `system = 1` jobs (heartbeat, distillation, snapshots) **never appear
+   in `/schedules`** — that surface is for the owner's schedules only.
+   They live under `/health → System jobs` (status, last run, pause) —
+   pausable, never deletable, and never announce themselves: no
+   "⏰ Scheduled — <title>" headers, no result DMs.
+2. Output contract (deterministic): a system job's output goes to the
+   log. ONLY lines prefixed `OWNER_ALERT:` are DM'd (one calm line,
+   cooldown-gated via H2's alerting) — everything else, including the
+   whole HEARTBEAT_OK/quiet-run mechanism, stays silent. An in-flight
+   build that already created these as visible schedules migrates them
+   (marked system, stripped from the user list) in this sub-phase.
+   **Accept:** /schedules never renders system jobs; announcement-
+   suppression tests; OWNER_ALERT extraction + cooldown test; migration
+   test for pre-existing visible system schedules.
+
+## 18. Execution order & progress
 
 Execute strictly top-to-bottom. Check items off here (this file) as they land.
 
-- [ ] M1 SQLite store + migration
-- [ ] M2 Memory layout + injection
-- [ ] M3 FTS5 + memory git + quiet runs
+- [x] M1 SQLite store + migration *(done on execution branch, 606 green)*
+- [x] M2 Memory layout + injection *(done, 652 green)*
+- [x] M3 FTS5 + memory git + quiet runs *(done, 686 green)*
+- [ ] F1 ZILLA_HOME replaces AGI-Brain (§17)
+- [ ] F2 Dynamic backend registry — no hard-coded backends (§17)
+- [ ] F3 Media importance + retention controls (§17)
+- [ ] F4 System jobs invisible + silent (§17)
 - [ ] M4 Nightly distillation + /memory + change surfacing
 - [ ] K1 Graph schema + indexer
 - [ ] K2 Entity linking + neighborhood injection

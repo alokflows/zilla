@@ -1,8 +1,24 @@
 # HANDOFF — status board
 
-**Planned by Fable (planning session, 2026-07-17) with the owner. The full
-engineering blueprint is [`PLAN.md`](PLAN.md) — read it and execute, phase by
-phase, in order.**
+**Planned by Fable (planning sessions, 2026-07-17/18) with the owner. The
+full engineering blueprint is [`PLAN.md`](PLAN.md) — read it and execute,
+phase by phase, in order.**
+
+## Branch topology — READ BEFORE ANYTHING (execution agents)
+
+- **Planning branch (this spec's source of truth):**
+  `claude/python-cli-bot-planning-80x8a3` — Fable writes PLAN.md here.
+- **Execution branch (the code's source of truth):**
+  `claude/zilla-harness-review-0v96bs` — all implementation commits live
+  here (M1–M3 pushed; the owner's machine may hold commits beyond that).
+- **Start of EVERY execution session:** check out the execution branch,
+  `git pull`, PUSH any local commits that aren't on the remote yet (an
+  unpushed session nearly caused divergence once — never again), then
+  `git fetch origin claude/python-cli-bot-planning-80x8a3 && git merge
+  origin/claude/python-cli-bot-planning-80x8a3`. Conflict rule: PLAN.md —
+  planning branch wins (it is the spec); HANDOFF status rows — execution
+  branch wins (it is the record of what's built). Push after every
+  session, without exception.
 
 For any execution agent, every session:
 
@@ -23,9 +39,13 @@ For any execution agent, every session:
 |---|---|---|
 | Planning (architecture, phases, blueprint) | ✅ done | Fable + owner, 2026-07-17 |
 | Independent adversarial review + amendments | ✅ done | 2nd Fable review: 2 critical, 5 high, 9 medium, 4 low — all verified against code and folded into PLAN.md |
-| M1 SQLite store + migration | ⬜ next | |
-| M2 Memory layout + injection | ⬜ | |
-| M3 FTS5 + memory git + quiet runs | ⬜ | |
+| M1 SQLite store + migration | ✅ done | execution branch, 606 green |
+| M2 Memory layout + injection | ✅ done | 652 green, TurnContext landed |
+| M3 FTS5 + memory git + quiet runs | ✅ done | 686 green |
+| F1 ZILLA_HOME replaces AGI-Brain | ⬜ next | Phase F (§17) — owner-ordered, runs before M4 |
+| F2 Dynamic backend registry | ⬜ | no hard-coded backend buttons anywhere |
+| F3 Media importance + retention controls | ⬜ | |
+| F4 System jobs invisible + silent | ⬜ | fixes the heartbeat noise the owner is seeing live |
 | M4 Nightly distillation + /memory + change surfacing | ⬜ | |
 | K1 Graph schema + indexer | ⬜ | planned by Fable, 2026-07-18 |
 | K2 Entity linking + neighborhood injection | ⬜ | |
