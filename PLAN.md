@@ -33,6 +33,14 @@ scheduling, health, and interfaces (Telegram today, terminal app in this plan).
 - **P6 — Preserve the concurrency invariants** I-CONV / I-STEP / I-CANCEL / L
   (defined in `AI_CONTEXT.md`). All CLI execution stays inside the per-user
   lock; conversation ids stay backend-tagged.
+- **P7 — Headless-first: 100% operable from Telegram.** The runtime is a
+  display-less server. EVERY operation, error, and recovery path must be
+  performable from Telegram (with the TUI-over-SSH as the second surface).
+  No feature may assume a local display, and nothing may be console-only:
+  any state a console would show must be reachable remotely (`/health` runs
+  the doctor probes on demand). A feature whose failure mode ends with
+  "SSH in and look at the logs" is incomplete — the error must arrive in
+  Telegram as one calm sentence with its recovery action.
 
 **Platforms:** development on macOS; primary runtime is Linux (laptop or
 always-on server). Windows keeps working via `platform_compat.py` but is not
@@ -53,7 +61,10 @@ the optimization target. All OS divergence stays in `platform_compat.py`.
                       │  heartbeat.py— proactive loop              │
                       │  skills.py   — skill store + approval      │
                       │  schedules   — timers & recurring jobs     │
-                      │  health.py   — probes + assisted re-login  │
+                      │  tasks.py    — background task lane        │
+                      │  health.py   — probes + re-login + update  │
+                      │  connectors  — per-backend MCP/native mgmt │
+                      │  voice/      — wake-word satellite (V3)    │
                       │  store.py    — SQLite (state + FTS index)  │
                       └───────┬──────────────────┬─────────────────┘
                               │                  │
@@ -115,15 +126,19 @@ CREATE TABLE schedules (id TEXT PRIMARY KEY, uid INTEGER NOT NULL,
                         kind TEXT NOT NULL,          -- once|interval|daily|weekly
                         spec TEXT NOT NULL,          -- JSON, same shape as today
                         title TEXT, prompt TEXT,
-                        session_name TEXT,           -- legacy pre-Part-B binding (back-compat read only)
-                        session TEXT,                 -- 'isolated'|'main'|'named:<x>' (resolve_session_mode)
+                        session_name TEXT,           -- legacy binding (back-compat read only)
+                        session TEXT,                -- 'isolated'|'main'|'named:<x>' (resolve_session_mode)
                         payload_type TEXT DEFAULT 'message',  -- message|system_event|command
-                        backend TEXT, model TEXT,     -- pin (None = any); see backend_pin_mismatch
-                        backend_pin_notified INTEGER DEFAULT 0,  -- one-time pin-drift note, never repeats
+                        backend TEXT, model TEXT,    -- pin (None = any); see backend_pin_mismatch
+                        backend_pin_notified INTEGER DEFAULT 0,
                         enabled INTEGER DEFAULT 1,
-                        system INTEGER DEFAULT 0,    -- system jobs: undeletable via UI, pausable
-                        next_run REAL, last_run REAL, -- epoch seconds (compute_next_run's native unit)
+                        system INTEGER DEFAULT 0,    -- system jobs: see F4 (hidden, silent)
+                        next_run REAL, last_run REAL, -- epoch seconds (compute_next_run native unit)
                         fail_count INTEGER DEFAULT 0, created_at TEXT); -- replaces schedules.json
+-- NOTE (merge 2026-07-18): the columns above reflect the schema as BUILT on
+-- the execution branch through M3 (session modes, payload types, backend
+-- pins) — built reality wins over the original draft. Executors: trust
+-- store.py's actual schema + migrations over any older text.
 CREATE TABLE usage     (day TEXT NOT NULL, backend TEXT NOT NULL,
                         turns INTEGER DEFAULT 0, errors INTEGER DEFAULT 0,
                         fallbacks INTEGER DEFAULT 0,
@@ -135,21 +150,6 @@ CREATE TABLE skill_approvals (slug TEXT PRIMARY KEY,
 CREATE VIRTUAL TABLE mem_fts USING fts5(path, title, body, tokenize='porter unicode61');
 CREATE TABLE mem_seen  (path TEXT PRIMARY KEY, mtime REAL, size INTEGER);
 ```
-
-**M1 grep-enumeration correction (2026-07-17 night, per the step-2 mandate
-below):** `users.name` and `schedules.session`/`payload_type`/`backend`/
-`model`/`backend_pin_notified` were read/written by live code
-(`zilla/users.py`, `zilla/schedules.py`) but absent from the schema as
-first drafted — added above. Confirmed against source, not just grep:
-`resolve_session_mode()` and `backend_pin_mismatch()` in
-`zilla/schedules.py` depend on all five schedule fields; `add_user()` in
-`zilla/users.py` always writes `name`. Also corrected:
-`schedules.next_run`/`last_run` are epoch-second floats in every real
-write path (`compute_next_run`, `touch_run`, `mark_failure`), not the
-TEXT datetime strings first drafted — now REAL. `schedules.system` and
-`users.added_by` remain in the schema unused by current code (forward-
-looking, harmless). `usage`/`skill_approvals` have no migration source
-data (later phases populate them).
 
 **Threading/locking model (one coherent story — do not improvise another):**
 - Managers (`SessionManager`, `ScheduleManager`, `users`, settings KV) become
@@ -181,13 +181,13 @@ is retried safely on next start. Never delete originals.
 ```
 AGI-Brain/Memory/            ← `git init` here; NEVER the Zilla repo
   MEMORY.md                  ← core memory: owner facts, standing prefs. ≤ 2000 chars.
-  HEARTBEAT.md               ← agent-owned proactive checklist (see §6)
+  HEARTBEAT.md               ← agent-owned proactive checklist (see §8)
   Wiki/                      ← archival memory, one page per topic
     People/  Projects/  Preferences/  Places/  Systems/
   Journal/
     2026-07-17.md            ← one file per day, newest entries appended
   Skills/
-    <slug>/SKILL.md          ← learned skills (see §8); scripts live beside it
+    <slug>/SKILL.md          ← learned skills (see §11); scripts live beside it
 ```
 
 Page format: H1 title on line 1, one-line summary on line 2 (the wiki index
@@ -357,7 +357,7 @@ destructive automated job — the distillation lands in M4, not here.)
    conversation** (fresh conv id, discarded after the run — never advances
    any session's conv id); raw pre-distillation journal text stays
    recoverable via memory git history (M3 — already live by now).
-2. **Memory-change surfacing (the §12.9 injection-surface mitigation):**
+2. **Memory-change surfacing (the §16.9 injection-surface mitigation):**
    `git_autocommit` computes the per-run diff stat. When a run's inputs
    included untrusted content (document-ingest turn, browser-bearing turn)
    or the run was non-owner-originated, DM the owner one line: *"memory
@@ -372,7 +372,214 @@ destructive automated job — the distillation lands in M4, not here.)
 
 ---
 
-## 6. Phase H — Heartbeat & self-healing
+## 6. Phase K — Relational graph memory (executes after M4, before Phase H)
+
+The wiki grows a **property-graph layer**: entities are wiki pages, typed
+relations are lines inside those pages, and a deterministic indexer derives a
+queryable graph in `zilla.db`. Zep/Graphiti-class capability — typed edges,
+temporal validity, entity resolution, provenance — with zero new
+dependencies, zero extra AI calls in the pipeline, and P1 fully intact (the
+graph tables are disposable; the pages are the truth).
+
+**Ontology (full, from day one — owner decision):** node types `person`,
+`org`, `place`, `project`, `topic`. Seed relation verbs: `knows`,
+`family_of`, `works_at`, `member_of`, `located_in`, `part_of`,
+`involved_in`, `supplies` — free verbs are allowed (normalized to
+`lower_snake`); the indexer NEVER fails on an unknown verb.
+
+**Entity page format** (extends §3.2; parse rules are exact):
+
+```
+# Ramesh Kumar
+Cousin; the person to call for anything passport-related.   ← line 2 = bio line
+- type:: person
+- aliases:: Ramesh, my cousin, passport guy
+- phone:: +91 …                                             ← any other key:: value = attribute
+## Relations
+- works_at:: [[Passport Office]] (since 2024-01)
+- family_of:: [[Suresh]]
+- worked_at:: [[XYZ Corp]] (2020 .. 2023-06)                ← closed interval = superseded fact
+```
+
+`key:: value` lines and `verb:: [[Target]] (dates?)` lines are the entire
+grammar. `[[Wiki-links]]` anywhere in prose also count as untyped `mentions`
+edges (Obsidian semantics). A `[[Target]]` with no page yet becomes a
+**ghost node** — rendered hollow in views, and a curiosity trigger.
+
+### K1 — Graph schema + indexer
+1. Schema (in `zilla.db`, rebuildable):
+   `nodes(id, path UNIQUE, type, title, bio, is_ghost)` ·
+   `aliases(alias, node_id)` ·
+   `edges(src, rel, dst, valid_from, valid_to, provenance)` — provenance =
+   `path:line` of the source relation line; open `valid_to` = currently
+   true (bi-temporal: facts are superseded by closing the interval, never
+   deleted — M3's indexer extends to parse the grammar above on the same
+   mtime-diff cycle).
+2. `memgraph.py` CLI (agent-callable, like memsearch): `neighbors <name>
+   [--hops 2]`, `path <a> <b>` (how are these connected), `find <type>
+   [--near <name>]`. Traversal = recursive CTEs; current-facts-only by
+   default, `--history` includes closed intervals.
+   **Accept:** parser golden tests (grammar above, incl. ghost nodes, date
+   intervals, alias multi-match); index rebuild-from-scratch equals
+   incremental result; CTE traversal tests (2-hop, path, cycles safe);
+   unknown verbs indexed not rejected.
+
+### K2 — Turn-time entity linking + neighborhood injection
+1. Deterministic alias scan of each owner message (longest-match against
+   `aliases`, case-insensitive, word-bounded). For each hit (cap 3 nodes),
+   inject a compact **local graph card** into the turn: bio line + current
+   edges 1 hop out (2 hops for the single strongest hit), ≤ 25 lines
+   total, with a `[via graph]` header. This is how "I need to renew my
+   passport" surfaces `Passport Office —[works_at]— Ramesh` *before* the
+   agent even reasons.
+2. Harness protocol addition (owner turns): *"You have a relational memory.
+   To answer 'whom do I know at/for X' or plan anything involving people,
+   places, or organizations, run memgraph.py. When the owner shares a new
+   fact about an entity, update that entity's page (create it from the
+   template if missing — every person gets a bio line); record relations
+   as `verb:: [[Target]]` lines; close an interval when a fact is
+   superseded, never delete the line."*
+   **Accept:** alias-scan unit tests (word boundary, longest match, cap);
+   injection golden test; live smoke — mention a stored person by a
+   nickname alias, the reply reflects graph knowledge without an explicit
+   memory question.
+
+### K3 — Curiosity loop (one question, when relevant — owner decision)
+1. Deterministic gap detection at index time (zero AI): `person` node with
+   no contact attribute; ghost node referenced from ≥ 2 pages; `org`/
+   `place` with no `located_in`. Gaps land in a `curiosity(node_id, gap,
+   asked_at)` table.
+2. Enforcement is code, not model judgment (P5): the harness includes AT
+   MOST ONE pending curiosity question per conversation, and only when the
+   gap's node was activated by K2's alias scan in the current turn
+   (relevance gate). Phrasing is the agent's; the *permission to ask* is
+   Zilla's. Owner answers flow through the normal memory protocol (agent
+   updates the page; next index cycle clears the gap). A question asked
+   and unanswered is cooled down 7 days.
+   **Accept:** gap-detection tests; one-question-per-conversation and
+   relevance-gate tests; cooldown test; live smoke — mention a new person
+   twice, get exactly one polite "should I save his contact?" follow-up.
+
+### K4 — Graph views (the flabbergast moment)
+1. `/graph` (Telegram, owner): generates a **self-contained single-file
+   HTML** (inline JS/CSS, no CDN — must open offline on a phone) rendering
+   the current graph from a JSON snapshot embedded in the file. Obsidian-
+   grade features, specified: canvas force-directed simulation (repulsion +
+   spring + centering, ~60 fps for ≤ 2k nodes); node size ∝ degree; color
+   by node type (legend); ghost nodes hollow; **global view + local view**
+   (tap a node → its N-hop neighborhood, N slider 1–3); filters (by type,
+   by search box, orphans on/off); tap a node → side panel with bio,
+   attributes, current relations, and "superseded" history collapsed.
+   Sent via `safe_send_file` to the Outbox. `/graph <name>` opens directly
+   in local view on that node.
+2. TUI: Phase T's screen list gains **Graph** — a local-graph explorer
+   (adjacency tree around a chosen node, arrow-key navigation, enter →
+   open the page); the full visual stays HTML (terminals can't do force
+   layouts honestly).
+   **Accept:** HTML generation golden test (valid, self-contained, embeds
+   N nodes); renders offline in a plain browser (live smoke on phone);
+   local-view + filter behavior verified in smoke; 2k-node synthetic graph
+   stays interactive.
+
+**Phase K definition of done:** live smoke demonstrating the full loop —
+owner mentions a new person + workplace in normal chat → pages appear with
+bio lines and typed relations (M-git commits show it) → days later, owner
+states an intent ("I need to sort out my passport") → the reply proactively
+surfaces the right person → `/graph` on the phone shows the connection
+visually → exactly one curiosity question was asked along the way.
+
+## 7. Phase U — Generative UI & design system (executes after K, before H)
+
+**The idea:** the agent should be able to answer with *interface*, not just
+text — cards, tables, tappable buttons, real contact cards — the way cloud
+chat UIs do. **The mechanism (P5-compatible):** formatting is never
+hard-coded per feature and never left to raw model output. The agent emits a
+small declarative block; Zilla validates it against a strict schema and
+renders it with native Telegram widgets. The agent decides *when* and *what*;
+Zilla's code decides *how* and enforces *limits*. Invalid block → the block
+is stripped and the text still delivers (P4: a bad card never kills a reply).
+
+### U1 — The ZUI protocol (declarative block → native widgets)
+1. Grammar: the agent may embed at most 2 fenced blocks per reply:
+   ````
+   ```zui
+   {"kind": "buttons", "items": [
+     {"label": "Book the ticket", "say": "book the 6pm ticket"},
+     {"label": "Open site", "url": "https://…"}]}
+   ```
+   ````
+   Kinds (v1, exhaustive): `card` (title, subtitle, fields[], footer —
+   rendered as clean HTML with consistent typography), `table` (headers +
+   rows — monospace `<pre>` with column alignment; auto-degrades to
+   field-per-line beyond phone width), `contacts` (refs to graph entities —
+   rendered via Telegram `send_contact`, i.e. REAL contact cards with
+   tappable numbers and "save to contacts"; numbers resolved from the
+   entity page's `phone::` attribute, never free-typed by the model),
+   `buttons` (rows of inline buttons), `location` (lat/lon or a place
+   entity → Telegram venue card).
+2. Button verbs (whitelist, exhaustive): `say` (tap ⇒ the text is
+   submitted as the tapping owner's next message through the normal
+   pipeline — this is what makes replies feel alive: the agent offers next
+   actions as taps), `url` (http/https only — existing href guard),
+   `copy` (tap ⇒ value sent back as monospace for long-press copy).
+   No other verb exists; unknown verbs are dropped at validation.
+3. Deterministic validation in `formatter.py`: JSON schema, caps (≤ 2
+   blocks, ≤ 8 buttons, label ≤ 32 chars, table ≤ 8×20), scheme
+   whitelist, identity check on `say` callbacks (only the addressed uid's
+   taps are accepted — reuse the existing callback-identity pattern),
+   `contacts` only resolvable via graph nodes. Everything else stripped.
+   **Accept:** schema/caps/verb-whitelist tests incl. malicious blocks
+   (javascript: url, forged callback uid, free-typed phone number — all
+   rejected); golden renders for each kind; invalid-JSON block → text
+   still delivered.
+
+### U2 — Teach the agent (protocol, not hard-coding)
+1. Harness gains a compact ZUI reference with 3 worked examples and usage
+   guidance: options/next-steps → `buttons`; a person's reachable info →
+   `contacts`; comparisons/lists of records → `table`; a structured
+   answer (booking, plan, summary of an entity) → `card`. Plain prose
+   stays plain — no widget for widget's sake.
+2. The "get me contacts" loop lands here end-to-end: owner asks for a
+   person/plumber/whoever → agent runs memgraph/memsearch → replies with
+   `contacts` block(s) → owner taps → phone's native call/save sheet.
+   **Accept:** live smoke — "send me Ramesh's contact" yields a real
+   tappable contact card; "what should we do about X" yields tappable
+   next-step buttons that actually submit.
+
+### U3 — Design system (professional, Apple-grade restraint)
+1. `docs/dev/STYLE.md` — the visual constitution for every surface
+   (Telegram menus, ZUI renders, TUI later): typography hierarchy (bold
+   title / plain body / italic captions), ONE accent emoji per screen as
+   an icon — never emoji confetti, sentence case everywhere, primary
+   action first and `✕ Close` always last-row-right, consistent spacing
+   lines, no exclamation marks in UI copy, error copy = one calm sentence
+   + one action. Numbers right-aligned in tables. Every menu fits one
+   phone screen without scrolling.
+2. Refactor pass: existing `/settings`, `/sessions`, `/schedules`,
+   `/skills`, `/memory` menus and all ZUI renderers audited against
+   STYLE.md; deviations fixed. STYLE.md is binding for every later phase
+   (T inherits it wholesale).
+   **Accept:** style-lint checklist applied to every menu (documented in
+   STATUS.md with before/after screenshots in the live smoke).
+
+### U4 — Presence (kill the startup blast)
+1. The current `⚡ Zilla is online (vX) / Model / Time` message on every
+   start (bot.py post_init) is REMOVED. Replacement — a **pinned status
+   card**: one message in the owner chat, pinned once, then **edited in
+   place** (edits generate no notifications): `● Online · <backend> ·
+   v<X>` / `○ Offline since <t>` (best-effort edit on clean shutdown),
+   plus last-heartbeat time. Glanceable always, noisy never.
+2. An actual new message is sent ONLY when it carries information: first
+   install ("Hi — I'm here."), after `/update` ("Updated to vX ✓", one
+   line), or on recovery from unexpected downtime > `downtime_notify_min`
+   (default 60 min; the catch-up summary rides the same single message).
+   Routine restarts are silent. `/status` shows the card's content on
+   demand.
+   **Accept:** no-message-on-clean-restart test; single-message-after-
+   downtime test; pinned-card edit (mocked bot) test; STYLE.md-compliant
+   copy.
+
+## 8. Phase H — Heartbeat & self-healing
 
 **Design (owner-confirmed):** ONE agent-owned file, `HEARTBEAT.md`, holds
 everything — briefings, watches, follow-ups, notes-to-self. The agent reads
@@ -419,11 +626,18 @@ Seeded template:
    that is the slowest possible design. On claude/opencode (cheap fresh
    sessions) throwaway convs are fine. Quiet-run suppresses OK beats;
    memory autocommit picks up file edits.
-4. **Throwaway-conv GC:** every throwaway/scratch conv id is recorded;
-   after the run (or on a startup sweep) agy brain dirs unreferenced by
-   any session and older than 7 days are deleted. Without this, beats +
-   distillation + fallback turns leak ~1,500 orphaned brain dirs/month and
-   progressively slow agy's snapshot-diff conv detection.
+4. **GC & retention sweeps** (one housekeeping pass, deterministic):
+   (a) throwaway/scratch convs — every such conv id is recorded; after
+   the run (or on a startup sweep) agy brain dirs unreferenced by any
+   session and older than 7 days are deleted. Without this, beats +
+   distillation + fallback turns leak ~1,500 orphaned brain dirs/month
+   and progressively slow agy's snapshot-diff conv detection.
+   (b) **media retention** — Inbox/Outbox files older than
+   `media_retention_days` (default 30, 0 = keep forever) are deleted by
+   the same sweep; the deletion is logged, never announced (P4). Anything
+   worth keeping graduates out of Inbox: the agent (on request, "keep
+   this") copies it to `Media/Kept/`, which is retention-exempt,
+   git-tracked, and rides C3's cloud backup.
 5. Harness gains one protocol line: *"When the owner asks you to keep an
    eye on / remind / follow up on something recurring, add it to
    HEARTBEAT.md."*
@@ -453,8 +667,26 @@ Seeded template:
 3. Failed probes also prepend one line to the next beat prompt
    ("System flag: agy login expired — already DM'd owner") so the agent
    doesn't duplicate alerts.
+4. **Login console relay (P7 — checked against current code: does NOT
+   exist yet; the interactive.py bridge is agent-protocol-level and
+   cannot drive a CLI login prompt).** Build it deterministically:
+   `PtyProcess` gains a `write()` (os.write to the PTY master on POSIX /
+   winpty write). `/login <backend>` (owner, also offered as the button
+   on a login-expired alert) spawns that backend's login command under a
+   PTY, streams its output into the chat (URLs arrive as tappable links),
+   and forwards the owner's next reply into the PTY + Enter — token
+   pasted, authenticated, no display needed. Replies in this mode get
+   OTP-grade handling: deleted from chat after use, never logged,
+   redaction filter active. Timeout + cancel button; zero model
+   involvement end to end.
+5. `/health` (owner): runs the full probe suite + doctor checks on demand
+   and renders one ZUI card — the remote equivalent of
+   `install.py --doctor`, per P7.
    **Accept:** probe unit tests with injected failures; cooldown test;
-   live smoke of one full re-login round-trip (documented in STATUS.md).
+   PTY write + relay tests (mocked login binary: URL streamed, token
+   forwarded + newline, chat message deleted, nothing logged); /health
+   card renders; live smoke of one full agy re-login round-trip via
+   Telegram only — no SSH, no display (documented in STATUS.md).
 
 ### H3 — Linux service deployment
 1. `install.py --service`: writes + enables a systemd **user** unit
@@ -465,9 +697,67 @@ Seeded template:
    **Accept:** unit file golden test; doctor reports service state; live:
    reboot → bot up, missed schedules caught up (existing reconcile).
 
+### H4 — Self-update with rollback
+1. `/update` (owner) + `zilla update`: deterministic pipeline — record
+   current commit → `git fetch && git pull --ff-only` on the Zilla repo →
+   `pip install -r requirements.txt` (venv) → run store.py migrations →
+   restart service → post-restart `--doctor`. **Doctor fails ⇒ automatic
+   rollback**: checkout recorded commit, reinstall, restart, doctor again,
+   and DM the owner one line with what failed. DB is backed up
+   (`VACUUM INTO`, M1.6) immediately before migrations. Never auto-updates
+   on its own — owner-triggered only (a heartbeat line may *mention* that
+   an update is available; H2 probe checks `git fetch --dry-run` 1×/day).
+   **Accept:** update pipeline test with a simulated bad migration →
+   rollback restores prior commit + DB; doctor-gate test; live smoke of
+   one full update on the Linux service.
+
+## 9. Phase B — Background tasks & incognito (executes after H)
+
+**The gap this closes:** every turn holds the per-uid lock, so a 20-minute
+research job freezes the owner's chat for 20 minutes — the deepest possible
+violation of "never feels dead". Background tasks get their own lane.
+
+### B1 — Background lane
+1. `tasks.py` + table: `tasks(id, uid, prompt, status
+   queued|running|done|failed|canceled, progress, result, created_at,
+   started_at, finished_at)`. Each task runs in its OWN named session
+   (`task:<id>`, backend-tagged per I-CONV, GC'd with H1's sweep) under a
+   task-scoped lock — NOT the owner's chat lock. The chat stays free. The
+   agy global new-conv lock still applies at spawn (unavoidable, brief).
+   Concurrency cap `max_bg_tasks` (default 2, setting) — queued beyond
+   that; quota protection is the cap + usage counters.
+2. Creation, deterministic (P5): `/bg <prompt>` command; or the agent —
+   when the owner *asks* for background work conversationally — ends its
+   reply with `BG_TASK: <prompt>` (marker detected/stripped exactly like
+   `SKILL_PROPOSAL`, rendered as a ZUI confirm button; owner taps ⇒ task
+   created). The model cannot spawn work without a command or a tap.
+3. Completion: result DM'd as a ZUI card (title, duration, result body /
+   FileOut); failure = one calm sentence + a "retry" button. Cancel via
+   `/tasks` buttons (per-task `cancel_event`, I-CANCEL semantics).
+4. `/tasks` board (ZUI): running (with live progress line + cancel),
+   queued, last 5 finished. TUI gets a Tasks screen in Phase T.
+   **Accept:** lock-independence test (bg task running, chat turn completes
+   concurrently); cap/queue test; cancel test; marker detect/strip/confirm
+   test; live smoke — start a long bg task, keep chatting, get the result
+   card.
+
+### B2 — Incognito sessions
+1. `/new incognito` (session flag in `sessions`): the harness omits the
+   journal/memory instructions AND the memory protocol for those turns;
+   **code enforcement**, not model promise: Memory-tree mtime snapshot
+   around each incognito turn — any change ⇒ `git restore` from the memory
+   repo + one-line owner notice. No graph cards injected, no curiosity
+   questions, no FTS of anything said.
+2. Honest ceiling, documented in MANUAL.md: the backend CLI still keeps
+   its own conversation transcript (agy brain dir / claude session) — 
+   incognito guarantees *Zilla's memory* is untouched, and the session's
+   conv dir is deleted on `/close` (or H1 GC).
+   **Accept:** enforcement test (simulated memory write during incognito ⇒
+   reverted + notice); injection-absence test; close-deletes-conv test.
+
 ---
 
-## 7. Phase R — Router & fallback
+## 10. Phase R — Router & fallback
 
 ### R1 — Triage router
 `router.py`, deterministic only (P3), runs before the engine spends a lock:
@@ -485,12 +775,45 @@ Seeded template:
    `normal` — everything else, full injection, session backend.
 2. Misclassification safety: if a `trivial` reply comes back empty/error,
    silently rerun as `normal`. Router decisions logged.
-   **Accept:** classifier table-driven tests (≥ 30 cases); fast-profile
-   turn does not mutate session conv id; rerun-on-empty test.
+3. **Adaptive effort controller (owner-directed, never model-trusted):**
+   per-turn effort ∈ {fast, standard, deep}, resolved by deterministic
+   rules in priority order — the model NEVER decides its own effort
+   (P3/P5; a model grading its own homework under-thinks hard problems):
+   (a) **owner emphasis wins absolutely**: markers like "think hard /
+   deeply / carefully / properly", "take your time", or an explicit
+   `!deep` prefix ⇒ `deep`; (b) `trivial` class ⇒ `fast`; (c) everything
+   else ⇒ `standard`. Effort maps to backend+model per a `effort_map`
+   setting (defaults: fast = cheapest chain model, e.g. claude haiku;
+   standard = session backend as configured; deep = the strongest model
+   among per-invocation-flag backends ONLY, e.g. claude opus — an
+   `effort_map` entry naming an agy model is invalid and rejected at
+   settings-write time, per rule 4 below). `deep` turns get a "thinking
+   deeply…" progress note (P4).
+4. **agy model-switching constraint (recorded reality):** agy's active
+   model is a GLOBAL display string in its settings file — per-turn
+   switching would race with every other agy terminal on the machine (the
+   owner has personally hit this headache). Rule: effort-based model
+   switching happens ONLY on backends with a per-invocation model flag
+   (claude `--model`, opencode). On agy, effort routing changes *which
+   backend* runs the turn, never the agy model mid-session; agy model
+   changes remain an explicit owner action in `/settings` (existing
+   atomic write + read-back). Document in MANUAL.md that external agy
+   terminals share agy's model setting by agy's design — Zilla won't
+   silently mutate it.
+   **Accept:** classifier table-driven tests (≥ 30 cases); effort-
+   priority tests (emphasis beats trivial-class; `!deep` on a one-word
+   message still goes deep); effort_map dispatch test; fast-profile turn
+   does not mutate session conv id; rerun-on-empty test; NO test may
+   assert an agy model write during routing.
 
 ### R2 — Fallback chain
-1. Setting `backend_chain` (ordered, default = active backend + others
-   detected on PATH). **A chain entry is eligible only if its last health
+1. Setting `backend_chain` — ordered; **default order is the owner's
+   declared priority: `agy → opencode → claude`**, filtered to what is
+   detected on PATH (the active backend, whatever it is, always leads its
+   own session's turns). `effort_map` defaults follow the same reality:
+   fast/deep pick the cheapest/strongest model among the per-invocation-
+   flag backends actually present (opencode first, claude when enabled).
+   **A chain entry is eligible only if its last health
    probe (H2) showed a fresh login** — a binary on PATH that isn't logged
    in would burn the retry or hang on a login prompt; skip it and log why
    (probe freshness per H2 — stale probe ⇒ on-demand probe, never a dead
@@ -526,7 +849,7 @@ Seeded template:
 
 ---
 
-## 8. Phase S — Skills from chat (ask-first)
+## 11. Phase S — Skills from chat (ask-first)
 
 1. Format: `Memory/Skills/<slug>/SKILL.md` — frontmatter (`name`,
    `description`, `created`, `uses`) + body (when to use, steps); optional
@@ -560,14 +883,99 @@ Seeded template:
    scope guard as memory), and `/skills` labels the two sources
    distinctly. `Memory/Skills/` is the managed, gated system going
    forward.
+5. **Slash-command surface (owner decision 2026-07-18): every approved
+   skill also becomes a slash command** — this is how the owner adds a new
+   `/command` going forward, no separate mechanism. On approval (the ✅ tap
+   in item 2, or `/skills approve`), Zilla derives a command name from the
+   skill slug (deterministic slugify: lowercase, non-alnum → `_`, dedup
+   underscores; collision with an existing command or another skill's
+   slug ⇒ suffix `_2`/`_3`) and re-registers the owner's
+   `BotCommandScopeChat` list (F2's command-registry extension owns the
+   mechanics — same `set_my_commands` call, same drift-gate test).
+   Typing `/<skill>` runs the skill's stored prompt as a normal owner
+   turn through the SAME pipeline as typed text (memory injection, effort
+   routing, review gate all apply — a slash command is a shortcut for the
+   wording, never a different execution path or a permissions bypass).
+   Revoking a skill (item 3's hash-mismatch auto-revoke, or manual
+   `/skills disable`) removes its command on the same registration pass.
+   Legacy backend-native skills (item 4) do **not** get commands — only
+   `Memory/Skills/` entries, since only those are approval-gated (P5: an
+   unapproved skill must never become a callable command).
    **Accept:** marker detect/strip tests; approval hash lifecycle tests
-   (approve → run allowed; edit script → revoked); /skills flows; live
+   (approve → run allowed; edit script → revoked); /skills flows; slugify
+   + collision-suffix tests; approve→command-appears /
+   revoke→command-disappears tests (mocked `set_my_commands`); live
    smoke: solve task → proposal → ✅ → skill file exists, indexed,
-   committed to memory git.
+   committed to memory git, AND `/<name>` appears in Telegram's own "/"
+   autocomplete and running it produces the skill's answer.
 
 ---
 
-## 9. Phase G — Gateway extraction, then Phase T — Terminal app
+## 12. Phase C — Connectors & the portable brain (executes after S)
+
+### C1 — Brain export / import
+1. `zilla export [--encrypt] [path]` → one archive: `Memory/` (incl. its
+   `.git`), a `System/state-snapshot.json` (settings/schedules/users/
+   curiosity dumped from the DB — NOT the DB file; the DB is
+   operational+index and rebuilds), `.env.template` (structure, NO
+   secrets), and `Media/` files under `export_media_max_mb` (default 10)
+   each. `--encrypt` = AES-256 via openssl with a relay-prompted
+   passphrase.
+2. `zilla import <archive|dir>` (and installer/TUI onboarding step
+   "Restore from a backup?"): restore files → import snapshot →
+   rebuild FTS + graph indexes from the files (this is P1's proof — the
+   entire brain reconstitutes from Markdown + one JSON).
+   **Accept:** export→wipe→import round-trip equals original (graph query
+   results identical); encrypted round-trip; snapshot excludes secrets.
+
+### C2 — Connectors screen (MCP + native, per-backend)
+1. Reality, recorded: connectors live at the BACKEND level and differ —
+   agy ships native connectors (Google Workspace etc.) plus MCP config;
+   claude manages MCP via `claude mcp add/list/remove` / `.mcp.json`;
+   opencode declares MCP servers in its JSON config. Zilla does not proxy
+   or re-implement any of this — it MANAGES the per-backend configs
+   deterministically (write + read-back, like `set_model`; exact
+   file/flag shapes verified against installed versions, evidence-first).
+2. `/settings → Connectors`: an availability matrix (connector × backend:
+   native / via MCP / unavailable), add/remove/enable per backend, secrets
+   (MCP server keys) collected via the interactive relay — written only
+   to the backend's own config, never logged, never in memory files.
+   **Owner-approval gate (P5):** adding any connector/MCP server requires
+   an explicit ✅ confirm card showing exactly what will run — MCP servers
+   are third-party code and a prompt-injection/supply-chain surface
+   (→ §16.11).
+3. Router awareness (small, later-proof): `connector_hints` map — a turn
+   that clearly needs a connector only one backend has (e.g. Workspace on
+   agy) is routed to that backend for that turn, same throwaway-conv rules
+   as fallback.
+   **Accept:** config write+read-back tests per backend (mocked binaries);
+   matrix renders truthfully from configs; approval-gate test (no write
+   without confirm); secrets never appear in logs test.
+
+### C3 — Cloud backup + bootstrap-from-cloud
+1. **GitHub is the canonical cloud backup** (recorded decision): the
+   memory repo (M3) gains an optional remote — a PRIVATE repo the owner
+   supplies (URL + PAT via relay; PAT into `.env`, 0600). Auto-push after
+   autocommit, rate-limited (≥ 10 min apart) + always after nightly
+   distillation. C1's `state-snapshot.json` is committed nightly into the
+   repo → **the entire brain is restorable from the repo alone**. `Media/
+   Kept/` under the size cap included; oversize files listed in a
+   `Media/SKIPPED.md` (LFS = conscious deferral). Plaintext-in-private-
+   repo vs encrypted-archive tradeoff documented in MANUAL.md; the
+   `--encrypt` export (C1) is the answer for the cautious.
+2. Bootstrap-from-cloud: onboarding (installer + TUI) offers "Restore
+   from GitHub" → URL + PAT → clone → C1 import path → reindex → the new
+   machine wakes up with the owner's full memory, graph, and schedules.
+3. Google Drive / Workspace: **not** the canonical backup path (no
+   deterministic tool without new deps) — recorded decision. Drive is
+   reachable for file operations through C2 connectors on backends that
+   have it; a `drive_backup` skill can exist later as an agent-level
+   convenience, never as the integrity-bearing path.
+   **Accept:** push rate-limit test; nightly snapshot commit test; live
+   smoke — push to a real private repo, clone on a clean dir, import,
+   graph query matches; PAT never logged.
+
+## 13. Phase G — Gateway extraction, then Phase T — Terminal app
 
 ### G1 — Engine facade (prerequisite for T, pure refactor)
 1. Extract from `bot.py` into `engine.py`: the run pipeline (lock →
@@ -583,7 +991,8 @@ Seeded template:
 ### T1 — `zilla` TUI (Textual)
 1. `tui/` package, `zilla` entry point (console script). Screens:
    **Chat** (stream engine events; Esc = cancel), **Sessions** sidebar,
-   **Schedules**, **Memory** (MEMORY.md + journal + commits), **Skills**
+   **Schedules**, **Memory** (MEMORY.md + journal + commits),
+   **Graph** (K4's local-graph explorer), **Skills**
    (approve/disable), **Health** (probe results, usage counters from
    `usage`), **Settings** (backend/model/chain/heartbeat interval —
    same setters as Telegram menus).
@@ -612,8 +1021,9 @@ Seeded template:
 
 ---
 
-## 10. Phase V — Offline voice
+## 14. Phase V — Voice (offline STT → voice replies → wake-word satellite)
 
+### V1 — Offline transcription
 1. `faster-whisper` optional dependency (`pip install zilla[voice]` /
    requirements-voice.txt). Setting `transcribe = auto|local|online`
    (default `auto` = local if importable, else current online path).
@@ -623,9 +1033,40 @@ Seeded template:
    **Accept:** branch tests with mocked model; live smoke: voice note on
    Linux transcribed offline (network blocked) and answered.
 
+### V2 — Voice replies (local TTS)
+1. Piper TTS (local, fast, no keys) as another `zilla[voice]` extra.
+   Setting `voice_replies = auto|always|off` (default `auto`: voice note
+   in ⇒ voice reply out, plus the text). Rendered from the reply text
+   AFTER ZUI blocks are stripped; long replies voice only a spoken-length
+   summary line + full text below (setting `tts_max_secs`, default 45).
+   **Accept:** mode-matrix tests; strip-before-speak test; live smoke —
+   voice note in, voice answer back in Telegram.
+
+### V3 — Wake-word satellite (`zilla-voice`, on the Linux box)
+1. Always-on local loop, zero cloud: **openWakeWord** with a wake word
+   trained on the OWNER's voice — guided enrollment (`zilla voice-train`
+   or via Telegram: "record your wake phrase N times", accepts voice
+   notes), threshold tunable, chime on wake so false accepts are audible,
+   not silent. Silero VAD for end-pointing.
+2. Loop: wake → chime → capture until silence → V1 STT → engine as an
+   owner turn on the active session (normal pipeline: memory, graph,
+   router — the voice is just another connector, per the Gateway
+   principle) → V2 TTS out through the speaker.
+3. Half-duplex, honestly specified: mic input is ignored while speaking
+   EXCEPT the wake-word detector stays live — saying the wake word
+   interrupts playback (barge-in). No full-duplex conversation claim.
+4. Priority: its own systemd unit with `Nice=-5` + high `CPUWeight` (and
+   rtkit for the audio thread when available) so wake→response stays
+   snappy under load; the main Zilla service is NOT reprioritized.
+   Runs only where a mic/speaker exists; auto-disabled headless.
+   **Accept:** wake-detector unit tests on recorded fixtures (owner
+   samples + negatives); barge-in test; end-pointing test; live smoke —
+   wake word from across the room, spoken answer, chat transcript of the
+   exchange visible in Telegram session history.
+
 ---
 
-## 11. Cross-cutting engineering rules
+## 15. Cross-cutting engineering rules
 
 - **Testing:** every phase adds deterministic no-network tests to the suite
   (`test_fixes.py` / new `test_<module>.py` files wired into it). Suite
@@ -645,7 +1086,7 @@ Seeded template:
 - **Secrets:** existing redaction filter covers new logs; memory protocol
   forbids credentials in Markdown; relay answers keep their wipe behavior.
 
-## 12. Risk register (with mitigations already in the plan)
+## 16. Risk register (with mitigations already in the plan)
 
 1. **G1 refactor breaks invariants** → isolated phase, behavior-freeze
    smoke checklist, small commits.
@@ -659,7 +1100,7 @@ Seeded template:
    deterministic empty-file skip, try-acquire (never blocks the owner).
 6. **Memory privacy leak to non-owner users** → §4 scope guard: injection
    is owner-turn-only, enforced by uid with a negative test.
-7. **TUI↔daemon transport under-engineered** → §9 specifies the Unix-socket
+7. **TUI↔daemon transport under-engineered** → §13 specifies the Unix-socket
    JSONL protocol up front; WebBridge explicitly ruled out as transport.
 8. **Fallback to present-but-unauthenticated backend** → chain eligibility
    gated on H2 login-freshness probes (own timer, on-demand refresh).
@@ -678,23 +1119,156 @@ Seeded template:
    already forbids secrets in memory files; additionally `/memory purge
    <pattern>` (owner-only) is specified in M4's scope as a documented
    `git filter-repo` wrapper — destructive, confirm-gated, exact steps in
-   MANUAL.md.
+   MANUAL.md. With C3's remote, purge must force-push and the MANUAL
+   documents that a leaked-then-pushed secret is rotate-not-purge.
+11. **MCP servers / connectors are third-party code** — a supply-chain and
+   prompt-injection surface inside the backends. Mitigation: C2's
+   owner-confirm gate on every addition, per-backend config isolation,
+   secrets via relay only, and M4's memory-change surfacing already
+   covers the "connector content writes memory" path.
+12. **Background tasks can burn quota unattended** → `max_bg_tasks` cap,
+   queueing, usage counters per backend, and creation only via command or
+   explicit owner tap (no model-initiated spawning).
+13. **Wake-word false accepts** (satellite hears TV, triggers a turn) →
+   owner-trained model + tunable threshold + audible chime + everything it
+   heard lands visibly in the session transcript — never a silent action.
 
-## 13. Execution order & progress
+## 17. Phase F — Foundation cleanup (EXECUTES IMMEDIATELY AFTER M3, before M4)
+
+Owner-ordered corrections to things already built or about to calcify.
+Positioned early on purpose: every later phase writes paths, menus, and
+system jobs — fix the foundation before more code lands on it.
+
+### F1 — `AGI-Brain` dies; `ZILLA_HOME` is born
+1. The data home becomes **`~/Zilla`** (env override `ZILLA_HOME`) —
+   visible and owner-facing, not a dot-dir; the knowledge is the product.
+   **The storage constitution — every file Zilla ever touches has exactly
+   ONE legal home below; a file anywhere else is a bug:**
+
+   ```
+   ~/Zilla/
+     Memory/    the brain (git repo): MEMORY.md, HEARTBEAT.md,
+                Wiki/, Journal/, Skills/   — nothing else, ever
+     Media/     ALL media, one place:
+       Inbox/{images,audio,video,documents}/   auto-swept (F3 settings)
+       Kept/                                    permanent, cloud-backed
+     Outbox/    files Zilla generates to send; swept with Inbox
+     Runtime/   the machine's business: zilla.db + backups, logs,
+                pid, sock — owner never needs to look here
+   ```
+
+   All path constants resolve through config from `ZILLA_HOME`; nothing
+   composes "AGI-Brain" ever again, and no code writes outside the four
+   roots (test-gated: a path-audit test walks every write in the suite).
+2. Migration, deterministic, first start: legacy `~/AGI-Brain` exists and
+   `~/Zilla` doesn't ⇒ move contents into the new layout, then leave a
+   symlink `AGI-Brain → ~/Zilla` for one release (external references,
+   old transcripts). Path fences (`safe_send_file`, inbox realpath
+   checks) re-anchored to the new roots.
+3. **Separation of ownership, recorded:** backend conversation stores
+   (agy's brain dir, claude's sessions) are the BACKENDS' property and
+   stay wherever the backend puts them (`BRAIN_DIR` stays a distinct
+   setting). Zilla's home holds knowledge and operations — conversations
+   belong to brains, knowledge belongs to you.
+   **Accept:** migration test (seeded legacy tree → moved + symlink +
+   fences hold); full suite green on new paths; doctor shows the home.
+
+### F2 — No hard-coded backends anywhere (dynamic registry)
+1. Each backend adapter self-describes: `{name, binary, probe(),
+   login_cmd, model_flag: bool, models()}` in a registry. **Every**
+   surface derives from a PATH+login probe of that registry at
+   render time: the `/settings` backend buttons (a CLI that isn't
+   installed simply isn't a button; installed-but-logged-out renders with
+   a `login` action wired to H2.4's `/login`), the chain editor,
+   `effort_map` validation, doctor, and the connectors matrix. Zero
+   hard-coded backend lists in `keyboards.py` or anywhere else.
+2. Adding a future backend = registering one adapter; every menu and
+   validator picks it up with no UI edits. (R3's opencode adapter lands
+   as the proof: register it, watch the button appear.)
+3. **Same principle, extended to the slash-command surface (owner
+   decision 2026-07-18):** `bot.py`'s hand-maintained `_BASE_COMMANDS`/
+   `_OWNER_COMMANDS` lists become a single command registry — one entry
+   per command (`name`, `description`, `handler`, `scope`:
+   everyone/admin/owner) that is the SOLE source for both
+   `add_handler(CommandHandler(...))` registration and the
+   `set_my_commands` push. A grep-gate test asserts a 1:1 mapping between
+   registered `CommandHandler`s and registry entries in both directions —
+   no command with a handler but no menu entry (invisible), no menu entry
+   with no handler (dead, exactly the "nothing dead lying around"
+   complaint that motivated this). §11 item 5's skill-derived commands
+   register into this SAME table dynamically at approve/revoke time, not
+   as a second list.
+   **Accept:** registry probe tests (present/absent/logged-out binaries
+   mocked); menu-generation test — buttons exactly match probe results;
+   grep-gate: no literal backend-name button lists outside the registry;
+   command-registry 1:1 test (handler ⇔ menu entry, both directions);
+   live smoke — `/help` output, and Telegram's own "/" autocomplete, both
+   show exactly the registry's commands, no more, no less.
+
+### F3 — Media importance + retention controls
+1. Settings (owner, `/settings → Storage`): auto-sweep **on/off** and
+   duration picker **30 / 60 / 90 days** (values, not free text; 0=off
+   equivalent). Sweep behavior itself is H1.4b.
+2. **Importance recognition:** harness protocol line — when context says
+   a received file matters ("this is my passport", "save this bill"),
+   the agent copies it to `Media/Kept/` and journals one line. Plus a
+   deterministic path: every media acknowledgment carries a ZUI `Keep`
+   button ⇒ same graduation, no model judgment. `Media/Kept/` is
+   sweep-exempt, git-tracked, cloud-backed (C3).
+   **Accept:** settings render/persist tests; Keep-button graduation
+   test; sweep honors off/30/60/90 and never touches `Media/Kept/`.
+
+### F4 — System jobs are invisible internals (the heartbeat-noise fix)
+1. `system = 1` jobs (heartbeat, distillation, snapshots) **never appear
+   in `/schedules`** — that surface is for the owner's schedules only.
+   They live under `/health → System jobs` (status, last run, pause) —
+   pausable, never deletable, and never announce themselves: no
+   "⏰ Scheduled — <title>" headers, no result DMs.
+2. Output contract (deterministic): a system job's output goes to the
+   log. ONLY lines prefixed `OWNER_ALERT:` are DM'd (one calm line,
+   cooldown-gated via H2's alerting) — everything else, including the
+   whole HEARTBEAT_OK/quiet-run mechanism, stays silent. An in-flight
+   build that already created these as visible schedules migrates them
+   (marked system, stripped from the user list) in this sub-phase.
+   **Accept:** /schedules never renders system jobs; announcement-
+   suppression tests; OWNER_ALERT extraction + cooldown test; migration
+   test for pre-existing visible system schedules.
+
+## 18. Execution order & progress
 
 Execute strictly top-to-bottom. Check items off here (this file) as they land.
 
-- [ ] M1 SQLite store + migration
-- [ ] M2 Memory layout + injection
-- [ ] M3 FTS5 + memory git + quiet runs
+- [x] M1 SQLite store + migration *(done on execution branch, 606 green)*
+- [x] M2 Memory layout + injection *(done, 652 green)*
+- [x] M3 FTS5 + memory git + quiet runs *(done, 686 green)*
+- [ ] F1 ZILLA_HOME replaces AGI-Brain (§17)
+- [ ] F2 Dynamic backend registry — no hard-coded backends (§17)
+- [ ] F3 Media importance + retention controls (§17)
+- [ ] F4 System jobs invisible + silent (§17)
 - [ ] M4 Nightly distillation + /memory + change surfacing
+- [ ] K1 Graph schema + indexer
+- [ ] K2 Entity linking + neighborhood injection
+- [ ] K3 Curiosity loop
+- [ ] K4 Graph views (/graph HTML)
+- [ ] U1 ZUI protocol (cards/tables/contacts/buttons)
+- [ ] U2 Agent ZUI education + contacts loop
+- [ ] U3 Design system (STYLE.md + menu refactor)
+- [ ] U4 Presence (pinned status card, silent restarts)
 - [ ] H1 Heartbeat loop
 - [ ] H2 Health probes + assisted re-login
 - [ ] H3 systemd service
-- [ ] R1 Triage router
+- [ ] H4 Self-update with rollback
+- [ ] B1 Background task lane + /tasks
+- [ ] B2 Incognito sessions
+- [ ] R1 Triage router + effort controller
 - [ ] R2 Fallback chain
 - [ ] R3 opencode adapter
 - [ ] S  Skills from chat
+- [ ] C1 Brain export/import
+- [ ] C2 Connectors screen (MCP/native)
+- [ ] C3 Cloud backup + bootstrap-from-cloud
 - [ ] G1 Engine facade extraction
 - [ ] T1 Terminal app
-- [ ] V  Offline voice
+- [ ] V1 Offline transcription
+- [ ] V2 Voice replies (local TTS)
+- [ ] V3 Wake-word satellite

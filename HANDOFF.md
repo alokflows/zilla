@@ -316,13 +316,29 @@ log below.
 see checklist + session log below.
 **H3 (systemd Linux service deployment) is COMPLETE** (PLAN.md §6/H3) —
 see checklist + session log below.
-**NEXT UNIT OF WORK: Phase R1 — Triage router refinement**
-(PLAN.md §7/R1: `zilla/review.py`'s existing triage mostly covers this —
-confirm against PLAN.md's exact spec, especially the ≥30-case
-classifier-table test and the fast-profile agy exclusion, before marking
-done; don't rebuild what P1.5 already shipped). Full test gate before and
-after.
-**Working branch (source of truth):** `claude/zilla-harness-review-0v96bs`
+**RECONCILED 2026-07-18 night:** this branch (`claude/zilla-harness-review-0v96bs`,
+7 commits: M4/H1/H2/H3) was merged with `main`, which had independently
+grown PLAN.md by ~630 lines (Phase F, K, U, H4, B inserted; R1 expanded
+into "triage router + effort controller") plus an owner-reported quick
+fix, while this branch shipped M4/H1/H2/H3 built-reality that main's
+checklist didn't yet know about. Built reality (M4/H1/H2/H3 DONE) wins;
+main's newer PLAN.md content wins. See Checklist below for the corrected,
+single, non-duplicated phase order.
+**NEXT UNIT OF WORK: the owner-reported pre-F1 quick fix (Menu Close
+button + silent-second-answer() bug, see Notes below), THEN Phase F
+(F1→F4) — foundation cleanup (PLAN.md §17): F1 ZILLA_HOME storage layout
+replaces AGI-Brain, F2 dynamic backend registry (+ slash-command
+registry), F3 media importance+retention, F4 system jobs
+invisible+silent. THEN K1-K4, U1-U4, H4, B1-B2, THEN the existing
+R1→...→V1-V3 tail (unchanged).** Full test gate before and after every
+step.
+**Working branch (source of truth): `main`.** Branches consolidated
+2026-07-18 night: `claude/zilla-harness-review-0v96bs`'s 7 commits are
+merged into `main` and pushed; the planning branch
+(`claude/python-cli-bot-planning-80x8a3`) and this execution branch are
+both now fully merged, superseded shells — safe to delete. **PUSH TO
+MAIN EVERY SESSION, no exceptions** (an unpushed session nearly caused
+divergence before — this reconciliation is the proof of why).
 **Tests:** 260+16+116+57 core + 71 review + 17 tui + 69 cli + 46 harness +
 34 memory_m3 + 31 memory_m4 + 61 heartbeat + 57 health + 23 service =
 **858 green** — `.venv/bin/python test_fixes.py / test_interactive.py /
@@ -409,13 +425,29 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **H1** Heartbeat loop — DONE 2026-07-18. 778 green.
 - [x] **H2** Health probes + assisted re-login — DONE 2026-07-18. 835 green. (Earlier P7 health-loop stash was NOT popped — re-derived clean from PLAN.md's more precise spec; stash still sits in `git stash list` as dead reference, safe to drop whenever.)
 - [x] **H3** systemd Linux service — DONE 2026-07-18. 858 green.
+- [ ] **Quick fix (owner-reported 2026-07-18 pm)** Menu Close button:
+  delete the message instead of editing it to "✓ Closed" text; and fix
+  the silent-second-`answer()` bug so a failed callback is never
+  indistinguishable from a successful one (P4). Exact spec in Notes
+  below. — NEXT, before F1.
+- [ ] **F1** ZILLA_HOME storage layout replaces AGI-Brain (PLAN §17).
+- [ ] **F2** Dynamic backend registry — no hard-coded backend buttons, includes slash-command registry (PLAN §17).
+- [ ] **F3** Media importance + retention controls (PLAN §17).
+- [ ] **F4** System jobs invisible + silent — fixes the live heartbeat noise the owner screenshotted (PLAN §17).
+- [ ] **K1-K4** Relational graph memory (PLAN §6): schema+indexer, entity linking, curiosity loop, /graph views.
+- [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card.
+- [ ] **H4** Self-update with doctor-gated rollback (PLAN §8).
+- [ ] **B1-B2** Background task lane + /tasks; incognito sessions (PLAN §9).
 - [ ] **R1** Triage router refinement — MOSTLY DONE via `zilla/review.py` (P1.5 above); confirm against PLAN.md's exact spec before marking done, don't rebuild.
 - [ ] **R2** Fallback chain — genuinely new.
 - [ ] **R3** opencode adapter — genuinely new (was P8).
 - [ ] **S** Skills from chat, ask-first approval — genuinely new (was P5).
+- [ ] **C1-C3** Brain export/import; connectors screen (MCP/native, per-backend); GitHub cloud backup + bootstrap-from-cloud (PLAN §12).
 - [ ] **G1** Engine facade extraction — PARTIAL via existing `zilla/core.py` (P1 above); the new part is the Unix-socket IPC daemon-attach model. PLAN.md flags this as the riskiest refactor in the plan — do it alone, no parallel fan-out.
 - [ ] **T1** Terminal app (Textual, daemon-attach via IPC) — MOSTLY DONE via existing `zilla/tui/` (P2 above); missing pieces listed there.
-- [ ] **V** Offline voice (faster-whisper — already pip-installed, salvaged from GOD MODE round 2) — genuinely new (was P9).
+- [ ] **V1** Offline voice (faster-whisper — already pip-installed, salvaged from GOD MODE round 2) — genuinely new (was P9).
+- [ ] **V2** Voice replies via local TTS (Piper) (PLAN §14).
+- [ ] **V3** Owner-trained wake-word satellite (PLAN §14).
 
 ### Session log (one line per session — details in git log)
 
@@ -444,6 +476,47 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 | 2026-07-18 | **H3 COMPLETE** (PLAN.md §6/H3, both steps, one commit `da58805`): `install.py` gained a new `--service` flag (Linux-only; on macOS/Windows it prints a clear message and exits 0 rather than doing nothing silently or erroring — "nothing Windows breaks" per the accept criteria) that writes + enables `~/.config/systemd/user/zilla.service` via two new functions: `systemd_unit_content(py_path, base_dir)` (pure, golden-testable) and `write_service()` (I/O: writes the unit, `systemctl --user daemon-reload` + `enable --now`, prints a `loginctl enable-linger $USER` hint rather than running it — a login/session-policy change that shouldn't happen silently on the owner's behalf). `Restart=on-failure`, deliberately NOT `Restart=always` like the pre-H3 Linux autostart branch used to write: `run_background.py` already exits 0 cleanly on an intentional `zilla stop` (its own `zilla.stop`-file check), so `on-failure` respects that and only restarts systemd's copy on an actual crash — layered on top of `run_background.py`'s own pre-existing ~7s internal restart loop for `bot.py` itself, not replacing it. `setup_autostart()`'s Linux branch now calls the same `write_service()` instead of duplicating unit-writing logic (single source of truth caught at the future-cost-check step); `disable_autostart()` reuses the same `SYSTEMD_UNIT_PATH` constant. `zilla/doctor.py`: new `check_systemd_service()` — Linux-only (`applicable=False` elsewhere, since macOS uses the LaunchAgent and Windows the Startup shortcut, neither of which has a systemd unit to report on), reads `systemctl --user is-active`/`is-enabled`, never raises on a missing `systemctl` binary or a timeout; folded into `environment_report()`/`format_report()` so `zilla doctor` reports service state on Linux. New `test_service.py` (23 checks): exact golden text of the unit file (`ExecStart`/`WorkingDirectory`/`Restart=on-failure`/`WantedBy=default.target`); `write_service()` exercised against an isolated tmp systemd dir (module-level `SYSTEMD_UNIT_DIR`/`SYSTEMD_UNIT_PATH` swapped out for the duration of each test, restored after) with `subprocess.run` mocked for success/missing-binary/nonzero-exit — **no real `systemctl` is ever invoked and the real `~/.config/systemd/user/zilla.service` is never touched by a test**; `check_systemd_service()`'s output-parsing matrix (active+enabled, inactive+disabled, unit-not-installed, missing systemctl, timeout) exercised via a monkeypatched `platform_compat.IS_LINUX=True` since this dev machine is macOS (the real, unmocked `applicable=False` case is also asserted directly). 858 green (835 + 23, zero regressions). Verified after the test run: no stray `zilla.db` from tests (the real one is the live bot's, gitignored, pre-existing), no real systemd unit written to `~/.config/systemd/user/`. **Deliberately NOT done as part of this session (live-only, owner's call, same deferral category as every prior phase's live-smoke items):** the actual "reboot → bot up, missed schedules caught up" round-trip needs a real Linux box with the service enabled — that machine doesn't exist yet (dev is the owner's MacBook; the Ubuntu laptop deployment is still ahead per §3's "Deployment posture"). `reconcile_startup`'s catch-up logic itself is unrelated to H3 and already covered live-independent by `test_heartbeat.py`/`test_fixes.py`. |
 
 ### Notes (only what a future session needs)
+
+- **Quick fix spec (owner-reported 2026-07-18 pm, do this FIRST, before
+  F1):**
+  1. `bot.py` `_cb_misc`, the `menu_close` branch (~line 2013-2020):
+     currently `await query.edit_message_text("✓ Closed. Send /menu to
+     reopen.")`. Change to `await query.message.delete()` (bots can
+     always delete their own outgoing messages in a private chat, no 48h
+     limit — same precedent already used for the OTP/password wipe at
+     `bot.py:1920`, `await update.message.delete()`). Keep a fallback:
+     if delete raises, fall back to `edit_message_reply_markup(reply_markup=None)`
+     silently (strip the buttons, no confirmation text either way — the
+     owner does not want a "Closed" message, they want the message gone).
+  2. `handle_callback` (~line 2586-2617): the outer `except Exception`
+     tries a second `query.answer(f"Error: ...")` to report a failure,
+     but Telegram rejects a second `answer()` on the same callback query,
+     so that call raises and is swallowed by its own bare
+     `except Exception: pass` — a failing button tap currently looks
+     IDENTICAL to a working one (tap registers, spinner clears, nothing
+     else happens). This is a real P4 violation, not cosmetic, and is
+     the likely cause of "buttons feel unresponsive" reports beyond
+     Close specifically. Fix: on that exception path, since `answer()`
+     is already spent, surface the failure a different way — edit the
+     original message (or send a new one if edit fails) with one calm
+     line, e.g. `⚠️ That didn't go through — try again.` (P4/STYLE.md
+     tone: no stack traces, one sentence, no exclamation-mark pile-up).
+     **Accept:** unit test simulating a `_cb_*` helper raising mid-way
+     confirms the chat receives a visible failure notice, not silence;
+     menu_close unit test confirms `delete()` is called and no text
+     message is sent; live smoke — tap Close, message vanishes with no
+     new message; force an error in a callback handler, confirm a
+     failure line appears instead of silence.
+- **Operational note (owner-reported 2026-07-18 pm):** a chunk of the
+  "unresponsive" reports traced to the dev MacBook's battery dying,
+  killing the bot process — not a code bug. PLAN.md's H3 (systemd on
+  the always-on Ubuntu server, per P7 headless-first) is the structural
+  fix and stays in its planned phase order; until H3 lands, keep the
+  dev Mac plugged in / prevent sleep during active use.
+- **Aesthetics note (owner-reported 2026-07-18 pm):** "stray lines and
+  symbols" in the menus is exactly PLAN.md's U3 (Design System /
+  STYLE.md) scope — already planned, no new spec needed, executes in
+  its existing phase slot.
 
 - **Latency is the owner's #1 complaint** — every turn pays a full CLI call
   (17s–2m34s observed live). The P1.5 orchestration router is the fix.
