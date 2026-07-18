@@ -529,7 +529,31 @@ code resolves it, confirms with the owner, and only then acts.
    with target, timestamp, and message/schedule summary — an audit trail so
    a relay action is never a surprise days later (same spirit as M4's
    memory-change surfacing).
-   **Accept:** marker detect/strip/confirm tests for both kinds;
+5. **Inbound relay replies (owner decision 2026-07-18: report, never
+   execute).** A relay target is never added to `users` — `auth_middleware`
+   (`bot.py`) already rejects any message from an unauthorized chat_id
+   before it reaches a handler, so "a relay target cannot run commands or
+   reach the model" is already true today, by construction, with zero new
+   code. The gap is that a rejected message is currently just silently
+   dropped. Add one narrow carve-out, checked BEFORE the reject: if the
+   sender is unauthorized but their chat_id matches a `telegram_uid::` on
+   a known `person` page, don't reject — DM the owner one plain line,
+   `"<Name> said: <verbatim text>"`, and stop. The reply is a dead end: it
+   is never wrapped into a prompt, never touches `cli_engine`/the model,
+   never gains any capability — it is a report, not a turn. Media from a
+   relay target (photo/voice/doc) is named but not ingested/transcribed in
+   v1 (`"<Name> sent a photo (not saved) — reply here to have Zilla save
+   or act on it"`) — the owner relays it onward themselves if it matters;
+   auto-ingesting untrusted-sender media is deliberately out of scope here
+   (same caution as C2's connector gate).
+   **Accept:** unauthorized-but-known-relay-target message produces
+   exactly the report DM, not a rejection, not a model call (assert
+   `cli_engine.run_*` never invoked); unauthorized-and-unknown sender
+   still gets today's silent reject (no behavior change for strangers);
+   media-from-relay-target produces the named-not-ingested notice; live
+   smoke — a relay target replies to a Zilla message, the owner sees
+   "X said: …" with no menu/command surface ever exposed to that person.
+   **Accept (item 1-4):** marker detect/strip/confirm tests for both kinds;
    alias-resolution + no-telegram-uid / no-node failure-mode tests, each
    with its explanatory line; confirm-required test (no confirm ⇒ no send,
    including a simulated attempt to skip it); relay-schedule round-trip
@@ -1196,6 +1220,13 @@ violation of "never feels dead". Background tasks get their own lane.
    marker (no broadcast in v1); `telegram_uid::` presence on a page is
    itself owner-authorized (§4 scope guard — only the owner writes
    Memory); `/relay log` gives a standing audit trail.
+15. **A relay target gains chat access or command execution** (K5.5) →
+   structurally impossible, not just policy: relay targets are never
+   added to `users`, so `auth_middleware` blocks them the same as any
+   stranger; their captured replies are reported text only, never wrapped
+   into a prompt or passed to `cli_engine` (owner decision 2026-07-18:
+   Zilla is a personal assistant to the owner and a reporter about
+   everyone else, never the reverse).
 
 ## 17. Phase F — Foundation cleanup (EXECUTES IMMEDIATELY AFTER M3, before M4)
 
