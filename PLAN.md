@@ -1371,7 +1371,7 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] F4 System jobs invisible + silent (§17) *(done, 1000 green; fixed the real heartbeat-noise bug — non-HEARTBEAT_OK responses no longer broadcast the full raw response, only an explicit OWNER_ALERT: line, cooldown-gated via H2's should_alert/mark_alerted)*
 - [x] F5 Conversational schedule access (§17) — done 2026-07-18, 1014 green *(fresh full-gate count; the "1000" baseline this session inherited was already stale for reasons unrelated to F5 — see HANDOFF note)*
 - [x] K1 Graph schema + indexer *(done 2026-07-18, 1050 green — nodes/aliases/edges in store.py; zilla/graph.py parser+indexer+BFS traversal; memgraph.py CLI: neighbors/path/find)*
-- [ ] K2 Entity linking + neighborhood injection
+- [x] K2 Entity linking + neighborhood injection *(done 2026-07-18, 1078 green — graph.alias_scan()/local_card_lines() + harness._graph_block() wired into wrap_prompt: owner-only, longest-match word-bounded alias/title scan capped at 3 nodes, strongest hit gets a 2-hop card, overall block capped at 25 lines, `[via graph]` header; harness protocol line teaches the agent memgraph.py + the entity-page update protocol. Live-smoked: mentioning "ramesh" with no memory question surfaced the Ramesh Kumar/Passport Office relation to the real claude backend, unprompted)*
 - [ ] K3 Curiosity loop
 - [ ] K4 Graph views (/graph HTML)
 - [ ] K5 Team relay: delegated send & scheduling

@@ -370,6 +370,16 @@ def find_path(db, a: str, b: str, *, history: bool = False, max_hops: int = 8) -
     return result
 
 
+def format_dates(valid_from: str | None, valid_to: str | None) -> str:
+    """'(since 2024-01)' / '(2020 .. 2023-06, superseded)' / '' — shared by
+    memgraph.py's CLI output and K2's turn-time local graph card."""
+    if valid_to:
+        return f" ({valid_from or '?'} .. {valid_to}, superseded)"
+    if valid_from:
+        return f" (since {valid_from})"
+    return ""
+
+
 def find_nodes(db, type_: str | None = None, *, near: str | None = None,
                 hops: int = 2, history: bool = False) -> list[dict]:
     """Nodes matching `type_` (case-insensitive; None = any type),
@@ -394,3 +404,86 @@ def find_nodes(db, type_: str | None = None, *, near: str | None = None,
         out.append(n)
     out.sort(key=lambda n: (n["title"] or "").lower())
     return out
+
+
+# ══════════════════════════════════════════════════════════
+#  TURN-TIME LINKING  (harness.py's owner-turn injection, PLAN.md §6.K2)
+# ══════════════════════════════════════════════════════════
+#  Deterministic — zero AI calls in this path. A name is "known" only via
+#  an exact alias or an exact node title (case-insensitive, word-bounded);
+#  no fuzzy matching here (that is K3/curiosity territory, not this one).
+
+def alias_scan(db, text: str, *, cap: int = 3) -> list[dict]:
+    """Scan `text` (an owner message) for known entity names — every
+    alias plus every node's own title is a candidate, longest name first
+    so "Ramesh Kumar" wins over "Ramesh" when both would match the same
+    span. Case-insensitive, word-bounded (`\\b`), first occurrence per
+    candidate. Returns up to `cap` distinct node dicts, ordered strongest
+    (longest matched name) first — the order `harness.py` uses to decide
+    which single hit gets the deeper (2-hop) card. Never raises; [] on
+    empty text or no hits."""
+    if not text:
+        return []
+    seen_names: set[str] = set()
+    candidates: list[tuple[str, int]] = []
+    for row in db.graph_aliases_all():
+        name = (row["alias"] or "").strip()
+        key = name.lower()
+        if not name or key in seen_names:
+            continue
+        seen_names.add(key)
+        candidates.append((name, row["node_id"]))
+    for node in db.graph_nodes_all():
+        name = (node["title"] or "").strip()
+        key = name.lower()
+        if not name or key in seen_names:
+            continue
+        seen_names.add(key)
+        candidates.append((name, node["id"]))
+    candidates.sort(key=lambda c: (-len(c[0]), c[0].lower()))
+
+    claimed: list[tuple[int, int]] = []
+    hit_ids: list[int] = []
+    for name, node_id in candidates:
+        if len(hit_ids) >= cap or node_id in hit_ids:
+            continue
+        try:
+            m = re.search(r"\b" + re.escape(name) + r"\b", text, re.IGNORECASE)
+        except re.error:
+            continue
+        if not m:
+            continue
+        start, end = m.span()
+        if any(start < c_end and end > c_start for c_start, c_end in claimed):
+            continue
+        claimed.append((start, end))
+        hit_ids.append(node_id)
+
+    hits = []
+    for node_id in hit_ids:
+        node = db.graph_node_get(node_id)
+        if node is not None:
+            hits.append(node)
+    return hits
+
+
+def local_card_lines(db, node: dict, *, hops: int = 1) -> list[str]:
+    """Compact "local graph card" lines for one node: title (+ ghost
+    marker) + bio line + current edges out to `hops` hops. This is the
+    text that lets a nickname mention surface graph knowledge before the
+    agent even reasons — never more than a handful of lines per node,
+    the caller (harness.py) enforces the overall block's line cap."""
+    label = node["title"] or "(untitled)"
+    if node["is_ghost"]:
+        label += " [ghost — no page yet]"
+    lines = [f"- {label}"]
+    if node.get("bio"):
+        lines.append(f"    {node['bio']}")
+    result = neighbors(db, node["title"], hops=hops, history=False) if node["title"] else None
+    if result:
+        for hit in result["hits"]:
+            arrow = "->" if hit["direction"] == "out" else "<-"
+            dates = format_dates(hit["valid_from"], hit["valid_to"])
+            hit_label = hit["node"]["title"] or "(untitled)"
+            lines.append(f"    {arrow} {hit['rel']} {arrow} {hit_label}{dates}")
+    return lines

@@ -650,6 +650,12 @@ class Store:
                 )
         self._write(_do)
 
+    def graph_aliases_all(self) -> list[dict]:
+        """Every (alias, node_id) pair — the candidate set K2's turn-time
+        alias scan matches owner messages against."""
+        rows = self._r().execute("SELECT alias, node_id FROM aliases").fetchall()
+        return [dict(row) for row in rows]
+
     def graph_alias_lookup(self, name: str) -> int | None:
         """Resolve a bare name to a node id via aliases OR the node's own
         title (case-insensitive exact match), aliases first."""

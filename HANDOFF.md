@@ -384,32 +384,32 @@ jobs no longer broadcast their full raw response — only an explicit
 see checklist + session log below.
 **K1 (graph schema + indexer) is COMPLETE** (PLAN.md §6/K1) — see
 checklist + session log below.
-**NEXT UNIT OF WORK: K2 (turn-time entity linking + neighborhood
-injection), THEN K3-K4, THEN K5 (team relay, new 2026-07-18,
-owner-requested — depends on K2's alias resolution)** — PLAN.md's phase
-order. THEN U1-U4, H4, B1-B2, THEN the existing R1→...→V1-V3 tail
-(unchanged). Full test gate before and after every step — the gate is now
-16 files: test_fixes/test_interactive/test_core/test_schedules_seam/
-test_review/test_tui/test_zilla_cli/test_memory_m3/test_memory_m4/
-test_harness/test_health/test_heartbeat/test_quickfix/test_service/
-test_zilla_home/test_memory_k1, plus `import bot; import zilla.core;
-import zilla.cli; import zilla.tui.app; import schedule_query;
-import zilla.graph; import memgraph`. (The 9-file list in older session
-notes was stale — H1-H3/F1 each added a file that was never folded into
-"the gate" name; a fresh count of ALL test_*.py this session found 15,
-not 9 — run `ls test_*.py` to reconfirm before trusting either number in
-a future session.) **F5 session note: a fresh per-file recount landed at
-1014 green, not the "1000+4" arithmetic you'd expect from 4 new test
-functions — per-file counts already didn't sum to "1000" before this
-session either (e.g. test_zilla_cli alone is 150, not the "70" the file
-list above still names); this drift predates F5 and is a documentation
-issue, not a regression — every file still exits 0. Recompute fresh via
-the per-file loop rather than trusting any cited grand total, including
-this one, until a session does the work of reconciling per-file counts
-against their own history.** **K1 session note: 1014 + 36 (new
+**K2 (turn-time entity linking + neighborhood injection) is COMPLETE**
+(PLAN.md §6/K2) — see checklist + session log below.
+**NEXT UNIT OF WORK: K3 (curiosity loop), THEN K4, THEN K5 (team relay,
+owner-requested — depends on K2's alias resolution, now shipped)** —
+PLAN.md's phase order. THEN U1-U4, H4, B1-B2, THEN the existing
+R1→...→V1-V3 tail (unchanged). Full test gate before and after every
+step — the gate is now 17 files: test_fixes/test_interactive/test_core/
+test_schedules_seam/test_review/test_tui/test_zilla_cli/test_memory_m3/
+test_memory_m4/test_harness/test_health/test_heartbeat/test_quickfix/
+test_service/test_zilla_home/test_memory_k1/test_memory_k2, plus
+`import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
+import schedule_query; import zilla.graph; import memgraph`. **F5
+session note: a fresh per-file recount landed at 1014 green, not the
+"1000+4" arithmetic you'd expect from 4 new test functions — per-file
+counts already didn't sum to "1000" before this session either (e.g.
+test_zilla_cli alone is 150, not the "70" the file list above still
+names); this drift predates F5 and is a documentation issue, not a
+regression — every file still exits 0. Recompute fresh via the per-file
+loop rather than trusting any cited grand total, including this one,
+until a session does the work of reconciling per-file counts against
+their own history.** **K1 session note: 1014 + 36 (new
 test_memory_k1.py) = 1050 green, verified by fresh per-file sum, not
 carried forward blindly — see the K1 line in Session log for the
-per-file breakdown.**
+per-file breakdown.** **K2 session note: 1050 + 28 (new
+test_memory_k2.py) = 1078 green, fresh per-file sum, all 17 files exit 0
+— see the K2 line in Session log.**
 **Working branch (source of truth): `main`.** Branches consolidated
 2026-07-18 night: `claude/zilla-harness-review-0v96bs`'s 7 commits are
 merged into `main` and pushed; the planning branch
@@ -417,19 +417,46 @@ merged into `main` and pushed; the planning branch
 both now fully merged, superseded shells — safe to delete. **PUSH TO
 MAIN EVERY SESSION, no exceptions** (an unpushed session nearly caused
 divergence before — this reconciliation is the proof of why).
-**Tests (fresh per-file recount, 2026-07-18 K1 session):** 291 fixes +
+**Tests (fresh per-file recount, 2026-07-18 K2 session):** 291 fixes +
 16 interactive + 116 core + 57 schedules_seam + 71 review + 17 tui +
 150 cli + 49 harness + 34 memory_m3 + 31 memory_m4 + 67 heartbeat +
-57 health + 23 service + 10 quickfix + 25 zilla_home + 36 memory_k1
-= **1050 green** —
+57 health + 23 service + 10 quickfix + 25 zilla_home + 36 memory_k1 +
+28 memory_k2 = **1078 green** —
 `.venv/bin/python test_fixes.py / test_interactive.py / test_core.py /
 test_schedules_seam.py / test_review.py / test_tui.py / test_zilla_cli.py /
 test_harness.py / test_memory_m3.py / test_memory_m4.py /
 test_heartbeat.py / test_health.py / test_service.py / test_quickfix.py /
-test_zilla_home.py / test_memory_k1.py` (test_schedules_seam.py is a
-frozen acceptance spec — never edit it) + `import bot; import zilla.core;
-import zilla.cli; import zilla.tui.app; import schedule_query;
-import zilla.graph; import memgraph`.
+test_zilla_home.py / test_memory_k1.py / test_memory_k2.py`
+(test_schedules_seam.py is a frozen acceptance spec — never edit it) +
+`import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
+import schedule_query; import zilla.graph; import memgraph`.
+K2 note: `graph.alias_scan(db, text, cap=3)` builds its candidate set
+from BOTH `graph_aliases_all()` and every node's own `title` (a node's
+proper name is the most obvious "alias" for itself; PLAN.md's literal
+spec text says "against aliases" but omitting title match would mean
+mentioning someone by their real name — not a declared alias — surfaces
+nothing, a real UX gap) — sorted longest-name-first so multi-word
+overlaps resolve correctly (e.g. "New York City Project" wins over "New
+York" for the same span), word-bounded (`\b`) and case-insensitive,
+first non-overlapping occurrence per candidate, capped at `cap` distinct
+nodes. Ghost nodes ARE matchable (by title) — mentioning a
+referenced-but-pageless entity still surfaces its ghost marker, which is
+also K3's future relevance-gate hook. `harness._graph_block()` is the
+sole injection point, wired into `wrap_prompt` (NOT `build_preamble` —
+build_preamble has no access to the raw user message, only wrap_prompt
+does), gated on `ctx.is_owner` exactly like M2's `_memory_block` (same
+single gate — the graph lives under Memory/Wiki, never any other
+principal's prompt). Strongest hit (index 0 = longest matched name) gets
+a 2-hop `local_card_lines()` card, the rest 1-hop; whole block capped at
+25 lines with a `[truncated]` marker, never a crash on a hub node with
+many edges. Live-smoked against a throwaway `ZILLA_HOME`+`Memory` dir
+(not the owner's real one) through the REAL `claude` backend
+(`zilla.backends.run_claude`, `--dangerously-skip-permissions`, isolated
+tmp dirs): message "can you ping ramesh about the thing?" with NO
+explicit memory question got a reply that referenced "the wiki page for
+Ramesh" and correctly declined to fabricate a send (no relay tool exists
+yet — that's K5) — proof the `[via graph]` card actually reaches and is
+used by the model, not just present in the constructed string.
 K1 note: graph tables (`nodes`/`aliases`/`edges`) are disposable/
 rebuildable, same spirit as `mem_fts` — the Wiki pages are the truth.
 `memory.reindex()` now also calls `graph.reindex_graph()` every cycle;
@@ -537,7 +564,7 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **F4** System jobs invisible + silent — fixes the live heartbeat noise the owner screenshotted (PLAN §17). DONE 2026-07-18. 1000 green (full 15-file gate). See session log below for full detail.
 - [x] **F5** Conversational schedule access (`schedule_query.py` — agent answers "what's scheduled" in plain language, no menu tap required; PLAN §17) — owner-requested 2026-07-18. DONE 2026-07-18. 1014 green (fresh full-gate recount — see Tests line above for why this isn't "1000+4"). See session log below for full detail.
 - [x] **K1** Graph schema + indexer (PLAN §6): `nodes`/`aliases`/`edges` tables in `store.py`; `zilla/graph.py` parser (entity page grammar: bio line, `key::`/`verb:: [[Target]] (dates?)`, ghost nodes, wiki-link mentions, unknown-verb tolerance) + indexer (wired into `memory.reindex()`'s cycle, rebuild-from-scratch == incremental, order-independent ghost promotion) + BFS traversal (neighbors/path/find, cycle-safe); `memgraph.py` CLI. DONE 2026-07-18. 1050 green (16-file gate + `test_memory_k1.py`'s 36). See session log below.
-- [ ] **K2** Turn-time entity linking + neighborhood injection.
+- [x] **K2** Turn-time entity linking + neighborhood injection (PLAN §6/K2) — DONE 2026-07-18. 1078 green (17-file gate + `test_memory_k2.py`'s 28). See session log below.
 - [ ] **K3** Curiosity loop.
 - [ ] **K4** Graph views (`/graph` HTML).
 - [ ] **K5** Team relay: delegated send & scheduling ("tell Priya X" / "remind Rahul every Monday") — owner-requested 2026-07-18, always-confirm policy (PLAN §6).
@@ -588,6 +615,7 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 | 2026-07-18 | **F4 COMPLETE** (PLAN.md §17/F4, "the heartbeat-noise fix"): the ACTUAL bug behind the owner's screenshotted noise was in `core._run_and_record_system` — it broadcast a full `ScheduledResult` (rendered by `bot.py` as "⏰ Scheduled — {title}" + the ENTIRE raw response) any time a system job's reply wasn't EXACTLY the literal string `HEARTBEAT_OK`, so any mildly-interesting heartbeat finding produced a noisy full-response DM. **(1) `/schedules` is owner-schedules-only:** `zilla/schedules.py`'s `ScheduleManager.list()` gained `include_system: bool = False` — a READ-TIME filter (system rows were already correctly flagged `system=1` at creation by pre-existing M4/H1 code, so no data migration was needed; the two internal callers that must still see system rows, `ensure_system_schedule`/`ensure_heartbeat_schedule`, now explicitly pass `include_system=True`) — plus a new `list_system(user_id)` for system-only reads. **(2) `/health → System jobs` panel:** `keyboards.py` gained `kb_health()` (adds a "System jobs" entry) and `kb_sysjobs(items)` (status marker + last-run + a per-job `sysjob_toggle_<id>` pause/resume button, NEVER a delete button — `ScheduleManager.remove()` already refused system rows since F1); `bot.py`'s `_cb_misc` gained `menu_sysjobs`/`sysjob_toggle_` branches (no dispatch-table change needed, both already fall through to `_cb_misc`) plus a new `_sysjobs_panel_text()` helper, and `menu_health` now renders `kb_health()` instead of the old generic `kb_back()`. **(3) Silent-output contract:** `zilla/core.py` gained `_OWNER_ALERT_RE` (`^OWNER_ALERT:\s*(.+)$`, multiline) and `_maybe_alert_owner_from_system_job(sid, response)`; `_run_and_record_system` no longer broadcasts `ScheduledResult` under any circumstance — a system job's full output goes to the log only, and the ONLY DM path is an extracted `OWNER_ALERT:` line, cooldown-gated by reusing H2's existing generic `zilla.health.should_alert`/`mark_alerted` machinery under key `f"schedule_alert:{sid}"` (one alert per schedule per 6h cooldown window, same as a health probe). `zilla/heartbeat.py`'s `build_beat_prompt()` and `bot.py`'s `DISTILLATION_PROMPT` both now teach the agent the `OWNER_ALERT: <one calm sentence>` convention as the only way to reach the owner from a system job. **(4) Migration:** satisfied entirely by (1)'s read-time filter — no separate migration code needed, confirmed via `test_schedule_list_hides_system_jobs_by_default`. New tests: `test_heartbeat.py` — renamed and inverted `test_run_and_record_system_fires_with_injected_prompt_and_delivers` → `..._and_stays_silent` (F4 changes real behavior, not just a rename) plus 3 new tests (OWNER_ALERT line delivers as a bare `Alert` with only that line, not the whole response; repeated OWNER_ALERT for the same schedule is cooldown-gated to one DM; the silence contract applies to any `system=1` job, not just the heartbeat by title). `test_fixes.py` — `test_schedule_list_hides_system_jobs_by_default`, `test_ensure_system_schedule_still_finds_existing_across_restart`. `test_zilla_cli.py` — `kb_health()` links to System jobs, `kb_sysjobs()` renders status/toggle/no-delete, structural grep-gate confirming `bot.py`'s new branches are wired and the sysjobs panel is driven by `list_system()` not the owner-facing `list()`. **Regression found and fixed mid-session:** the new `list()` default broke two PRE-EXISTING tests that located the heartbeat/distillation schedule via a bare `.list(OWNER)` call expecting system rows included — `test_ensure_heartbeat_schedule_idempotent_and_toggle` (test_heartbeat.py) and `test_distillation_schedule_seeded_exactly_once` (test_memory_m4.py) — both fixed by adding `include_system=True` to those specific lookup calls; `bot.py`'s 5 real `/schedules`-surface call sites were correctly left on the new owner-only default (that's the point of F4.1). Also fixed a cosmetic truncation bug caught by the new `kb_sysjobs` test: the paused-marker test wanted the full word "distillation" in the label but `title[:24]` cut "Nightly memory distillation" mid-word — widened to `title[:40]` (only affects `kb_sysjobs`, `kb_schedules`'s separate `[:24]` truncation for the owner-facing `/schedules` list is untouched). **1000 green — full 15-file gate, zero regressions** (980 + 20 new F4 tests). |
 | 2026-07-18 | **F5 COMPLETE** (PLAN.md §17/F5, `feat(F5)` commit): new `schedule_query.py` (repo root, same agent-callable CLI convention as `memsearch.py`) — read-only, plain-text view of the owner's OWN schedules. `render_list(mgr, owner_id)` calls the existing `ScheduleManager.list(owner_id)` (system=1 rows already excluded by its F4 default, no new filtering logic needed) and formats `[id] title — description · next <ts> · enabled/paused` per row via the existing `schedules.describe()`; `render_detail(mgr, owner_id, sid)` resolves one schedule by id and explicitly refuses (`"No such schedule."`) unless it belongs to `owner_id` AND isn't a system row — a system job's id is therefore never resolvable through this tool even if guessed, same rule as the list view, just enforced a second time since `get()` has no owner filter of its own. `main(argv)` is a thin wrapper: no args → `render_list`, one arg → `render_detail` for that id, against `config.SCHEDULES_FILE`/`config.OWNER_CHAT_ID` (no new config surface). `zilla/harness.py`'s `_memory_block()` gained one more owner-only forward-compat line (same gated pattern as the `memsearch.py` line just above it): present only when `schedule_query.py` exists on disk, telling the agent to answer "what's scheduled" questions directly instead of pointing at the `/schedules` menu. New tests: `test_fixes.py` (+3) — list excludes a system job and shows the exact stored `next_run`; detail matches title/next-run/fail-count and returns "not found" for another user's id, an unknown id, AND a system job's own id (the second enforcement point, exercised directly). `test_harness.py` (+1) — the forward-compat line appears only when the script file exists, and — the part that's actually new versus the memsearch precedent — is verified absent from a non-owner `TurnContext`'s preamble even when the script exists (owner-only gate, mirroring `_memory_block`'s existing `ctx.is_owner` short-circuit). Live-verified read-only against the real bot's actual `~/Zilla/Runtime/zilla.db` this session (owner's real `OWNER_CHAT_ID` resolved correctly; the real DB currently has zero owner schedules — heartbeat/distillation haven't been seeded yet per H1's still-open live-restart deferral — so `schedule_query.py` printed "No schedules.", the correct output for that state, no crash, no mutation). **Fresh full-gate recount this session: 1014 green, not "1000 + 4"** — discovered mid-session that several per-file counts already didn't match the file-list-with-counts documented near the top of this board (e.g. `test_zilla_cli.py` is 150 tests today, not the "70" still named there) — this predates F5 (F2/F3/F4 each added tests to files without updating that summary line) and is a documentation-drift issue, not a functional regression; every one of the 15 files plus the import-smoke line still exits 0. Corrected the stale "Tests:" line near the top of this board to the fresh recount and named every per-file count explicitly so the next drift is easier to spot. Live smoke of the actual conversational path ("what do I have scheduled" via live chat) deliberately NOT done — same owner's-call live-verification deferral as every prior phase. |
 | 2026-07-18 | **K1 COMPLETE** (PLAN.md §6/K1): `store.py` gained `nodes`/`aliases`/`edges` tables (disposable/rebuildable, `ON DELETE CASCADE`) plus thin CRUD (`graph_node_get/_get_by_path/_get_by_title/_insert/_update/_promote/_demote_to_ghost/_delete`, `graph_aliases_set`/`graph_alias_lookup` — alias-first then title-fallback, both case-insensitive, `graph_edges_replace_for_path` — provenance-scoped so re-indexing one page never touches another's edges, `graph_edges_all(history=)`, `graph_clear`). New `zilla/graph.py`: `parse_entity_page()` — pure parser for the exact PLAN.md grammar (H1 title, line-2 bio, `- key:: value` attributes before `## Relations`, `- verb:: [[Target]] (dates?)` after, verb normalized to `lower_snake`, `(since X)`/`(A .. B)` date-interval parsing, stray `[[Wiki-links]]` anywhere in prose captured as untyped `mentions` edges) — note the key-token regex had to allow internal spaces (`Works At::`) for normalization to have anything to do; `index_page()`/`remove_page()`/`reindex_graph()`/`rebuild()` — ghost nodes for `[[Target]]`s with no page yet, promoted (not duplicated) the moment their real page is indexed via case-insensitive title match, order-independent either direction; a deleted page with remaining inbound edges demotes to a ghost rather than orphaning them, otherwise deletes outright; `neighbors()`/`find_path()`/`find_nodes()` — Python BFS (not a raw SQL recursive CTE — see the module docstring's reasoning) over one `graph_edges_all()` fetch, cycle-safe, current-facts-only by default. Wired into `memory.reindex()`'s existing cycle (full Wiki re-walk each call, not mtime-diffed — a documented, revisitable tradeoff). New `memgraph.py` CLI (repo root, same convention as `memsearch.py`/`schedule_query.py`): `neighbors <name> [--hops N] [--history]`, `path <a> <b>`, `find <type> [--near <name>]`. New `test_memory_k1.py` (36 tests, all of PLAN.md §6.K1's Accept criteria): parser golden test against the exact grammar example incl. date intervals; unknown-verb + prose-mention capture; verb normalization; ghost creation + promotion both orders; rebuild-from-scratch == incremental (by node/edge shape, not raw ids, since a clear+rebuild legitimately reassigns ids); page-deletion removal vs. demotion-to-ghost; 2-hop neighbors with an explicit cycle proven non-duplicating; shortest path; type+near filtering; alias multi-match. Live-smoked end to end against a throwaway `ZILLA_HOME` (never the owner's real one): seeded two Wiki pages, ran `memory.reindex()`, then `memgraph.py neighbors/path/find` all read back correctly including ghost rendering for `[[Delhi]]` (never given its own page). **1050 green** (1014 + 36, fresh per-file sum — see Tests line above). No stray real `Memory/`/`zilla.db` touched (confirmed — the repo-root `Memory/`/`zilla.db` predate this session and are gitignored, untouched by any isolated test run). |
+| 2026-07-18 | **K2 COMPLETE** (PLAN.md §6/K2): `store.py` gained `graph_aliases_all()` (every alias/node_id pair — the candidate source for the turn-time scan). `zilla/graph.py` gained `format_dates()` (pulled out of `memgraph.py`'s private `_fmt_dates` so both the CLI and the new turn-time card share one implementation — memgraph.py now imports it instead of duplicating), `alias_scan(db, text, cap=3)` (deterministic, zero-AI: candidates = every alias PLUS every node's own title — deliberately broader than PLAN.md's literal "against aliases" text, since matching only declared aliases would mean mentioning someone by their real name surfaces nothing if that exact name was never listed as an alias; sorted longest-name-first so multi-word overlaps resolve to the more specific entity, e.g. "New York City Project" beats "New York" for the same span; word-bounded `\b` + case-insensitive; first non-overlapping occurrence per candidate; ghost nodes are matchable by title, which doubles as K3's future relevance-gate hook), and `local_card_lines(db, node, hops)` (title + ghost marker + bio + current edges via the existing `neighbors()`, reused rather than re-implementing BFS). `zilla/harness.py` gained `_graph_block(user_message, ctx)` — the sole injection point, wired into `wrap_prompt` (not `build_preamble`, which never sees the raw user message) and gated on `ctx.is_owner` exactly like M2's `_memory_block` (same single gate: the graph is Memory/Wiki-derived, owner-only); on a hit it renders a `[via graph]` header + up to 3 nodes' cards (index-0 "strongest"/longest-matched hit gets a 2-hop card, the rest 1-hop), the whole block capped at 25 lines with a `[truncated]` marker so a hub node with many edges can never bloat or crash a turn. `_memory_block()` also gained one more owner-only protocol line (same gated pattern as the F5 `schedule_query.py` line) teaching the agent `memgraph.py` and the entity-page update protocol (create-from-template, `verb:: [[Target]]` relation lines, close-don't-delete on supersession). New `test_memory_k2.py` (28 tests, all of PLAN.md §6.K2's Accept criteria): alias-scan word-boundary (no false positive on "Rameshwaram" containing "Ramesh"), longest-match precedence over a shorter overlapping name, cap enforcement, ghost-node matchability; `local_card_lines()` bio+edge+ghost-marker rendering; `wrap_prompt()` injection golden tests — owner-only gating (non-owner and `ctx=None` both get zero leakage), no-match is a silent no-op, `build_preamble` alone never carries the card, strongest-hit 2-hop vs. 1-hop, and the 25-line cap with a synthetic 40-edge hub node. **1078 green** (1050 + 28, fresh per-file sum — see Tests line above; 17-file gate). Live-smoked against a throwaway `ZILLA_HOME`+`Memory` dir (never the owner's real one) through the REAL `claude` backend (`zilla.backends.run_claude`, `--dangerously-skip-permissions`, fully isolated tmp dirs — no owner state touched): the message "can you ping ramesh about the thing?" carried NO explicit memory question, and the model's actual reply referenced "the wiki page for Ramesh" and correctly declined to fabricate sending a message (no relay tool exists yet — that's K5) — direct proof the `[via graph]` card reaches and is used by the model, not just present in the constructed prompt string. |
 
 ### Notes (only what a future session needs)
 

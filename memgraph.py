@@ -21,14 +21,6 @@ from zilla.config import DB_FILE
 from zilla import graph, store as _store
 
 
-def _fmt_dates(valid_from, valid_to) -> str:
-    if valid_to:
-        return f" ({valid_from or '?'} .. {valid_to}, superseded)"
-    if valid_from:
-        return f" (since {valid_from})"
-    return ""
-
-
 def _fmt_node(node: dict) -> str:
     label = node["title"] or "(untitled)"
     if node["is_ghost"]:
@@ -50,7 +42,7 @@ def cmd_neighbors(db, args) -> int:
         return 0
     for hit in result["hits"]:
         arrow = "->" if hit["direction"] == "out" else "<-"
-        dates = _fmt_dates(hit["valid_from"], hit["valid_to"])
+        dates = graph.format_dates(hit["valid_from"], hit["valid_to"])
         print(f"  [{hit['hop']}] {arrow} {hit['rel']} {arrow} {_fmt_node(hit['node'])}{dates}")
     return 0
 

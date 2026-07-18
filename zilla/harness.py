@@ -364,6 +364,19 @@ def _memory_block(ctx: "TurnContext | None") -> str:
             "plain language instead of pointing at a menu."
         )
 
+    memgraph_path = os.path.join(_HERE, "memgraph.py")
+    graph_line = None
+    if os.path.exists(memgraph_path):
+        graph_line = (
+            "- You have a relational memory of people, places, and organizations "
+            f"(`python {memgraph_path} neighbors|path|find ...`). To answer \"whom do I "
+            "know at/for X\" or plan anything involving people, places, or organizations, "
+            "run it. When the owner shares a new fact about an entity, update that "
+            "entity's Wiki page (create it from the template if missing — every person "
+            "gets a bio line); record relations as `verb:: [[Target]]` lines; close an "
+            "interval when a fact is superseded, never delete the line."
+        )
+
     parts = [
         "## Your memory (persistent, yours to maintain)",
         core_text.strip() or "(empty)",
@@ -387,6 +400,8 @@ def _memory_block(ctx: "TurnContext | None") -> str:
     ]
     if schedule_line:
         parts.append(schedule_line)
+    if graph_line:
+        parts.append(graph_line)
     if was_template:
         parts.append(
             "\nMEMORY.md is still empty — briefly interview the owner "
@@ -451,6 +466,43 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
     return "\n\n".join(parts)
 
 
+# ══════════════════════════════════════════════════════════
+#  TURN-TIME GRAPH LINKING  (PLAN.md §6.K2 — owner-only, deterministic)
+# ══════════════════════════════════════════════════════════
+
+_GRAPH_CARD_MAX_LINES = 25
+
+
+def _graph_block(user_message: str, ctx: "TurnContext | None") -> str:
+    """Deterministic alias scan of `user_message` against the relational
+    graph (zero AI calls). '' for any non-owner turn or ctx=None — same
+    single gate as `_memory_block` (the graph lives under Memory/Wiki, so
+    it is the owner's, never any other principal's). On a hit, returns a
+    compact `[via graph]` card (bio + current edges) per matched entity —
+    up to 3, the single strongest (longest-matched) getting a 2-hop card,
+    the rest 1-hop — capped overall at `_GRAPH_CARD_MAX_LINES` lines so a
+    busy graph can never bloat the prompt."""
+    if ctx is None or not ctx.is_owner or not user_message:
+        return ""
+    try:
+        from zilla import graph as _graph
+        from zilla import store as _store
+        from zilla.config import DB_FILE
+        db = _store.get_store(DB_FILE)
+        hits = _graph.alias_scan(db, user_message, cap=3)
+        if not hits:
+            return ""
+        lines = ["[via graph]"]
+        for i, node in enumerate(hits):
+            lines.extend(_graph.local_card_lines(db, node, hops=2 if i == 0 else 1))
+        if len(lines) > _GRAPH_CARD_MAX_LINES:
+            lines = lines[:_GRAPH_CARD_MAX_LINES] + ["  [truncated]"]
+        return "\n".join(lines)
+    except Exception as e:  # a broken graph read must never break a turn
+        logger.debug(f"[HARNESS] graph card failed: {e}")
+        return ""
+
+
 def _relay_protocol(bridge_dir: str) -> str:
     """Instruction block teaching the agent the human-in-the-loop file bridge.
     This is what lets an autonomous login/checkout pause for an OTP, phone
@@ -488,7 +540,9 @@ def wrap_prompt(user_message: str, *, is_new: bool, backend: str | None = None,
     # the task is complex (simple tasks stay lean = fast).
     from zilla.autoharness import plan_directive
     directive = plan_directive(user_message)
-    blocks = [b for b in (preamble, directive) if b]
+    # Phase K2: deterministic alias scan -> local graph card (owner-only).
+    graph_block = _graph_block(user_message, ctx)
+    blocks = [b for b in (preamble, directive, graph_block) if b]
     if not blocks:
         return user_message
     return (
