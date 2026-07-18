@@ -92,6 +92,16 @@
    fine, expected, not a bug to chase). Still SERIAL ONLY (see Working
    Agreements below) — one dispatched session at a time, never fan out
    several in parallel.
+   **Known gotcha (hit once, 2026-07-18, now fixed for this path):** the
+   very first `do script`-launched window sits stuck on Claude Code's
+   "Do you trust this folder?" dialog forever — `do script` has no one
+   there to press Enter. Fix if it ever recurs (e.g. a different clone
+   path, a different machine/account): bring the window forward and send
+   one Return keystroke —
+   `osascript -e 'tell application "Terminal" to set index of window id <ID> to 1' -e 'tell application "Terminal" to activate' -e 'tell application "System Events" to key code 36'`
+   — accepting it once persists `hasTrustDialogAccepted: true` for that
+   exact path in `~/.claude.json`, so it never prompts again for repeat
+   relays into the same directory.
 
 ---
 
