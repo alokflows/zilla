@@ -34,6 +34,7 @@ For any execution agent, every session:
 | U1 ZUI protocol (cards/tables/contacts/buttons) | ⬜ | planned by Fable, 2026-07-18 |
 | U2 Agent ZUI education + contacts loop | ⬜ | |
 | U3 Design system (STYLE.md + menu refactor) | ⬜ | |
+| U4 Presence (pinned status card, silent restarts) | ⬜ | planned by Fable, 2026-07-18 |
 | H1 Heartbeat loop | ⬜ | |
 | H2 Health probes + assisted re-login | ⬜ | |
 | H3 systemd service | ⬜ | |

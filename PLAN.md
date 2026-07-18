@@ -33,6 +33,14 @@ scheduling, health, and interfaces (Telegram today, terminal app in this plan).
 - **P6 — Preserve the concurrency invariants** I-CONV / I-STEP / I-CANCEL / L
   (defined in `AI_CONTEXT.md`). All CLI execution stays inside the per-user
   lock; conversation ids stay backend-tagged.
+- **P7 — Headless-first: 100% operable from Telegram.** The runtime is a
+  display-less server. EVERY operation, error, and recovery path must be
+  performable from Telegram (with the TUI-over-SSH as the second surface).
+  No feature may assume a local display, and nothing may be console-only:
+  any state a console would show must be reachable remotely (`/health` runs
+  the doctor probes on demand). A feature whose failure mode ends with
+  "SSH in and look at the logs" is incomplete — the error must arrive in
+  Telegram as one calm sentence with its recovery action.
 
 **Platforms:** development on macOS; primary runtime is Linux (laptop or
 always-on server). Windows keeps working via `platform_compat.py` but is not
@@ -546,6 +554,23 @@ is stripped and the text still delivers (P4: a bad card never kills a reply).
    **Accept:** style-lint checklist applied to every menu (documented in
    STATUS.md with before/after screenshots in the live smoke).
 
+### U4 — Presence (kill the startup blast)
+1. The current `⚡ Zilla is online (vX) / Model / Time` message on every
+   start (bot.py post_init) is REMOVED. Replacement — a **pinned status
+   card**: one message in the owner chat, pinned once, then **edited in
+   place** (edits generate no notifications): `● Online · <backend> ·
+   v<X>` / `○ Offline since <t>` (best-effort edit on clean shutdown),
+   plus last-heartbeat time. Glanceable always, noisy never.
+2. An actual new message is sent ONLY when it carries information: first
+   install ("Hi — I'm here."), after `/update` ("Updated to vX ✓", one
+   line), or on recovery from unexpected downtime > `downtime_notify_min`
+   (default 60 min; the catch-up summary rides the same single message).
+   Routine restarts are silent. `/status` shows the card's content on
+   demand.
+   **Accept:** no-message-on-clean-restart test; single-message-after-
+   downtime test; pinned-card edit (mocked bot) test; STYLE.md-compliant
+   copy.
+
 ## 8. Phase H — Heartbeat & self-healing
 
 **Design (owner-confirmed):** ONE agent-owned file, `HEARTBEAT.md`, holds
@@ -593,11 +618,18 @@ Seeded template:
    that is the slowest possible design. On claude/opencode (cheap fresh
    sessions) throwaway convs are fine. Quiet-run suppresses OK beats;
    memory autocommit picks up file edits.
-4. **Throwaway-conv GC:** every throwaway/scratch conv id is recorded;
-   after the run (or on a startup sweep) agy brain dirs unreferenced by
-   any session and older than 7 days are deleted. Without this, beats +
-   distillation + fallback turns leak ~1,500 orphaned brain dirs/month and
-   progressively slow agy's snapshot-diff conv detection.
+4. **GC & retention sweeps** (one housekeeping pass, deterministic):
+   (a) throwaway/scratch convs — every such conv id is recorded; after
+   the run (or on a startup sweep) agy brain dirs unreferenced by any
+   session and older than 7 days are deleted. Without this, beats +
+   distillation + fallback turns leak ~1,500 orphaned brain dirs/month
+   and progressively slow agy's snapshot-diff conv detection.
+   (b) **media retention** — Inbox/Outbox files older than
+   `media_retention_days` (default 30, 0 = keep forever) are deleted by
+   the same sweep; the deletion is logged, never announced (P4). Anything
+   worth keeping graduates out of Inbox: the agent (on request, "keep
+   this") copies it to `Memory/Media/`, which is retention-exempt,
+   git-tracked, and rides C3's cloud backup.
 5. Harness gains one protocol line: *"When the owner asks you to keep an
    eye on / remind / follow up on something recurring, add it to
    HEARTBEAT.md."*
@@ -627,8 +659,26 @@ Seeded template:
 3. Failed probes also prepend one line to the next beat prompt
    ("System flag: agy login expired — already DM'd owner") so the agent
    doesn't duplicate alerts.
+4. **Login console relay (P7 — checked against current code: does NOT
+   exist yet; the interactive.py bridge is agent-protocol-level and
+   cannot drive a CLI login prompt).** Build it deterministically:
+   `PtyProcess` gains a `write()` (os.write to the PTY master on POSIX /
+   winpty write). `/login <backend>` (owner, also offered as the button
+   on a login-expired alert) spawns that backend's login command under a
+   PTY, streams its output into the chat (URLs arrive as tappable links),
+   and forwards the owner's next reply into the PTY + Enter — token
+   pasted, authenticated, no display needed. Replies in this mode get
+   OTP-grade handling: deleted from chat after use, never logged,
+   redaction filter active. Timeout + cancel button; zero model
+   involvement end to end.
+5. `/health` (owner): runs the full probe suite + doctor checks on demand
+   and renders one ZUI card — the remote equivalent of
+   `install.py --doctor`, per P7.
    **Accept:** probe unit tests with injected failures; cooldown test;
-   live smoke of one full re-login round-trip (documented in STATUS.md).
+   PTY write + relay tests (mocked login binary: URL streamed, token
+   forwarded + newline, chat message deleted, nothing logged); /health
+   card renders; live smoke of one full agy re-login round-trip via
+   Telegram only — no SSH, no display (documented in STATUS.md).
 
 ### H3 — Linux service deployment
 1. `install.py --service`: writes + enables a systemd **user** unit
@@ -1069,6 +1119,7 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [ ] U1 ZUI protocol (cards/tables/contacts/buttons)
 - [ ] U2 Agent ZUI education + contacts loop
 - [ ] U3 Design system (STYLE.md + menu refactor)
+- [ ] U4 Presence (pinned status card, silent restarts)
 - [ ] H1 Heartbeat loop
 - [ ] H2 Health probes + assisted re-login
 - [ ] H3 systemd service
