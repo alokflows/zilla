@@ -481,6 +481,64 @@ edges (Obsidian semantics). A `[[Target]]` with no page yet becomes a
    local-view + filter behavior verified in smoke; 2k-node synthetic graph
    stays interactive.
 
+### K5 — Team relay: delegated send & scheduling (owner decision
+2026-07-18: always-confirm, no trusted-contact auto-send tier)
+
+**The idea:** the owner talks only to their own Zilla; Zilla reaches other
+people on the owner's behalf — "tell Priya to send the report" or "remind
+Rahul every Monday at 9" — instead of the owner switching chats or hunting
+a menu. **Mechanism (P5-compatible, reuses existing plumbing):** the
+schedule schema already separates creator from delivery target
+(`ScheduleManager.add(user_id, chat_id, …)`, `zilla/schedules.py` — no
+schema change needed). The model proposes a relay action with a
+deterministic marker (same family as `BG_TASK:`/`SKILL_PROPOSAL:`); Zilla's
+code resolves it, confirms with the owner, and only then acts.
+
+1. Ontology extension (§6 grammar, no new syntax): `person` pages may carry
+   a `telegram_uid:: <int>` attribute. The owner sets it (directly, or when
+   they share it in chat — the normal "update that entity's page" memory
+   protocol). Presence of this attribute on a page IS the authorization —
+   only the owner can write Memory (§4 scope guard), so recording it is the
+   owner vouching for the mapping. No separate "registered user" concept —
+   Telegram's own send API is the natural backstop (a person who never
+   started a chat with the bot simply can't receive one; Zilla surfaces one
+   calm line on that failure, never a crash).
+2. Deterministic marker pair (owner-turn-only): a reply may end with
+   `RELAY_SEND: <alias> :: <message>` or
+   `RELAY_SCHEDULE: <alias> :: <kind> :: <spec-json> :: <text>`. Zilla
+   strips the marker, resolves `<alias>` via K2's alias scan (exactly one
+   target per marker — no broadcast in v1), and renders a ✅/❌ confirm card
+   showing the resolved person's name plus the exact message or schedule
+   about to go out. **No confirm ⇒ nothing sends, ever — owner decision:
+   always-confirm, no trusted-contact bypass.** A relay action is a real
+   message sent to a real person in the owner's name; a misresolved alias
+   or an injected instruction must never fire unattended. On confirm,
+   `RELAY_SEND` delivers immediately via the existing `safe_send`;
+   `RELAY_SCHEDULE` calls `ScheduleManager.add(user_id=owner,
+   chat_id=<resolved telegram_uid>, payload_type="system_event", …)` —
+   verbatim-text delivery by default (P3: deterministic, no re-generation
+   drift on a fixed reminder). `uid` on the row stays the owner's, so it
+   still shows up under the owner's own `/schedules` (labeled "→ Priya").
+3. Failure modes, all silent-safe (P4): alias resolves to no node, or the
+   node has no `telegram_uid::` ⇒ marker stripped, reply still delivers to
+   the owner with one explanatory line ("I don't have a way to reach Priya
+   yet — add her Telegram ID to her page first"). Telegram send/schedule
+   fire fails (blocked the bot, never started a chat with it, etc.) ⇒ one
+   calm line, logged, never a stack trace.
+4. `/relay log` (owner, read-only): last 20 relay sends/schedule-creations
+   with target, timestamp, and message/schedule summary — an audit trail so
+   a relay action is never a surprise days later (same spirit as M4's
+   memory-change surfacing).
+   **Accept:** marker detect/strip/confirm tests for both kinds;
+   alias-resolution + no-telegram-uid / no-node failure-mode tests, each
+   with its explanatory line; confirm-required test (no confirm ⇒ no send,
+   including a simulated attempt to skip it); relay-schedule round-trip
+   test (`chat_id` = target's uid, `uid` = owner, `payload_type` =
+   system_event); `/relay log` test; live smoke — "tell `<person>` to do X"
+   → confirm card → tap → message arrives in their chat, not the owner's;
+   "remind `<person>` every Monday at 9" → confirm card → tap → schedule
+   fires on time and delivers to their chat.
+
 **Phase K definition of done:** live smoke demonstrating the full loop —
 owner mentions a new person + workplace in normal chat → pages appear with
 bio lines and typed relations (M-git commits show it) → days later, owner
@@ -1132,6 +1190,12 @@ violation of "never feels dead". Background tasks get their own lane.
 13. **Wake-word false accepts** (satellite hears TV, triggers a turn) →
    owner-trained model + tunable threshold + audible chime + everything it
    heard lands visibly in the session transcript — never a silent action.
+14. **Relay-send to the wrong person, or at all, from a misresolved alias
+   or injected instruction** (K5) → always-confirm, no auto-send tier
+   (owner decision 2026-07-18); alias resolution capped at one target per
+   marker (no broadcast in v1); `telegram_uid::` presence on a page is
+   itself owner-authorized (§4 scope guard — only the owner writes
+   Memory); `/relay log` gives a standing audit trail.
 
 ## 17. Phase F — Foundation cleanup (EXECUTES IMMEDIATELY AFTER M3, before M4)
 
@@ -1234,6 +1298,30 @@ system jobs — fix the foundation before more code lands on it.
    suppression tests; OWNER_ALERT extraction + cooldown test; migration
    test for pre-existing visible system schedules.
 
+### F5 — Conversational schedule access (owner decision 2026-07-18: kill
+the "open the menu just to look" reflex)
+1. `schedule_query.py` (repo root, same agent-callable CLI convention as
+   `memsearch.py`/`memgraph.py`): read-only, the owner's schedules in plain
+   text — title, kind/spec phrased in human terms, next run (via
+   `compute_next_run`), enabled/paused, last run + outcome.
+   `python schedule_query.py` → all; `python schedule_query.py <id>` → one,
+   with recent run history (`fail_count`, `last_run`). `system=1` jobs are
+   excluded (F4 — those are never owner-facing) and so are other users'
+   schedules (owner-only tool, like memsearch/memgraph).
+2. Harness protocol line (owner-turn-only, same TurnContext gate as
+   memsearch/memgraph): "You can inspect the owner's schedules with
+   `python schedule_query.py` — when asked what's scheduled, upcoming, or
+   about a specific reminder, answer directly in plain language instead of
+   pointing at a menu."
+3. The `/schedules` button menu is NOT removed — P7 needs a precision
+   surface for editing exact times, pausing, deleting, and it's the
+   fallback when the CLI backend itself is down. This adds a conversational
+   path alongside it; it doesn't replace the menu.
+   **Accept:** `schedule_query.py` golden-format tests (matches
+   `compute_next_run`, excludes system jobs and other users); harness
+   injection test (owner-only); live smoke — ask "what do I have
+   scheduled", get a plain-language answer with zero `/schedules` taps.
+
 ## 18. Execution order & progress
 
 Execute strictly top-to-bottom. Check items off here (this file) as they land.
@@ -1250,10 +1338,12 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] F2 Dynamic backend registry — no hard-coded backends (§17) *(done, 950 green)*
 - [x] F3 Media importance + retention controls (§17) *(done, 980 green; also built the H1.4b retention-sweep mechanism itself, which H1 never actually shipped)*
 - [x] F4 System jobs invisible + silent (§17) *(done, 1000 green; fixed the real heartbeat-noise bug — non-HEARTBEAT_OK responses no longer broadcast the full raw response, only an explicit OWNER_ALERT: line, cooldown-gated via H2's should_alert/mark_alerted)*
+- [ ] F5 Conversational schedule access (§17) — new 2026-07-18, owner-requested
 - [ ] K1 Graph schema + indexer
 - [ ] K2 Entity linking + neighborhood injection
 - [ ] K3 Curiosity loop
 - [ ] K4 Graph views (/graph HTML)
+- [ ] K5 Team relay: delegated send & scheduling
 - [ ] U1 ZUI protocol (cards/tables/contacts/buttons)
 - [ ] U2 Agent ZUI education + contacts loop
 - [ ] U3 Design system (STYLE.md + menu refactor)
