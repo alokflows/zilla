@@ -313,9 +313,20 @@ owner-ordered 2026-07-18): F1 ZILLA_HOME storage layout, F2 dynamic
 backend registry, F3 media importance+retention, F4 system jobs
 invisible+silent. THEN M4.** Full test gate before and after.
 **Working branch (source of truth): `main`** (branches consolidated
-2026-07-18 — the old planning + execution branches were merged into main
-and deleted; if any machine still has local commits from them, rebase
-onto main and push. PUSH TO MAIN EVERY SESSION, no exceptions).
+2026-07-18 — the old planning + execution branches were fully merged into
+main; if any machine still has local commits from them, rebase onto main
+and push. PUSH TO MAIN EVERY SESSION, no exceptions).
+
+**ONE-TIME CHORE (do this FIRST, before F1, from the owner's terminal —
+takes 30 seconds):** the two stale remote branches still exist as empty
+merged shells (the remote refused deletion from the planning session).
+Run:
+`git push origin --delete claude/python-cli-bot-planning-80x8a3 claude/zilla-harness-review-0v96bs`
+then verify with `git ls-remote --heads origin` (only `main` should
+remain). **After verified deletion, edit this file: remove this entire
+chore block AND every remaining mention of the old branch names in this
+file, so the consolidation leaves no residue. Commit that cleanup with
+the F1 session.**
 **Tests:** 260+16+116+57 core + 71 review + 17 tui + 69 cli + 46 harness +
 34 memory_m3 = **686 green** — `.venv/bin/python test_fixes.py /
 test_interactive.py / test_core.py / test_schedules_seam.py /
