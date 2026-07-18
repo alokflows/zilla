@@ -883,10 +883,31 @@ violation of "never feels dead". Background tasks get their own lane.
    scope guard as memory), and `/skills` labels the two sources
    distinctly. `Memory/Skills/` is the managed, gated system going
    forward.
+5. **Slash-command surface (owner decision 2026-07-18): every approved
+   skill also becomes a slash command** — this is how the owner adds a new
+   `/command` going forward, no separate mechanism. On approval (the ✅ tap
+   in item 2, or `/skills approve`), Zilla derives a command name from the
+   skill slug (deterministic slugify: lowercase, non-alnum → `_`, dedup
+   underscores; collision with an existing command or another skill's
+   slug ⇒ suffix `_2`/`_3`) and re-registers the owner's
+   `BotCommandScopeChat` list (F2's command-registry extension owns the
+   mechanics — same `set_my_commands` call, same drift-gate test).
+   Typing `/<skill>` runs the skill's stored prompt as a normal owner
+   turn through the SAME pipeline as typed text (memory injection, effort
+   routing, review gate all apply — a slash command is a shortcut for the
+   wording, never a different execution path or a permissions bypass).
+   Revoking a skill (item 3's hash-mismatch auto-revoke, or manual
+   `/skills disable`) removes its command on the same registration pass.
+   Legacy backend-native skills (item 4) do **not** get commands — only
+   `Memory/Skills/` entries, since only those are approval-gated (P5: an
+   unapproved skill must never become a callable command).
    **Accept:** marker detect/strip tests; approval hash lifecycle tests
-   (approve → run allowed; edit script → revoked); /skills flows; live
+   (approve → run allowed; edit script → revoked); /skills flows; slugify
+   + collision-suffix tests; approve→command-appears /
+   revoke→command-disappears tests (mocked `set_my_commands`); live
    smoke: solve task → proposal → ✅ → skill file exists, indexed,
-   committed to memory git.
+   committed to memory git, AND `/<name>` appears in Telegram's own "/"
+   autocomplete and running it produces the skill's answer.
 
 ---
 
@@ -1164,9 +1185,25 @@ system jobs — fix the foundation before more code lands on it.
 2. Adding a future backend = registering one adapter; every menu and
    validator picks it up with no UI edits. (R3's opencode adapter lands
    as the proof: register it, watch the button appear.)
+3. **Same principle, extended to the slash-command surface (owner
+   decision 2026-07-18):** `bot.py`'s hand-maintained `_BASE_COMMANDS`/
+   `_OWNER_COMMANDS` lists become a single command registry — one entry
+   per command (`name`, `description`, `handler`, `scope`:
+   everyone/admin/owner) that is the SOLE source for both
+   `add_handler(CommandHandler(...))` registration and the
+   `set_my_commands` push. A grep-gate test asserts a 1:1 mapping between
+   registered `CommandHandler`s and registry entries in both directions —
+   no command with a handler but no menu entry (invisible), no menu entry
+   with no handler (dead, exactly the "nothing dead lying around"
+   complaint that motivated this). §11 item 5's skill-derived commands
+   register into this SAME table dynamically at approve/revoke time, not
+   as a second list.
    **Accept:** registry probe tests (present/absent/logged-out binaries
    mocked); menu-generation test — buttons exactly match probe results;
-   grep-gate: no literal backend-name button lists outside the registry.
+   grep-gate: no literal backend-name button lists outside the registry;
+   command-registry 1:1 test (handler ⇔ menu entry, both directions);
+   live smoke — `/help` output, and Telegram's own "/" autocomplete, both
+   show exactly the registry's commands, no more, no less.
 
 ### F3 — Media importance + retention controls
 1. Settings (owner, `/settings → Storage`): auto-sweep **on/off** and

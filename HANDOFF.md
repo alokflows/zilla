@@ -308,10 +308,13 @@ green.** **M2 (Memory layout + injection + `TurnContext` threading) is
 COMPLETE** (PLAN.md §5.M2) — see checklist + session log below.
 **M3 (FTS5 search + memory git + quiet-run mode) is COMPLETE** (PLAN.md
 §5.M3) — see checklist + session log below.
-**NEXT UNIT OF WORK: Phase F (F1→F4) — foundation cleanup (PLAN.md §17,
-owner-ordered 2026-07-18): F1 ZILLA_HOME storage layout, F2 dynamic
-backend registry, F3 media importance+retention, F4 system jobs
-invisible+silent. THEN M4.** Full test gate before and after.
+**NEXT UNIT OF WORK: a small pre-F1 quick fix (owner-reported
+2026-07-18 pm, see Checklist + Notes below), THEN Phase F (F1→F4) —
+foundation cleanup (PLAN.md §17, owner-ordered 2026-07-18): F1
+ZILLA_HOME storage layout, F2 dynamic backend registry (now includes
+the slash-command registry, see PLAN.md §17 F2 item 3), F3 media
+importance+retention, F4 system jobs invisible+silent. THEN M4.** Full
+test gate before and after.
 **Working branch (source of truth): `main`** (branches consolidated
 2026-07-18 — the old planning + execution branches were fully merged into
 main; if any machine still has local commits from them, rebase onto main
@@ -374,7 +377,12 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **M1** `store.py` (SQLite+WAL) + first-start migration from the 5 JSON files — DONE 2026-07-18 (6 commits, `store.py`/thin wrappers/migration/doctor DB checks/audit-debt burn-down/secrets hygiene+backup/acceptance tests). 606 green.
 - [x] **M2** Memory layout (`Memory/` — `config.MEMORY_DIR`, repo root, per M1's forward-declaration, not literal `~/AGI-Brain/Memory`) + owner-only injection + `TurnContext` threading — DONE 2026-07-18. 652 green.
 - [x] **M3** FTS5 search + memory git + quiet-run mode — DONE 2026-07-18. 686 green.
-- [ ] **F1** ZILLA_HOME storage layout replaces AGI-Brain (PLAN §17) — NEXT.
+- [ ] **Quick fix (owner-reported 2026-07-18 pm)** Menu Close button:
+  delete the message instead of editing it to "✓ Closed" text; and fix
+  the silent-second-`answer()` bug so a failed callback is never
+  indistinguishable from a successful one (P4). Exact spec in Notes
+  below. — NEXT, before F1.
+- [ ] **F1** ZILLA_HOME storage layout replaces AGI-Brain (PLAN §17).
 - [ ] **F2** Dynamic backend registry — no hard-coded backend buttons (PLAN §17).
 - [ ] **F3** Media importance + retention controls (PLAN §17).
 - [ ] **F4** System jobs invisible + silent — fixes the live heartbeat noise the owner screenshotted (PLAN §17).
@@ -419,6 +427,47 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 | 2026-07-18 | **M3 COMPLETE**: indexer — `memory.reindex()` scans `Memory/**/*.md`, diffs against `mem_seen` (mtime+size), upserts into the M1-seeded `mem_fts` FTS5 table, drops entries for deleted files; called on `bot.py` startup and on every owner-turn `harness._memory_block()` injection. `memory.search()` (FTS5 `MATCH`, reindexes first) + a post-match per-file line scan (`_locate()`, FTS5 carries no line numbers) → `memsearch.py` CLI at repo root (`python memsearch.py "query"` → top-8 `path:line` + 2-line snippet, plain text, exit 0 + "no results" on empty) — this is what the M2-seeded forward-compat line in the memory block now actually invokes. `memory.git_autocommit(context)`: `git init` on first call (author "Zilla <zilla@local>", `.git` locked 0700), `git add -A && git commit -m <context>` only if `git status --porcelain` shows changes; wrapped in a broad try/except so a git failure (missing binary, locked file, disk full) is logged and swallowed, never breaks a reply. Quiet-run mechanism: `system` flag threaded through `ScheduleManager.add()`/`_to_dict()` (DB column already existed from M1); `_quiet_heartbeat_suppressed(s, response)` in `core.py` — a `system=1` schedule whose stripped response is/ends with a line reading exactly `HEARTBEAT_OK` (case-insensitive) delivers nothing (still counts as success, logged as `schedule_quiet`); a user (`system=0`) schedule is never suppressed even if its own legitimate output ends with that token — checked and wired into both `_run_and_record` and `run_schedule_now`. **Critical safety design**: `git_autocommit`/`reindex` touching the real repo `Memory/` tree is gated behind a new `ZillaCore.memory_autocommit_enabled` flag (default `False`, same opt-in pattern as `schedule_pre_run`) — only `bot.py`'s real `main()` sets it `True`; every test-constructed `ZillaCore` (including the frozen `test_schedules_seam.py`, which does not isolate `MEMORY_DIR`/`DB_FILE`) leaves it off, so the new autocommit code path is a safe no-op there. Caught proactively before writing any code: a real `Memory/` tree with the owner's actual data already exists at the repo root (created by the live bot) — confirmed after every test run this session that no `.git` appeared inside it and no stray real `zilla.db` was created. New `test_memory_m3.py` (34 tests, all 5 of PLAN.md §5.M3's Accept criteria): index build + no-op-when-unchanged + invalidation-on-delete; search resolves a planted fact to the exact `path:line`; `git_autocommit` fires on change and is a no-op on no-change (verified via `git log` commit count); a git failure injected at the `subprocess.run` level (not by replacing `git_autocommit` itself, which would bypass its own try/except) still delivers the turn's `Response` through a real `ZillaCore.handle_message` call; full quiet-run suppression matrix including the negative case (`system=0` + token still delivers) for both `_run_and_record` and `run_schedule_now`. 686 green (260+16+116+57+71+17+69+46+34). |
 
 ### Notes (only what a future session needs)
+
+- **Quick fix spec (owner-reported 2026-07-18 pm, do this FIRST, before
+  F1):**
+  1. `bot.py` `_cb_misc`, the `menu_close` branch (~line 2013-2020):
+     currently `await query.edit_message_text("✓ Closed. Send /menu to
+     reopen.")`. Change to `await query.message.delete()` (bots can
+     always delete their own outgoing messages in a private chat, no 48h
+     limit — same precedent already used for the OTP/password wipe at
+     `bot.py:1920`, `await update.message.delete()`). Keep a fallback:
+     if delete raises, fall back to `edit_message_reply_markup(reply_markup=None)`
+     silently (strip the buttons, no confirmation text either way — the
+     owner does not want a "Closed" message, they want the message gone).
+  2. `handle_callback` (~line 2586-2617): the outer `except Exception`
+     tries a second `query.answer(f"Error: ...")` to report a failure,
+     but Telegram rejects a second `answer()` on the same callback query,
+     so that call raises and is swallowed by its own bare
+     `except Exception: pass` — a failing button tap currently looks
+     IDENTICAL to a working one (tap registers, spinner clears, nothing
+     else happens). This is a real P4 violation, not cosmetic, and is
+     the likely cause of "buttons feel unresponsive" reports beyond
+     Close specifically. Fix: on that exception path, since `answer()`
+     is already spent, surface the failure a different way — edit the
+     original message (or send a new one if edit fails) with one calm
+     line, e.g. `⚠️ That didn't go through — try again.` (P4/STYLE.md
+     tone: no stack traces, one sentence, no exclamation-mark pile-up).
+     **Accept:** unit test simulating a `_cb_*` helper raising mid-way
+     confirms the chat receives a visible failure notice, not silence;
+     menu_close unit test confirms `delete()` is called and no text
+     message is sent; live smoke — tap Close, message vanishes with no
+     new message; force an error in a callback handler, confirm a
+     failure line appears instead of silence.
+- **Operational note (owner-reported 2026-07-18 pm):** a chunk of the
+  "unresponsive" reports traced to the dev MacBook's battery dying,
+  killing the bot process — not a code bug. PLAN.md's H3 (systemd on
+  the always-on Ubuntu server, per P7 headless-first) is the structural
+  fix and stays in its planned phase order; until H3 lands, keep the
+  dev Mac plugged in / prevent sleep during active use.
+- **Aesthetics note (owner-reported 2026-07-18 pm):** "stray lines and
+  symbols" in the menus is exactly PLAN.md's U3 (Design System /
+  STYLE.md) scope — already planned, no new spec needed, executes in
+  its existing phase slot.
 
 - **Latency is the owner's #1 complaint** — every turn pays a full CLI call
   (17s–2m34s observed live). The P1.5 orchestration router is the fix.
