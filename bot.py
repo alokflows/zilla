@@ -2092,9 +2092,12 @@ async def _cb_misc(query, context, data, uid, chat_id):
     if data == "menu_close":
         _active_menu.pop(chat_id, None)
         try:
-            await query.edit_message_text("✓ Closed. Send /menu to reopen.")
+            await query.message.delete()
         except Exception:
-            await query.edit_message_reply_markup(reply_markup=None)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         return
 
     if data == "menu_back":
@@ -2689,10 +2692,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_misc(query, context, data, uid, chat_id)
     except Exception as e:
         logger.error(f"Callback error: {e}", exc_info=True)
+        # query.answer() was already spent above (or the crash happened
+        # inside a _cb_* helper after a successful answer) — a second
+        # answer() raises on Telegram's side and is silently swallowed,
+        # making a failed tap look identical to a working one (P4
+        # violation). Surface it a different way instead.
+        failure_text = "⚠️ That didn't go through — try again."
         try:
-            await query.answer(f"Error: {str(e)[:100]}")
+            await query.edit_message_text(failure_text)
         except Exception:
-            pass
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=failure_text)
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════
