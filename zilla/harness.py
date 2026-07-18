@@ -38,6 +38,7 @@ import json
 import time
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,35 @@ logger = logging.getLogger(__name__)
 # Phase 1 move: this module now lives in zilla/, one level below repo root —
 # go up one more level so logs/ and bot_instructions.md still resolve there.
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# ══════════════════════════════════════════════════════════
+#  TURN CONTEXT  (PLAN.md §5.M2 step 2)
+# ══════════════════════════════════════════════════════════
+#  Who this turn is for and why it's running — threaded explicitly through
+#  every layer of the turn pipeline (run_cli_async -> _run_blocking ->
+#  _dispatch_turn -> run_cli/run_claude -> wrap_prompt/build_preamble).
+#  Deliberately NEVER a module-level "current turn" global: with
+#  concurrent_updates(True) and a shared thread-pool executor, ambient
+#  state would race across turns and could leak the owner's memory into
+#  another user's prompt. Pass it as a parameter, every call site, always.
+
+@dataclass(frozen=True)
+class TurnContext:
+    """uid      — the turn's principal.
+    role     — 'owner' | 'admin' | 'limited' (AuthManager.role_of).
+    is_owner — convenience/cache of (role == 'owner'). This is what gates
+               memory injection (§4 scope guard): memory is the OWNER's,
+               never any other principal's — a non-owner turn must contain
+               zero MEMORY.md / wiki index / journal-protocol content.
+    origin   — why this turn is running: 'user' (live chat), 'schedule',
+               'heartbeat' (Phase H, not wired yet), or 'approval' (an
+               Approval-mode request the owner just approved).
+    """
+    uid: int
+    role: str
+    is_owner: bool
+    origin: str = "user"
 
 
 # ══════════════════════════════════════════════════════════
@@ -281,11 +311,77 @@ def _resolve_placeholders(text: str, conv_dir: str, backend: str | None = None) 
 
 
 # ══════════════════════════════════════════════════════════
+#  MEMORY INJECTION  (PLAN.md §4/§5.M2 step 3 — owner-only)
+# ══════════════════════════════════════════════════════════
+
+_MEMORY_SOFT_CAP = 2400   # warn in log past this — MEMORY.md should stay lean
+_MEMORY_HARD_CAP = 4000   # truncate the whole injected block past this
+_MEMORY_INDEX_MAX_LINES = 100
+
+
+def _memory_block(ctx: "TurnContext | None") -> str:
+    """The 'Your memory' block appended to every OWNER turn, built fresh
+    each time (a few file reads + one index scan — cheap). '' for any
+    non-owner turn or when ctx is None: memory is the owner's, and this is
+    the single gate that keeps it out of every other principal's prompt."""
+    if ctx is None or not ctx.is_owner:
+        return ""
+
+    from zilla import memory as _memory
+    from zilla.config import MEMORY_DIR
+
+    core_text = _memory.read_core()
+    was_template = _memory.is_template(core_text)
+    if len(core_text) > _MEMORY_SOFT_CAP:
+        logger.warning(
+            f"[HARNESS] MEMORY.md is {len(core_text)} chars "
+            f"(soft cap {_MEMORY_SOFT_CAP}) — nudge the agent to trim it"
+        )
+
+    wiki_text = _memory.wiki_index_text(max_index_lines=_MEMORY_INDEX_MAX_LINES)
+
+    recall_line = f"- To recall details: read/grep files under {MEMORY_DIR}"
+    memsearch_path = os.path.join(_HERE, "memsearch.py")
+    if os.path.exists(memsearch_path):
+        recall_line += f', or run `python {memsearch_path} "query"` for ranked full-text results.'
+    else:
+        recall_line += "."
+
+    parts = [
+        "## Your memory (persistent, yours to maintain)",
+        core_text.strip() or "(empty)",
+        "",
+        "## Wiki index (read pages with your file tools when you need details)",
+        wiki_text or "(no wiki pages yet)",
+        "",
+        "## Memory protocol",
+        recall_line,
+        "- To remember something durable: edit MEMORY.md (keep it under 2000 "
+        "characters — move detail to a Wiki page) or the right Wiki page.",
+        "- When the owner shares anything about their life, plans, or "
+        "preferences, append one line to today's Journal file: `- HH:MM — fact`.",
+        "- Never store credentials, OTPs, or tokens in any memory file.",
+    ]
+    if was_template:
+        parts.append(
+            "\nMEMORY.md is still empty — briefly interview the owner "
+            "(3-4 questions max: who they are, what they want help with, any "
+            "standing preferences) and fill it in before moving on."
+        )
+
+    block = "\n".join(parts)
+    if len(block) > _MEMORY_HARD_CAP:
+        block = block[:_MEMORY_HARD_CAP] + "\n[truncated — trim me]"
+    return block
+
+
+# ══════════════════════════════════════════════════════════
 #  PREAMBLE ASSEMBLY  (the public entry point)
 # ══════════════════════════════════════════════════════════
 
 def build_preamble(*, is_new: bool, backend: str | None = None,
-                   conv_dir: str | None = None) -> str:
+                   conv_dir: str | None = None,
+                   ctx: "TurnContext | None" = None) -> str:
     """
     The operating context to prepend to the CLI prompt for THIS turn.
 
@@ -306,9 +402,13 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
         conv_dir = os.path.join(AGI_BRAIN_DIR, "Outbox")
 
     relay = _relay_protocol(os.path.join(AGI_BRAIN_DIR, "Bridge"))
+    memory_block = _memory_block(ctx)
 
     if not is_new:
-        return operating_contract(backend) + "\n\n" + relay
+        parts = [operating_contract(backend), relay]
+        if memory_block:
+            parts.append(memory_block)
+        return "\n\n".join(parts)
 
     parts: list[str] = [engine_context(backend)]
     instructions = _raw_instructions()
@@ -321,6 +421,8 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
 
     parts.append(f"{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}\n\n{_SELF_HEAL}")
     parts.append(relay)
+    if memory_block:
+        parts.append(memory_block)
     return "\n\n".join(parts)
 
 
@@ -349,13 +451,14 @@ def _relay_protocol(bridge_dir: str) -> str:
 
 
 def wrap_prompt(user_message: str, *, is_new: bool, backend: str | None = None,
-                conv_dir: str | None = None) -> str:
+                conv_dir: str | None = None,
+                ctx: "TurnContext | None" = None) -> str:
     """
     Convenience: return the full prompt string (preamble + user message) with a
     clear boundary, so the model never confuses framing for the request. If
     there's no preamble, returns the user_message unchanged.
     """
-    preamble = build_preamble(is_new=is_new, backend=backend, conv_dir=conv_dir)
+    preamble = build_preamble(is_new=is_new, backend=backend, conv_dir=conv_dir, ctx=ctx)
     # Layer-2 AutoHarness: add the senior-engineer execution directive only when
     # the task is complex (simple tasks stay lean = fast).
     from zilla.autoharness import plan_directive
