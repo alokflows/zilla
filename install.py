@@ -39,6 +39,10 @@ ENV_PATH = os.path.join(BASE, ".env")
 REQS = os.path.join(BASE, "requirements.txt")
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+SYSTEMD_UNIT_DIR = os.path.expanduser("~/.config/systemd/user")
+SYSTEMD_UNIT_PATH = os.path.join(SYSTEMD_UNIT_DIR, "zilla.service")
 
 
 # ── tiny pretty helpers ───────────────────────────────────
@@ -268,6 +272,64 @@ def write_env(values: dict):
     ok(f".env written ({ENV_PATH})")
 
 
+# ── H3 (PLAN.md §6): systemd --user service, Linux only ───
+def systemd_unit_content(py_path: str, base_dir: str) -> str:
+    """The exact zilla.service unit text (PLAN.md §6/H3 step 1). Restart=
+    on-failure — NOT `always` — so an intentional `zilla stop` (which makes
+    run_background.py exit 0 cleanly via its zilla.stop check) is honored;
+    only a crash (non-zero exit / killed by a signal) triggers a systemd
+    restart, layered on top of run_background.py's own ~7s internal
+    restart-on-exit loop for bot.py itself. Pure function (no I/O) so it's
+    golden-testable without touching a real systemd."""
+    return (
+        "[Unit]\n"
+        "Description=Zilla Telegram bot\n"
+        "\n"
+        "[Service]\n"
+        f"ExecStart={py_path} {os.path.join(base_dir, 'run_background.py')}\n"
+        f"WorkingDirectory={base_dir}\n"
+        "Restart=on-failure\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def write_service() -> int:
+    """Write + enable the systemd --user unit (PLAN.md §6/H3 step 1).
+    Linux only — caller must check IS_LINUX first. Returns 0 on success,
+    1 if `systemctl` itself is missing or the enable step failed (the unit
+    file is still written either way, so a later manual `systemctl --user
+    enable --now zilla.service` can recover without re-running this)."""
+    os.makedirs(SYSTEMD_UNIT_DIR, exist_ok=True)
+    content = systemd_unit_content(sys.executable, BASE)
+    tmp = SYSTEMD_UNIT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, SYSTEMD_UNIT_PATH)
+    ok(f"systemd unit written: {SYSTEMD_UNIT_PATH}")
+
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "zilla.service"], check=True)
+        ok("zilla.service enabled and started (systemctl --user)")
+    except FileNotFoundError:
+        bad("systemctl not found — is this a systemd-based Linux system?")
+        return 1
+    except subprocess.CalledProcessError as e:
+        bad(f"systemctl failed: {e}")
+        return 1
+
+    # A --user unit only survives past logout if lingering is enabled for
+    # this account; NOT auto-run (needs no sudo on most systems, but is a
+    # login/session-policy change we don't make silently on the owner's
+    # behalf) — printed as a precise next step instead (PLAN.md §6/H3
+    # step 1: "lingering hint printed").
+    info(f"To keep Zilla running after you log out / across reboots, run:")
+    info(f"    loginctl enable-linger {getpass.getuser()}")
+    return 0
+
+
 def setup_autostart():
     """Per-OS auto-start at login. Best-effort; prints what it did."""
     try:
@@ -297,20 +359,8 @@ def setup_autostart():
             open(plist, "w").write(content)
             subprocess.run(["launchctl", "load", plist], check=False)
             ok(f"Autostart LaunchAgent installed: {plist}")
-        else:  # Linux
-            unit_dir = os.path.expanduser("~/.config/systemd/user")
-            os.makedirs(unit_dir, exist_ok=True)
-            unit = os.path.join(unit_dir, "zilla.service")
-            py = sys.executable
-            open(unit, "w").write(
-                "[Unit]\nDescription=Zilla Telegram bot\n\n"
-                "[Service]\n"
-                f"ExecStart={py} {os.path.join(BASE,'run_background.py')}\n"
-                f"WorkingDirectory={BASE}\nRestart=always\n\n"
-                "[Install]\nWantedBy=default.target\n"
-            )
-            subprocess.run(["systemctl", "--user", "enable", "--now", "zilla.service"], check=False)
-            ok(f"Autostart systemd unit installed: {unit}")
+        else:  # Linux — single source of truth is write_service() (H3)
+            write_service()
     except Exception as e:
         bad(f"Couldn't set autostart automatically: {e}")
         info("You can still start it manually (see below).")
@@ -385,9 +435,8 @@ def disable_autostart():
         else:  # Linux
             subprocess.run(["systemctl", "--user", "disable", "--now", "zilla.service"],
                             check=False)
-            unit = os.path.expanduser("~/.config/systemd/user/zilla.service")
-            if os.path.exists(unit):
-                os.remove(unit)
+            if os.path.exists(SYSTEMD_UNIT_PATH):
+                os.remove(SYSTEMD_UNIT_PATH)
             ok("Autostart systemd unit removed.")
     except Exception as e:
         bad(f"Couldn't remove autostart automatically: {e}")
@@ -431,6 +480,18 @@ def _arg(name: str):
 def main():
     if "--doctor" in sys.argv:
         sys.exit(doctor())
+
+    if "--service" in sys.argv:
+        # PLAN.md §6/H3: Linux-only systemd --user unit. Mac dev keeps
+        # ./start.sh; on any other OS this is a clean, informative no-op —
+        # "nothing Windows breaks" (H3 accept criteria).
+        if not IS_LINUX:
+            info("--service is Linux-only (systemd --user). "
+                 "macOS: use ./start.sh or the interactive installer's autostart "
+                 "prompt (a LaunchAgent). Windows: use the interactive installer.")
+            sys.exit(0)
+        hr(); print("  Zilla — systemd --user service"); hr()
+        sys.exit(write_service())
 
     # Non-interactive flags (used by the AI setup file and any script):
     #   --token <T> --owner <ID> [--backend agy|claude] [--no-autostart] [--no-start]

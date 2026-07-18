@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 import urllib.error
 import urllib.request
 
@@ -79,6 +80,37 @@ def check_webbridge(timeout: float = 2.0) -> tuple[bool, str]:
         return False, f"unreachable ({e.__class__.__name__}) — optional, only needed for web mode 'my-browser'"
 
 
+def check_systemd_service(timeout: float = 3.0) -> dict:
+    """systemd --user service status (PLAN.md §6/H3 step 2), Linux only.
+    `applicable=False` elsewhere (macOS uses a LaunchAgent, Windows a
+    Startup shortcut — neither has a systemd unit to report on). Never
+    raises: a missing `systemctl` or missing unit is a normal, reportable
+    state, not an error."""
+    if not platform_compat.IS_LINUX:
+        return {"applicable": False, "active": False, "enabled": False,
+                "detail": "n/a (systemd --user is Linux-only)"}
+    try:
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", "zilla.service"],
+            capture_output=True, text=True, timeout=timeout,
+        ).stdout.strip()
+        enabled = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "zilla.service"],
+            capture_output=True, text=True, timeout=timeout,
+        ).stdout.strip()
+    except FileNotFoundError:
+        return {"applicable": True, "active": False, "enabled": False,
+                "detail": "systemctl not found — not a systemd system?"}
+    except subprocess.TimeoutExpired:
+        return {"applicable": True, "active": False, "enabled": False,
+                "detail": "systemctl timed out"}
+    if not active and not enabled:
+        return {"applicable": True, "active": False, "enabled": False,
+                "detail": "not installed — run `python install.py --service`"}
+    return {"applicable": True, "active": active == "active", "enabled": enabled == "enabled",
+            "detail": f"active={active or 'unknown'}, enabled={enabled or 'unknown'}"}
+
+
 def environment_report(force: bool = False) -> dict:
     """Point-in-time environment snapshot. Stable, plain-value keys so both
     the text renderer below and a future TUI health screen can consume it.
@@ -118,6 +150,7 @@ def environment_report(force: bool = False) -> dict:
         "flac": {"ok": flac_ok, "detail": flac_detail},
         "webbridge": {"ok": bridge_ok, "detail": bridge_detail},
         "disk": {"path": disk_path, "free_bytes": free_bytes, "total_bytes": total_bytes},
+        "service": check_systemd_service(),
     }
 
 
@@ -162,5 +195,11 @@ def format_report(report: dict) -> str:
 
     disk = report["disk"]
     lines.append(f"  • Disk free: {_fmt_bytes(disk['free_bytes'])} / {_fmt_bytes(disk['total_bytes'])}  ({disk['path']})")
+
+    svc = report.get("service") or {}
+    if svc.get("applicable"):
+        svc_ok = svc.get("active") and svc.get("enabled")
+        lines.append(("  ✅ " if svc_ok else "  ❌ ") + f"systemd service: {svc.get('detail', '')}")
+
     lines.append("=" * 56)
     return "\n".join(lines)
