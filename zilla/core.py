@@ -930,6 +930,16 @@ class ZillaCore:
 
         pin_mismatch = backend_pin_mismatch(s, get_backend(), get_model())
         mode = resolve_session_mode(s)
+        if s.get("system") and mode == "isolated" and get_backend() == "agy":
+            # Phase H1 step 3 (PLAN.md §6): a fresh agy conversation holds
+            # the GLOBAL new-conv detection lock (30s, serializes ALL
+            # users' new conversations) and gets the full onboarding
+            # preamble — 48 beats/day of that is the slowest possible
+            # design. Reuse one persistent scratch conversation per system
+            # schedule instead. claude/opencode fresh conversations are
+            # cheap, so isolated mode is left alone there (a persistent
+            # conv there would only grow unboundedly for no benefit).
+            mode = f"named:__scratch_{s['id']}"
         ok, detail, response, conv_id = True, "", "", None
         self._scheduled_running.add(uid)
         try:
@@ -1041,11 +1051,68 @@ class ZillaCore:
         except Exception:
             pass
 
+    async def _run_and_record_system(self, s: dict) -> None:
+        """Phase H1 step 1 (PLAN.md §6/H1): the tick-loop path for a
+        system=1 schedule (H1's heartbeat beat, M4's nightly distillation) —
+        deliberately NOT the user-schedule path below. The blocking-acquire
+        + RETRY_LADDER + give-up DM in _run_and_record is correct for a
+        user's own job; it is wrong here (a backend outage would DM the
+        owner hourly all night, and a slept-through beat catching up would
+        hold the owner's lock during their first morning message). Instead:
+        try-acquire the per-uid lock and skip this tick entirely if busy (no
+        blocking wait, no queueing), no retry ladder on failure, no give-up
+        DM — a system job always advances to its next occurrence regardless
+        of outcome. Failures are only logged; H2's cooldown-gated alerts are
+        the sole surfacing mechanism for a persistently failing system job."""
+        sid = s["id"]
+        title = s.get("title", "")
+        uid = s["user_id"]
+
+        from zilla import heartbeat as _heartbeat
+        prepared = _heartbeat.prepare_beat(s)
+        if prepared is None:
+            # Deterministic pre-check said skip (PLAN.md §6/H1 step 2):
+            # HEARTBEAT.md is missing/empty — zero AI calls this tick.
+            log_event("schedule_system_skip_empty", id=sid, title=title[:40])
+            self.schedules.touch_run(sid)
+            return
+        s = prepared
+
+        if s.get("payload_type", "message") == "message" and self.get_user_lock(uid).locked():
+            # Only "message" payloads touch the per-uid lock at all —
+            # system_event/command schedules never contend it, so they are
+            # never skipped for being "busy".
+            log_event("schedule_system_skip_busy", id=sid, title=title[:40])
+            self.schedules.touch_run(sid)
+            return
+        ok, response, detail, meta = await self._execute_schedule(s)
+        if meta.get("pin_mismatch"):
+            self._maybe_notify_backend_pin(s)
+        sched_untrusted = not (self.auth and self.auth.is_owner(s.get("user_id")))
+        await self._autocommit_memory(f"schedule — {title}"[:80], untrusted=sched_untrusted)
+        self.schedules.touch_run(sid)
+        if ok:
+            log_event("schedule_ok", id=sid, title=title[:40])
+            if _quiet_heartbeat_suppressed(s, response):
+                log_event("schedule_quiet", id=sid, title=title[:40])
+                return
+            self._broadcast(ScheduledResult(
+                title=title, response=response, chat_id=s["chat_id"], user_id=s["user_id"],
+                schedule_id=sid, session=meta.get("session"), conv_id=meta.get("conv_id"),
+            ))
+            return
+        log_event("schedule_failed", id=sid, title=title[:40], detail=(detail or "")[:200])
+        # No retry ladder, no give-up DM — see docstring above.
+
     async def _run_and_record(self, s: dict) -> None:
         """Tick-loop path: run a due schedule, broadcast the result, and
         record the outcome with retry. A failed run is retried along
         RETRY_LADDER before the schedule advances — and the owner's chat is
-        told if it ultimately couldn't complete."""
+        told if it ultimately couldn't complete. system=1 schedules never
+        reach this body — see _run_and_record_system."""
+        if s.get("system"):
+            await self._run_and_record_system(s)
+            return
         sid = s["id"]
         title = s.get("title", "")
         ok, response, detail, meta = await self._execute_schedule(s)

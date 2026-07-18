@@ -415,17 +415,32 @@ class ScheduleManager:
     def reconcile_startup(self, now: float | None = None, catchup: bool = True):
         """
         At boot, decide what to do with schedules whose time passed while the
-        bot was off. catchup=True: leave them due (they run once on the next
-        tick). catchup=False: advance past now without running.
+        bot was off. catchup=True (the global default, `schedule_catchup`
+        setting): leave them due (they run once on the next tick).
+        catchup=False: advance past now without running.
+
+        Phase H1 (PLAN.md §6/H1 step 1): a system=1 schedule can carry its
+        own catch-up policy in spec["_catchup"] ("skip" | "run_once",
+        default "run_once") that OVERRIDES the global setting — beats are
+        periodic and a missed one is worthless (always "skip", regardless of
+        the owner's schedule_catchup setting); distillation stays
+        "run_once" (a missed nightly distillation is not worthless), same
+        as today's global-catchup=True behavior. A regular user schedule
+        (system=0) always follows the global setting, unchanged.
         """
         now = now if now is not None else time.time()
-        if catchup:
-            return  # due() will pick them up and run each once
         rows = self._store.schedules_all()
         for row in rows:
-            if row.get("enabled") and row.get("next_run") and row["next_run"] <= now:
-                nxt = compute_next_run(row["kind"], row["spec"], now)
-                if nxt is None:
-                    self._store.schedules_update(row["id"], enabled=0, next_run=None)
-                else:
-                    self._store.schedules_update(row["id"], next_run=nxt)
+            if not (row.get("enabled") and row.get("next_run") and row["next_run"] <= now):
+                continue
+            spec = row.get("spec") or {}
+            row_catchup = catchup
+            if row.get("system") and spec.get("_catchup") == "skip":
+                row_catchup = False
+            if row_catchup:
+                continue  # due() will pick it up and run it once
+            nxt = compute_next_run(row["kind"], row["spec"], now)
+            if nxt is None:
+                self._store.schedules_update(row["id"], enabled=0, next_run=None)
+            else:
+                self._store.schedules_update(row["id"], next_run=nxt)

@@ -78,6 +78,11 @@ class SessionManager:
         row = self._store.sessions_get(user_id, name)
         return row.get("conv_backend") if row else None
 
+    def all_conversation_ids(self) -> set:
+        """Every non-null conv_id across every user/session/backend — the
+        H1 brain-dir GC's 'still referenced' set (PLAN.md §6/H1 step 4)."""
+        return self._store.sessions_all_conv_ids()
+
     # ── Last Seen Step ────────────────────────────────────
 
     def get_last_seen_step(self, user_id: int) -> int:

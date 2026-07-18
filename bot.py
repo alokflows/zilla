@@ -76,10 +76,10 @@ from config import (
     DB_FILE, MEMORY_DIR,
 )
 from zilla.store import get_store
-from zilla import memory
+from zilla import memory, heartbeat
 from sessions import SessionManager
 import zilla.core as zcore
-from zilla.cli_engine import detect_limit, backend_status
+from zilla.cli_engine import detect_limit, backend_status, gc_orphaned_conv_dirs
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
@@ -2920,6 +2920,18 @@ def main():
     # Phase M4 step 1: idempotent — a no-op after the first successful start,
     # so a double restart still leaves exactly one distillation schedule.
     ensure_distillation_schedule(schedules_mgr, OWNER_CHAT_ID)
+    # Phase H1 step 2: idempotent beat schedule (heartbeat_interval setting,
+    # 0 = off). Same seed-once pattern as distillation above.
+    heartbeat.ensure_heartbeat_schedule(schedules_mgr, OWNER_CHAT_ID, get_setting)
+    # Phase H1 step 4: startup sweep for orphaned agy brain dirs (beats +
+    # distillation + fallback turns leak throwaway conversations otherwise).
+    # Cheap (one os.listdir()), never raises, so it can't block startup.
+    try:
+        removed = gc_orphaned_conv_dirs(sessions.all_conversation_ids())
+        if removed:
+            logger.info(f"[GC] removed {removed} orphaned agy brain dir(s)")
+    except Exception as e:
+        logger.warning(f"[GC] brain-dir sweep skipped: {e}")
     # the turn pipeline + scheduler runtime + bridge watcher (CORE_API
     # migration steps 2 + 3 + 4)
     core = zcore.ZillaCore(sessions=sessions, auth=auth, schedules=schedules_mgr,

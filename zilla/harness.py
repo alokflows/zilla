@@ -365,6 +365,8 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         "characters — move detail to a Wiki page) or the right Wiki page.",
         "- When the owner shares anything about their life, plans, or "
         "preferences, append one line to today's Journal file: `- HH:MM — fact`.",
+        "- When the owner asks you to keep an eye on / remind / follow up on "
+        "something recurring, add it to HEARTBEAT.md.",
         "- Never store credentials, OTPs, or tokens in any memory file.",
     ]
     if was_template:

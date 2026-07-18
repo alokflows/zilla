@@ -50,6 +50,21 @@ MEMORY_TEMPLATE = (
     "characters; move detail into a Wiki page instead.\n"
 )
 
+# Phase H1 (PLAN.md §6): the agent's own proactive checklist — Zilla's code
+# never parses this for meaning, the beat prompt just tells the agent to
+# read it, act on what's due, and edit it. Seeded once (see ensure_tree);
+# the owner/agent's edits from then on are never overwritten.
+HEARTBEAT_TEMPLATE = (
+    "# Heartbeat — I read this every 30 minutes and act on what's due.\n"
+    "## Daily\n"
+    "- 08:30 morning brief: today's schedules, anything in Watching/Follow-ups\n"
+    "  that needs the owner. (last run: never)\n"
+    "## Watching\n"
+    "(nothing yet — when the owner says \"keep an eye on X\", add it here)\n"
+    "## Follow-ups\n"
+    "(open loops from conversations worth a nudge)\n"
+)
+
 _STARTER_PAGES = {
     os.path.join("People", "owner.md"): (
         "# Owner\n"
@@ -99,9 +114,13 @@ def ensure_tree(base: str | None = None) -> None:
             f.write(MEMORY_TEMPLATE)
 
     heartbeat_md = os.path.join(mem_dir, HEARTBEAT_FILENAME)
-    if not os.path.exists(heartbeat_md):
-        # Empty on purpose — H1 owns the real seeded checklist template.
-        open(heartbeat_md, "w", encoding="utf-8").close()
+    # Seed if missing OR empty (an empty file carries no owner/agent edits to
+    # protect — the M2/M3 sessions left it empty on purpose pending H1; this
+    # is H1 promoting that placeholder to the real template exactly once).
+    # Any non-empty content, from here on, is never touched.
+    if not os.path.exists(heartbeat_md) or os.path.getsize(heartbeat_md) == 0:
+        with open(heartbeat_md, "w", encoding="utf-8") as f:
+            f.write(HEARTBEAT_TEMPLATE)
 
     for rel, content in _STARTER_PAGES.items():
         path = os.path.join(wiki_dir, rel)
@@ -113,6 +132,16 @@ def ensure_tree(base: str | None = None) -> None:
 def read_core(base: str | None = None) -> str:
     """MEMORY.md's text, verbatim. '' if missing/unreadable."""
     path = os.path.join(_mem_dir(base), MEMORY_FILENAME)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def read_heartbeat(base: str | None = None) -> str:
+    """HEARTBEAT.md's text, verbatim. '' if missing/unreadable."""
+    path = os.path.join(_mem_dir(base), HEARTBEAT_FILENAME)
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()

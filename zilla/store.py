@@ -307,6 +307,14 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def sessions_all_conv_ids(self) -> set:
+        """Every non-null conv_id across ALL users/sessions/backends — the
+        H1 brain-dir GC's 'still referenced' set (PLAN.md §6/H1 step 4)."""
+        rows = self._r().execute(
+            "SELECT conv_id FROM sessions WHERE conv_id IS NOT NULL"
+        ).fetchall()
+        return {r["conv_id"] for r in rows}
+
     def sessions_active_name(self, uid: int) -> str | None:
         """Raw active-flag lookup — None if no session is flagged active
         for this uid (caller applies the 'main' default, matching the

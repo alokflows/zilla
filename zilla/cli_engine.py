@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import time
 import logging
 import threading
@@ -530,6 +531,37 @@ def _find_new_conv(snapshot_before: set) -> str | None:
         return max(new_dirs, key=_mtime)
     except Exception:
         return None
+
+
+def gc_orphaned_conv_dirs(referenced: set, max_age_days: float = 7) -> int:
+    """Phase H1 step 4 (PLAN.md §6): delete BRAIN_DIR subdirectories that are
+    (a) not in `referenced` (every conv_id any session currently points at,
+    across all users/backends) AND (b) older than max_age_days by mtime.
+    Without this, beats + distillation + fallback throwaway conversations
+    leak ~1,500 orphaned brain dirs/month and progressively slow agy's
+    snapshot-diff new-conversation detection (_find_new_conv above scans
+    every dir in BRAIN_DIR on each new turn). Called on a startup sweep, not
+    per-beat, so it costs one os.listdir() per bot start, not per tick.
+    Never raises; returns the count actually removed."""
+    if not os.path.isdir(BRAIN_DIR):
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    try:
+        for name in os.listdir(BRAIN_DIR):
+            if name in referenced:
+                continue
+            full = os.path.join(BRAIN_DIR, name)
+            try:
+                if not os.path.isdir(full) or os.path.getmtime(full) >= cutoff:
+                    continue
+                shutil.rmtree(full)
+                removed += 1
+            except OSError:
+                continue
+    except Exception as e:
+        logger.debug(f"[GC] brain-dir sweep failed: {e}")
+    return removed
 
 
 # ══════════════════════════════════════════════════════════
