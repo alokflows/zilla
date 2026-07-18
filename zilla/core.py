@@ -48,10 +48,9 @@ from zilla.cli_engine import run_cli_async, get_latest_step
 from zilla.config import (
     get_backend, get_model, get_setting,
     agy_reachable, agy_models_live, BRAIN_DIR, HOME_DIR,
-    WIKI_JOURNAL_DIR,
 )
 from zilla.formatter import detect_file_paths
-from zilla.harness import log_event
+from zilla.harness import log_event, TurnContext
 from zilla.review import review, classify_route
 from zilla.schedules import resolve_session_mode, backend_pin_mismatch
 
@@ -128,15 +127,10 @@ def _run_fast_claude(prompt: str) -> str | None:
 
 def _append_to_journal(text: str) -> str:
     """Zero-model-call 'share' route: append the message verbatim, timestamped,
-    to today's wiki journal file. Path comes from config ONLY
-    (zilla.config.WIKI_JOURNAL_DIR) — no hardcoded path here. Returns the
-    one-line ack to show the user."""
-    import datetime
-    now = datetime.datetime.now()
-    os.makedirs(WIKI_JOURNAL_DIR, exist_ok=True)
-    path = os.path.join(WIKI_JOURNAL_DIR, now.strftime("%Y-%m-%d.md"))
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"- [{now.strftime('%H:%M')}] {text}\n")
+    to today's Memory/Journal/ file (PLAN.md §3.2) — the owner's own recall
+    buffer. Returns the one-line ack to show the user."""
+    from zilla import memory
+    memory.append_journal(text)
     return "📝 Noted."
 
 
@@ -311,7 +305,8 @@ class Approvals:
         uid, chat_id, prompt = req["uid"], req["chat_id"], req["prompt"]
         response = ""
         async for ev in self._core.handle_message(
-                uid, prompt, chat_key=chat_id, auto_title=True, skip_permissions=True):
+                uid, prompt, chat_key=chat_id, auto_title=True, skip_permissions=True,
+                origin="approval"):
             if isinstance(ev, Response):
                 response = ev.text
         return {**req, "id": rid, "response": response}
@@ -602,7 +597,8 @@ class ZillaCore:
     # ── THE turn pipeline ──────────────────────────────────
 
     async def handle_message(self, user_id: int, text: str, *, chat_key: int = None,
-                             auto_title: bool = False, skip_permissions: bool = None):
+                             auto_title: bool = False, skip_permissions: bool = None,
+                             origin: str = "user"):
         """Run one CLI turn against the user's active session, yielding events.
 
         Async generator: yields zero-or-more Progress events while the backend
@@ -617,11 +613,23 @@ class ZillaCore:
         skip_permissions: None → derive from the user's role (admins skip
         prompts). Owner-approved Approval-mode runs pass True explicitly (the
         owner already vetted the whole request).
+        origin: why this turn is running ('user' live chat, 'approval') — feeds
+        the TurnContext that gates memory injection (harness.py, PLAN.md §4).
+        Schedule-triggered turns are handled by a separate method
+        (_execute_message_schedule) that does not build a TurnContext yet —
+        a known, deliberate gap (frozen test_schedules_seam.py fakes can't
+        accept a new kwarg; see HANDOFF.md).
         """
         # ── P1.5 triage: deterministic, zero-model-call route decision BEFORE
         # the heavy CLI turn / lock (HANDOFF.md P1.5). 'full' is the safe
         # default and falls straight through to the unchanged pipeline below.
         route = classify_route(text)
+
+        # Journal is the OWNER's memory (PLAN.md §4 scope guard) — any other
+        # principal's "share"-shaped message falls through to the full route
+        # instead of silently writing into it.
+        if route == "share" and not self.auth.is_owner(user_id):
+            route = "full"
 
         if route == "share":
             ack = _append_to_journal(text)
@@ -683,11 +691,16 @@ class ZillaCore:
                     if info and info.get("messages", 0) == 0:
                         self.sessions.auto_title(text, user_id=user_id, session_name=sname)
 
+                ctx = TurnContext(
+                    uid=user_id, role=self.auth.role_of(user_id),
+                    is_owner=self.auth.is_owner(user_id), origin=origin,
+                )
                 run_task = loop.create_task(run_cli_async(
                     text, conv_id,
                     progress_callback=_on_progress,
                     cancel_event=cancel_event,
                     skip_permissions=skip_permissions,
+                    ctx=ctx,
                 ))
                 try:
                     while not run_task.done():
@@ -858,6 +871,11 @@ class ZillaCore:
                 sname = self._sname_for_mode(uid, mode)
                 if sname:
                     conv_id = self._conv_for_run(uid, sname)
+                # No ctx=/TurnContext here (M2 known gap, owner-confirmed deferral):
+                # test_schedules_seam.py is a frozen acceptance spec whose fake_run
+                # mocks have fixed signatures and would TypeError on a new kwarg.
+                # Schedule-triggered turns get no memory injection until a later
+                # phase. See HANDOFF.md.
                 response, detected = await run_cli_async(
                     s["prompt"], conv_id,
                     skip_permissions=self.auth.can(uid, "admin") if self.auth else False,

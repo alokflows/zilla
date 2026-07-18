@@ -69,6 +69,7 @@ def run_claude(
     skip_permissions: bool = False,
     model: str | None = None,
     use_browser: bool = False,
+    ctx=None,
 ) -> tuple[str, str | None]:
     """
     Run one turn through Claude Code and return (response_text, session_id).
@@ -81,7 +82,7 @@ def run_claude(
     # conversation, the compact trust/style contract on continued ones). Claude
     # previously received NO instructions at all — this fixes that.
     from zilla.harness import wrap_prompt
-    prompt = wrap_prompt(prompt, is_new=not conversation_id, backend="claude")
+    prompt = wrap_prompt(prompt, is_new=not conversation_id, backend="claude", ctx=ctx)
 
     cmd = [CLAUDE_PATH, "-p", prompt, "--output-format", "json"]
     if model:

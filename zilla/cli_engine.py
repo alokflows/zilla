@@ -542,6 +542,7 @@ def run_cli(
     progress_callback: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
     skip_permissions: bool = False,
+    ctx=None,
 ) -> tuple[str, str | None]:
     """
     Run the CLI. Returns (response, conversation_id).
@@ -596,6 +597,7 @@ def run_cli(
     prompt = wrap_prompt(
         prompt, is_new=is_new, backend="agy",
         conv_dir=os.path.join(AGI_BRAIN_DIR, "Outbox"),
+        ctx=ctx,
     )
 
     # Build command — no --conversation for new sessions; let CLI create its own ID
@@ -814,7 +816,7 @@ def run_cli(
 
 
 def _dispatch_turn(backend, prompt, conversation_id, progress_callback, cancel_event,
-                   skip_permissions, use_browser=False):
+                   skip_permissions, use_browser=False, ctx=None):
     """Run exactly one turn against the chosen backend. Returns (response, conv)."""
     if backend == "claude":
         from zilla.backends import run_claude
@@ -822,13 +824,14 @@ def _dispatch_turn(backend, prompt, conversation_id, progress_callback, cancel_e
             prompt, conversation_id,
             progress_callback=progress_callback, cancel_event=cancel_event,
             skip_permissions=skip_permissions, model=get_model(),
-            use_browser=use_browser,
+            use_browser=use_browser, ctx=ctx,
         )
     # default: agy (PTY + transcript)
-    return run_cli(prompt, conversation_id, progress_callback, cancel_event, skip_permissions)
+    return run_cli(prompt, conversation_id, progress_callback, cancel_event,
+                   skip_permissions, ctx=ctx)
 
 
-def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip_permissions):
+def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip_permissions, ctx=None):
     """Pick the backend, run one turn, and apply the anti-hallucination gate
     (one corrective retry if the answer looks fabricated). Blocking; thread-pool."""
     from zilla.verify import assess, correction_prompt
@@ -844,7 +847,7 @@ def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip
     try:
         response, conv = _dispatch_turn(
             backend, prompt, conversation_id, progress_callback, cancel_event,
-            skip_permissions, use_browser=use_browser)
+            skip_permissions, use_browser=use_browser, ctx=ctx)
 
         # ── Anti-hallucination gate ──────────────────────────────────────────
         # `prompt` here is the RAW user message (harness wrapping happens inside
@@ -865,7 +868,7 @@ def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip
                 r2, c2 = _dispatch_turn(
                     backend, correction_prompt(prompt), conv,
                     progress_callback, cancel_event, skip_permissions,
-                    use_browser=use_browser)
+                    use_browser=use_browser, ctx=ctx)
                 resolved = assess(prompt, r2) is None
                 log_event("hallucination_retry", backend=backend,
                           resolved=resolved, conv=(c2[:8] if c2 else None),
@@ -888,6 +891,7 @@ async def run_cli_async(
     progress_callback: Callable[[str], None] | None = None,
     cancel_event: threading.Event | None = None,
     skip_permissions: bool = False,
+    ctx=None,
 ) -> tuple[str, str | None]:
     """Async wrapper — runs the active backend's blocking call in the thread pool."""
     loop = asyncio.get_event_loop()
@@ -895,7 +899,7 @@ async def run_cli_async(
         cancel_event = threading.Event()
     task = loop.run_in_executor(
         executor, _run_blocking, prompt, conversation_id,
-        progress_callback, cancel_event, skip_permissions,
+        progress_callback, cancel_event, skip_permissions, ctx,
     )
     try:
         return await task
