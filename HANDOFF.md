@@ -27,6 +27,10 @@ For any execution agent, every session:
 | M2 Memory layout + injection | ⬜ | |
 | M3 FTS5 + memory git + quiet runs | ⬜ | |
 | M4 Nightly distillation + /memory + change surfacing | ⬜ | |
+| K1 Graph schema + indexer | ⬜ | planned by Fable, 2026-07-18 |
+| K2 Entity linking + neighborhood injection | ⬜ | |
+| K3 Curiosity loop | ⬜ | |
+| K4 Graph views (/graph HTML) | ⬜ | |
 | H1 Heartbeat loop | ⬜ | |
 | H2 Health probes + assisted re-login | ⬜ | |
 | H3 systemd service | ⬜ | |

@@ -162,13 +162,13 @@ is retried safely on next start. Never delete originals.
 ```
 AGI-Brain/Memory/            ← `git init` here; NEVER the Zilla repo
   MEMORY.md                  ← core memory: owner facts, standing prefs. ≤ 2000 chars.
-  HEARTBEAT.md               ← agent-owned proactive checklist (see §6)
+  HEARTBEAT.md               ← agent-owned proactive checklist (see §7)
   Wiki/                      ← archival memory, one page per topic
     People/  Projects/  Preferences/  Places/  Systems/
   Journal/
     2026-07-17.md            ← one file per day, newest entries appended
   Skills/
-    <slug>/SKILL.md          ← learned skills (see §8); scripts live beside it
+    <slug>/SKILL.md          ← learned skills (see §9); scripts live beside it
 ```
 
 Page format: H1 title on line 1, one-line summary on line 2 (the wiki index
@@ -338,7 +338,7 @@ destructive automated job — the distillation lands in M4, not here.)
    conversation** (fresh conv id, discarded after the run — never advances
    any session's conv id); raw pre-distillation journal text stays
    recoverable via memory git history (M3 — already live by now).
-2. **Memory-change surfacing (the §12.9 injection-surface mitigation):**
+2. **Memory-change surfacing (the §13.9 injection-surface mitigation):**
    `git_autocommit` computes the per-run diff stat. When a run's inputs
    included untrusted content (document-ingest turn, browser-bearing turn)
    or the run was non-owner-originated, DM the owner one line: *"memory
@@ -353,7 +353,123 @@ destructive automated job — the distillation lands in M4, not here.)
 
 ---
 
-## 6. Phase H — Heartbeat & self-healing
+## 6. Phase K — Relational graph memory (executes after M4, before Phase H)
+
+The wiki grows a **property-graph layer**: entities are wiki pages, typed
+relations are lines inside those pages, and a deterministic indexer derives a
+queryable graph in `zilla.db`. Zep/Graphiti-class capability — typed edges,
+temporal validity, entity resolution, provenance — with zero new
+dependencies, zero extra AI calls in the pipeline, and P1 fully intact (the
+graph tables are disposable; the pages are the truth).
+
+**Ontology (full, from day one — owner decision):** node types `person`,
+`org`, `place`, `project`, `topic`. Seed relation verbs: `knows`,
+`family_of`, `works_at`, `member_of`, `located_in`, `part_of`,
+`involved_in`, `supplies` — free verbs are allowed (normalized to
+`lower_snake`); the indexer NEVER fails on an unknown verb.
+
+**Entity page format** (extends §3.2; parse rules are exact):
+
+```
+# Ramesh Kumar
+Cousin; the person to call for anything passport-related.   ← line 2 = bio line
+- type:: person
+- aliases:: Ramesh, my cousin, passport guy
+- phone:: +91 …                                             ← any other key:: value = attribute
+## Relations
+- works_at:: [[Passport Office]] (since 2024-01)
+- family_of:: [[Suresh]]
+- worked_at:: [[XYZ Corp]] (2020 .. 2023-06)                ← closed interval = superseded fact
+```
+
+`key:: value` lines and `verb:: [[Target]] (dates?)` lines are the entire
+grammar. `[[Wiki-links]]` anywhere in prose also count as untyped `mentions`
+edges (Obsidian semantics). A `[[Target]]` with no page yet becomes a
+**ghost node** — rendered hollow in views, and a curiosity trigger.
+
+### K1 — Graph schema + indexer
+1. Schema (in `zilla.db`, rebuildable):
+   `nodes(id, path UNIQUE, type, title, bio, is_ghost)` ·
+   `aliases(alias, node_id)` ·
+   `edges(src, rel, dst, valid_from, valid_to, provenance)` — provenance =
+   `path:line` of the source relation line; open `valid_to` = currently
+   true (bi-temporal: facts are superseded by closing the interval, never
+   deleted — M3's indexer extends to parse the grammar above on the same
+   mtime-diff cycle).
+2. `memgraph.py` CLI (agent-callable, like memsearch): `neighbors <name>
+   [--hops 2]`, `path <a> <b>` (how are these connected), `find <type>
+   [--near <name>]`. Traversal = recursive CTEs; current-facts-only by
+   default, `--history` includes closed intervals.
+   **Accept:** parser golden tests (grammar above, incl. ghost nodes, date
+   intervals, alias multi-match); index rebuild-from-scratch equals
+   incremental result; CTE traversal tests (2-hop, path, cycles safe);
+   unknown verbs indexed not rejected.
+
+### K2 — Turn-time entity linking + neighborhood injection
+1. Deterministic alias scan of each owner message (longest-match against
+   `aliases`, case-insensitive, word-bounded). For each hit (cap 3 nodes),
+   inject a compact **local graph card** into the turn: bio line + current
+   edges 1 hop out (2 hops for the single strongest hit), ≤ 25 lines
+   total, with a `[via graph]` header. This is how "I need to renew my
+   passport" surfaces `Passport Office —[works_at]— Ramesh` *before* the
+   agent even reasons.
+2. Harness protocol addition (owner turns): *"You have a relational memory.
+   To answer 'whom do I know at/for X' or plan anything involving people,
+   places, or organizations, run memgraph.py. When the owner shares a new
+   fact about an entity, update that entity's page (create it from the
+   template if missing — every person gets a bio line); record relations
+   as `verb:: [[Target]]` lines; close an interval when a fact is
+   superseded, never delete the line."*
+   **Accept:** alias-scan unit tests (word boundary, longest match, cap);
+   injection golden test; live smoke — mention a stored person by a
+   nickname alias, the reply reflects graph knowledge without an explicit
+   memory question.
+
+### K3 — Curiosity loop (one question, when relevant — owner decision)
+1. Deterministic gap detection at index time (zero AI): `person` node with
+   no contact attribute; ghost node referenced from ≥ 2 pages; `org`/
+   `place` with no `located_in`. Gaps land in a `curiosity(node_id, gap,
+   asked_at)` table.
+2. Enforcement is code, not model judgment (P5): the harness includes AT
+   MOST ONE pending curiosity question per conversation, and only when the
+   gap's node was activated by K2's alias scan in the current turn
+   (relevance gate). Phrasing is the agent's; the *permission to ask* is
+   Zilla's. Owner answers flow through the normal memory protocol (agent
+   updates the page; next index cycle clears the gap). A question asked
+   and unanswered is cooled down 7 days.
+   **Accept:** gap-detection tests; one-question-per-conversation and
+   relevance-gate tests; cooldown test; live smoke — mention a new person
+   twice, get exactly one polite "should I save his contact?" follow-up.
+
+### K4 — Graph views (the flabbergast moment)
+1. `/graph` (Telegram, owner): generates a **self-contained single-file
+   HTML** (inline JS/CSS, no CDN — must open offline on a phone) rendering
+   the current graph from a JSON snapshot embedded in the file. Obsidian-
+   grade features, specified: canvas force-directed simulation (repulsion +
+   spring + centering, ~60 fps for ≤ 2k nodes); node size ∝ degree; color
+   by node type (legend); ghost nodes hollow; **global view + local view**
+   (tap a node → its N-hop neighborhood, N slider 1–3); filters (by type,
+   by search box, orphans on/off); tap a node → side panel with bio,
+   attributes, current relations, and "superseded" history collapsed.
+   Sent via `safe_send_file` to the Outbox. `/graph <name>` opens directly
+   in local view on that node.
+2. TUI: Phase T's screen list gains **Graph** — a local-graph explorer
+   (adjacency tree around a chosen node, arrow-key navigation, enter →
+   open the page); the full visual stays HTML (terminals can't do force
+   layouts honestly).
+   **Accept:** HTML generation golden test (valid, self-contained, embeds
+   N nodes); renders offline in a plain browser (live smoke on phone);
+   local-view + filter behavior verified in smoke; 2k-node synthetic graph
+   stays interactive.
+
+**Phase K definition of done:** live smoke demonstrating the full loop —
+owner mentions a new person + workplace in normal chat → pages appear with
+bio lines and typed relations (M-git commits show it) → days later, owner
+states an intent ("I need to sort out my passport") → the reply proactively
+surfaces the right person → `/graph` on the phone shows the connection
+visually → exactly one curiosity question was asked along the way.
+
+## 7. Phase H — Heartbeat & self-healing
 
 **Design (owner-confirmed):** ONE agent-owned file, `HEARTBEAT.md`, holds
 everything — briefings, watches, follow-ups, notes-to-self. The agent reads
@@ -448,7 +564,7 @@ Seeded template:
 
 ---
 
-## 7. Phase R — Router & fallback
+## 8. Phase R — Router & fallback
 
 ### R1 — Triage router
 `router.py`, deterministic only (P3), runs before the engine spends a lock:
@@ -507,7 +623,7 @@ Seeded template:
 
 ---
 
-## 8. Phase S — Skills from chat (ask-first)
+## 9. Phase S — Skills from chat (ask-first)
 
 1. Format: `Memory/Skills/<slug>/SKILL.md` — frontmatter (`name`,
    `description`, `created`, `uses`) + body (when to use, steps); optional
@@ -548,7 +664,7 @@ Seeded template:
 
 ---
 
-## 9. Phase G — Gateway extraction, then Phase T — Terminal app
+## 10. Phase G — Gateway extraction, then Phase T — Terminal app
 
 ### G1 — Engine facade (prerequisite for T, pure refactor)
 1. Extract from `bot.py` into `engine.py`: the run pipeline (lock →
@@ -564,7 +680,8 @@ Seeded template:
 ### T1 — `zilla` TUI (Textual)
 1. `tui/` package, `zilla` entry point (console script). Screens:
    **Chat** (stream engine events; Esc = cancel), **Sessions** sidebar,
-   **Schedules**, **Memory** (MEMORY.md + journal + commits), **Skills**
+   **Schedules**, **Memory** (MEMORY.md + journal + commits),
+   **Graph** (K4's local-graph explorer), **Skills**
    (approve/disable), **Health** (probe results, usage counters from
    `usage`), **Settings** (backend/model/chain/heartbeat interval —
    same setters as Telegram menus).
@@ -593,7 +710,7 @@ Seeded template:
 
 ---
 
-## 10. Phase V — Offline voice
+## 11. Phase V — Offline voice
 
 1. `faster-whisper` optional dependency (`pip install zilla[voice]` /
    requirements-voice.txt). Setting `transcribe = auto|local|online`
@@ -606,7 +723,7 @@ Seeded template:
 
 ---
 
-## 11. Cross-cutting engineering rules
+## 12. Cross-cutting engineering rules
 
 - **Testing:** every phase adds deterministic no-network tests to the suite
   (`test_fixes.py` / new `test_<module>.py` files wired into it). Suite
@@ -626,7 +743,7 @@ Seeded template:
 - **Secrets:** existing redaction filter covers new logs; memory protocol
   forbids credentials in Markdown; relay answers keep their wipe behavior.
 
-## 12. Risk register (with mitigations already in the plan)
+## 13. Risk register (with mitigations already in the plan)
 
 1. **G1 refactor breaks invariants** → isolated phase, behavior-freeze
    smoke checklist, small commits.
@@ -640,7 +757,7 @@ Seeded template:
    deterministic empty-file skip, try-acquire (never blocks the owner).
 6. **Memory privacy leak to non-owner users** → §4 scope guard: injection
    is owner-turn-only, enforced by uid with a negative test.
-7. **TUI↔daemon transport under-engineered** → §9 specifies the Unix-socket
+7. **TUI↔daemon transport under-engineered** → §10 specifies the Unix-socket
    JSONL protocol up front; WebBridge explicitly ruled out as transport.
 8. **Fallback to present-but-unauthenticated backend** → chain eligibility
    gated on H2 login-freshness probes (own timer, on-demand refresh).
@@ -661,7 +778,7 @@ Seeded template:
    `git filter-repo` wrapper — destructive, confirm-gated, exact steps in
    MANUAL.md.
 
-## 13. Execution order & progress
+## 14. Execution order & progress
 
 Execute strictly top-to-bottom. Check items off here (this file) as they land.
 
@@ -669,6 +786,10 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [ ] M2 Memory layout + injection
 - [ ] M3 FTS5 + memory git + quiet runs
 - [ ] M4 Nightly distillation + /memory + change surfacing
+- [ ] K1 Graph schema + indexer
+- [ ] K2 Entity linking + neighborhood injection
+- [ ] K3 Curiosity loop
+- [ ] K4 Graph views (/graph HTML)
 - [ ] H1 Heartbeat loop
 - [ ] H2 Health probes + assisted re-login
 - [ ] H3 systemd service
