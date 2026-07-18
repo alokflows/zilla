@@ -29,7 +29,7 @@ import threading
 import subprocess
 from typing import Callable
 
-from zilla.config import CLAUDE_PATH, CLI_WORKING_DIR, MAX_TOTAL_RUNTIME, AGI_BRAIN_DIR
+from zilla.config import CLAUDE_PATH, CLI_WORKING_DIR, MAX_TOTAL_RUNTIME
 
 logger = logging.getLogger(__name__)
 

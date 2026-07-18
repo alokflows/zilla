@@ -137,7 +137,8 @@ def detect_backend(name: str) -> str | None:
 def doctor_db() -> int:
     """Returns the number of problems found (0 = DB OK)."""
     problems = 0
-    db_path = os.path.join(BASE, "zilla.db")
+    import zilla.config as zconfig
+    db_path = zconfig.DB_FILE
     if not os.path.exists(db_path):
         info("zilla.db not created yet (first bot start will create it)")
         return 0
@@ -447,8 +448,9 @@ def is_running() -> bool:
     Reuses the SAME cross-platform lock primitive bot.py itself uses (never a
     second liveness mechanism) — try to acquire it; if we succeed, nobody
     else held it, so release immediately and report not-running."""
+    import zilla.config as zconfig
     import zilla.platform_compat as platform_compat
-    lock_path = os.path.join(BASE, "zilla_bot_instance.lock")
+    lock_path = zconfig.LOCK_FILE
     handle = platform_compat.acquire_instance_lock(lock_path)
     if handle is None:
         return True
@@ -459,7 +461,8 @@ def is_running() -> bool:
 def read_pid() -> int | None:
     """Best-effort PID of the running bot.py, for display only (status uses
     is_running() — the lock, not this file — as the source of truth)."""
-    pid_path = os.path.join(BASE, "zilla.pid")
+    import zilla.config as zconfig
+    pid_path = zconfig.PID_FILE
     try:
         with open(pid_path, encoding="utf-8") as f:
             return int(f.read().strip())
@@ -478,6 +481,13 @@ def _arg(name: str):
 
 
 def main():
+    # Must run before ANY path below touches DB_FILE/RUNTIME_DIR (e.g.
+    # doctor_db() reading zilla.db) — those lazily create the new-layout
+    # files on first access, which would make ZILLA_HOME "already exist"
+    # and silently skip the real migration (PLAN.md §17/F1).
+    import zilla.config as zconfig
+    zconfig.run_zilla_home_migration()
+
     if "--doctor" in sys.argv:
         sys.exit(doctor())
 

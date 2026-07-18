@@ -60,7 +60,7 @@ Two roles only: **owner** (env `TELEGRAM_OWNER_ID`) + **admin** (everyone in `au
 - Single-instance: `acquire_instance_lock` (msvcrt LK_NBLCK / fcntl LOCK_EX|NB). PID file `zilla.pid`.
 - Console output is cp1252 on Win → emit ASCII OR `sys.stdout.reconfigure(utf-8, errors=replace)` (installer does).
 - **Menu lifecycle**: opening a command-menu via `_open_menu` strips the previous menu's keyboard (`_active_menu[chat_id]`) ⇒ stale menus in history are inert. Every screen carries `✕ Close` (`menu_close`).
-- `safe_send_file`: realpath allowlist = `AGI_BRAIN_DIR` (∋ Inbox/Outbox) + the live conversation dir; symlink-fenced.
+- `safe_send_file`: realpath allowlist = `ZILLA_HOME` (∋ Media/Outbox) + the live conversation dir; symlink-fenced.
 
 ## Config surface (.env)
 Required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`. Selective: `BACKEND`, `CLI_PATH`, `CLAUDE_PATH`, `CLI_WORKING_DIR`, `BRAIN_DIR`, `FFMPEG_PATH`, `IDLE_KILL_AFTER`, `MAX_TOTAL_RUNTIME`, `KIMI_BRIDGE_URL`, `AGY_SETTINGS_FILE`. Settings KV (`settings.json`): `backend`, `claude_model`, `admins_can_change_model`, `schedule_catchup`, `idle_kill_after`, `auto_describe_photos`.

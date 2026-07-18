@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 
 from zilla.store import Store
 
@@ -166,3 +167,101 @@ def migrate_legacy_json(
     if imported:
         logger.info(f"[MIGRATE] Imported legacy JSON into {db.db_path}: {imported}")
     return stats
+
+
+def _move_once(src: str | None, dst: str) -> bool:
+    """Move src -> dst if src exists and dst doesn't yet (never clobbers a
+    destination, never deletes src on failure — shutil.move only removes the
+    source once the copy to dst has fully succeeded)."""
+    if not src or not (os.path.exists(src) or os.path.islink(src)):
+        return False
+    if os.path.exists(dst):
+        logger.warning(f"[MIGRATE] {dst} already exists — leaving {src} in place")
+        return False
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        shutil.move(src, dst)
+        return True
+    except OSError as e:
+        logger.error(f"[MIGRATE] Failed to move {src} -> {dst}: {e}")
+        return False
+
+
+def migrate_zilla_home(
+    *,
+    zilla_home: str,
+    legacy_agi_brain_dir: str | None = None,
+    legacy_memory_dir: str | None = None,
+    legacy_db_file: str | None = None,
+) -> dict:
+    """One-time move onto the ZILLA_HOME storage constitution (PLAN.md §17
+    F1): legacy ~/AGI-Brain's Inbox/Outbox/Bridge, PLUS the repo-root
+    Memory/ tree and zilla.db that M1-M4 already created there before F1
+    existed (F1 was written assuming AGI-Brain still held Memory/state;
+    those phases shipped first and anchored them at the repo root instead —
+    documented deviation, not a silent rewrite of the accepted M1-M4 work).
+
+    No-op if `zilla_home` already exists (already migrated, or a fresh
+    install with nothing to bring over). Idempotent and non-destructive:
+    each item only moves if its new-layout destination doesn't already
+    exist; nothing is ever deleted, only moved once."""
+    moved = {
+        "inbox": False, "outbox": False, "bridge": False,
+        "memory": False, "db": False, "agi_brain_symlink": False,
+    }
+    if os.path.isdir(zilla_home) or os.path.islink(zilla_home):
+        return moved
+
+    had_agi_brain = bool(
+        legacy_agi_brain_dir and os.path.isdir(legacy_agi_brain_dir)
+        and not os.path.islink(legacy_agi_brain_dir)
+    )
+
+    if had_agi_brain:
+        moved["inbox"] = _move_once(
+            os.path.join(legacy_agi_brain_dir, "Inbox"),
+            os.path.join(zilla_home, "Media", "Inbox"),
+        )
+        moved["outbox"] = _move_once(
+            os.path.join(legacy_agi_brain_dir, "Outbox"),
+            os.path.join(zilla_home, "Outbox"),
+        )
+        moved["bridge"] = _move_once(
+            os.path.join(legacy_agi_brain_dir, "Bridge"),
+            os.path.join(zilla_home, "Runtime", "Bridge"),
+        )
+
+    if legacy_memory_dir and os.path.isdir(legacy_memory_dir):
+        moved["memory"] = _move_once(
+            legacy_memory_dir, os.path.join(zilla_home, "Memory")
+        )
+
+    if legacy_db_file and os.path.exists(legacy_db_file):
+        dst_db = os.path.join(zilla_home, "Runtime", "zilla.db")
+        moved["db"] = _move_once(legacy_db_file, dst_db)
+        if moved["db"]:
+            for suffix in ("-wal", "-shm", ".bak", ".bak.1"):
+                _move_once(legacy_db_file + suffix, dst_db + suffix)
+
+    if had_agi_brain:
+        try:
+            leftovers = [n for n in os.listdir(legacy_agi_brain_dir) if n != ".DS_Store"]
+            if not leftovers:
+                ds_store = os.path.join(legacy_agi_brain_dir, ".DS_Store")
+                if os.path.exists(ds_store):
+                    os.remove(ds_store)
+                os.rmdir(legacy_agi_brain_dir)
+                os.symlink(zilla_home, legacy_agi_brain_dir)
+                moved["agi_brain_symlink"] = True
+            else:
+                logger.warning(
+                    f"[MIGRATE] {legacy_agi_brain_dir} still has {leftovers} — "
+                    "not replacing with a symlink"
+                )
+        except OSError as e:
+            logger.error(f"[MIGRATE] Could not symlink {legacy_agi_brain_dir}: {e}")
+
+    os.makedirs(zilla_home, exist_ok=True)
+    if any(moved.values()):
+        logger.info(f"[MIGRATE] ZILLA_HOME migration -> {zilla_home}: {moved}")
+    return moved

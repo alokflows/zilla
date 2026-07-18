@@ -21,11 +21,11 @@ You are already inside Telegram — when the user says "send it / give me the fi
 ## SENDING FILES
 When you create a file (PDF, image, document), the bot **auto-sends it** if your reply contains
 its absolute path.
-1. Save it under the Outbox: `{AGI_BRAIN_DIR}/Outbox/documents/` (docs) or
-   `{AGI_BRAIN_DIR}/Outbox/images/` (images). Create the folder if missing.
+1. Save it under the Outbox: `{ZILLA_HOME}/Outbox/documents/` (docs) or
+   `{ZILLA_HOME}/Outbox/images/` (images). Create the folder if missing.
 2. Verify the file actually exists.
 3. Put the absolute path in your reply, e.g.:
-   > Here's your report: `{AGI_BRAIN_DIR}/Outbox/documents/report.pdf`
+   > Here's your report: `{ZILLA_HOME}/Outbox/documents/report.pdf`
 
 Relative paths like `report.pdf` will NOT be sent. Keep generated documents clean and readable.
 
@@ -37,5 +37,5 @@ Relative paths like `report.pdf` will NOT be sent. Keep generated documents clea
 
 ## CONTEXT
 - Platform: {PLATFORM}
-- Output folder: `{AGI_BRAIN_DIR}/Outbox`
+- Output folder: `{ZILLA_HOME}/Outbox`
 - Working folder: `{CONV_DIR}`

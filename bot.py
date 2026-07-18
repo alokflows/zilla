@@ -67,13 +67,13 @@ from telegram.ext import (
 from config import (
     BOT_TOKEN, OWNER_CHAT_ID, USERS_FILE, SESSIONS_FILE,
     TELEGRAM_MAX_LENGTH, TELEGRAM_MAX_SEND_FILE, BOT_VERSION,
-    AGI_BRAIN_DIR, HOME_DIR, ensure_dirs, KIMI_BRIDGE_URL,
+    ZILLA_HOME, HOME_DIR, ensure_dirs, KIMI_BRIDGE_URL,
     get_model, set_model, get_idle_kill_after, get_setting, set_setting,
     OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES, BRAIN_DIR,
     SCHEDULES_FILE, agy_models_live,
     model_catalog, get_backend, set_backend,
-    run_first_start_migration,
-    DB_FILE, MEMORY_DIR,
+    run_first_start_migration, run_zilla_home_migration,
+    DB_FILE, MEMORY_DIR, LOG_DIR, PID_FILE, LOCK_FILE, RUNTIME_DIR,
 )
 from zilla.store import get_store
 from zilla import memory, heartbeat
@@ -102,7 +102,12 @@ from keyboards import (
 )
 
 # ── Logging ────────────────────────────────────────────────
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+# LOG_DIR lives under ZILLA_HOME/Runtime (PLAN.md §17/F1). This runs at
+# import time, before main()'s run_zilla_home_migration() — a fresh
+# install just creates an empty dir here, harmless; an owner upgrading
+# from pre-F1 keeps their old repo-root logs/ behind (low-value diagnostic
+# exhaust, not part of the storage constitution's data — deliberately not
+# migrated to avoid racing this early makedirs).
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # Under pythonw.exe (hidden launcher) there is no console — sys.stdout is None.
@@ -511,9 +516,9 @@ async def safe_send_file(bot, chat_id: int, filepath: str, caption: str = None,
     # Resolve symlinks to prevent junction/symlink escape
     abs_path = os.path.realpath(filepath)
 
-    # Allowlist: AGI-Brain (Outbox lives here) + this conversation's CLI brain folder
+    # Allowlist: ZILLA_HOME (Outbox lives here) + this conversation's CLI brain folder
     safe_prefixes = [
-        os.path.realpath(AGI_BRAIN_DIR),
+        os.path.realpath(ZILLA_HOME),
     ]
     if conv_id:
         # conv_id is a UUID — join directly without basename to avoid stripping
@@ -2830,9 +2835,7 @@ async def _register_commands(application):
 
 # Module-level lock file handle (for single-instance guard)
 _lock_file_handle = None
-
-_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-PID_FILE = os.path.join(_BOT_DIR, "zilla.pid")
+# PID_FILE imported from config (ZILLA_HOME/Runtime — PLAN.md §17/F1).
 
 
 def _cout(msg: str = ""):
@@ -2861,7 +2864,7 @@ def _remove_pid_file():
         pass
 
 
-_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zilla_bot_instance.lock")
+_LOCK_PATH = LOCK_FILE
 
 
 def _release_lock():
@@ -2874,6 +2877,13 @@ def _release_lock():
 
 def main():
     global sessions, auth, schedules_mgr, core, _lock_file_handle
+
+    # ZILLA_HOME migration (PLAN.md §17/F1) must run FIRST, before anything
+    # below (the lock file, PID file, ensure_dirs, memory.ensure_tree) ever
+    # creates a path under the new layout — the migration's own gate is
+    # "ZILLA_HOME doesn't exist yet", so it has to see that clean.
+    run_zilla_home_migration()
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
 
     # Single-instance guard — cross-platform (msvcrt on Windows, fcntl on Unix).
     bot_dir = os.path.dirname(os.path.abspath(__file__))

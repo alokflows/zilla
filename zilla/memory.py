@@ -1,9 +1,9 @@
 # ============================================================
 #  MEMORY — the Markdown knowledge tier (PLAN.md §3.2, Phase M2)
 # ============================================================
-#  AGI-Brain/Memory/ (today: <repo>/Memory/ — config.MEMORY_DIR, settled by
-#  M1's forward-declaration) is the OWNER's knowledge, in plain Markdown,
-#  on their own disk:
+#  ~/Zilla/Memory/ (config.MEMORY_DIR — PLAN.md §17/F1's ZILLA_HOME storage
+#  constitution) is the OWNER's knowledge, in plain Markdown, on their own
+#  disk:
 #
 #    MEMORY.md   — core memory, always in context. <= 2000 chars.
 #    HEARTBEAT.md — agent-owned proactive checklist (seeded empty; H1 owns

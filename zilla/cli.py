@@ -29,7 +29,7 @@ import zilla.security as zsecurity
 
 
 def _logs_dir() -> str:
-    return os.path.join(config.BASE_DIR, "logs")
+    return config.LOG_DIR
 
 
 # ── subcommands ──────────────────────────────────────────────
@@ -166,6 +166,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Must run before ANY subcommand touches DB_FILE/RUNTIME_DIR (e.g. `doctor`
+    # reading settings via get_backend()/get_model()) — those lazily create
+    # the new-layout files on first access, which would make ZILLA_HOME
+    # "already exist" and silently skip the real migration (PLAN.md §17/F1).
+    config.run_zilla_home_migration()
+
     parser = build_parser()
     args = parser.parse_args(argv)
 

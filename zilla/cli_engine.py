@@ -585,7 +585,7 @@ def run_cli(
       - total runtime > MAX_TOTAL_RUNTIME seconds (safety net)
       - natural process exit
     """
-    from zilla.config import get_idle_kill_after, AGI_BRAIN_DIR, HOME_DIR
+    from zilla.config import get_idle_kill_after, OUTBOX_DIR, HOME_DIR
 
     idle_kill_after = get_idle_kill_after()
     max_total_runtime = MAX_TOTAL_RUNTIME  # from env, not overridable at runtime
@@ -628,7 +628,7 @@ def run_cli(
     # of the model — previously they were injected only on the first turn.
     prompt = wrap_prompt(
         prompt, is_new=is_new, backend="agy",
-        conv_dir=os.path.join(AGI_BRAIN_DIR, "Outbox"),
+        conv_dir=OUTBOX_DIR,
         ctx=ctx,
     )
 

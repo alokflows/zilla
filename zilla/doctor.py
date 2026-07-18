@@ -27,7 +27,7 @@ import urllib.request
 import zilla.platform_compat as platform_compat
 from zilla.backends import claude_identity
 from zilla.config import (
-    BRAIN_DIR, FFMPEG_PATH, HOME_DIR, KIMI_BRIDGE_URL,
+    BRAIN_DIR, FFMPEG_PATH, HOME_DIR, KIMI_BRIDGE_URL, ZILLA_HOME,
     agy_reachable, agy_models_live, get_backend, get_model,
 )
 
@@ -140,6 +140,7 @@ def environment_report(force: bool = False) -> dict:
             "python": platform.python_version(),
             "gui": detect_gui(),
         },
+        "home": {"path": ZILLA_HOME, "exists": os.path.isdir(ZILLA_HOME)},
         "backend": {"active": get_backend(), "model": get_model()},
         "clis": {
             "agy": {"reachable": agy_ok},
@@ -174,6 +175,8 @@ def format_report(report: dict) -> str:
     osi = report["os"]
     lines.append(f"  • OS: {osi['system']} {osi['release']}  (Python {osi['python']})")
     lines.append(f"  • GUI present: {'yes' if osi['gui'] else 'no (headless)'}")
+    home = report["home"]
+    lines.append(f"  • Zilla home: {home['path']}" + ("" if home["exists"] else "  (not created yet — first start will create it)"))
     lines.append(f"  • Backend: {report['backend']['active']}  (model: {report['backend']['model']})")
 
     agy = report["clis"]["agy"]

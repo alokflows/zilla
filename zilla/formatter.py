@@ -294,7 +294,7 @@ def detect_file_paths(text: str) -> list[str]:
 
     Zilla is cross-platform, so this must catch both `C:\\Users\\...` and
     `/Users/me/...` / `~/...`. The Windows-only version silently delivered
-    zero files on macOS/Linux, where the agent writes to /Users/.../AGI-Brain.
+    zero files on macOS/Linux, where the agent writes to /Users/.../Zilla.
     """
     import os
     paths = []

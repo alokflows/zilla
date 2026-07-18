@@ -86,7 +86,9 @@ class TurnContext:
 #  worth a per-event fsync stall on the hot path), and it
 #  swallows every error: logging must never break a turn.
 
-_LOG_DIR = os.path.join(_HERE, "logs")
+# Runtime/logs, alongside bot.py's own daily log (PLAN.md §17/F1) — one
+# logs home, not two; config.LOG_DIR is the single source of truth.
+from zilla.config import LOG_DIR as _LOG_DIR
 _TRUST_LOG = os.path.join(_LOG_DIR, "trust_log.jsonl")
 _log_lock = threading.Lock()
 
@@ -297,13 +299,13 @@ def reload_instructions() -> None:
 
 
 def _resolve_placeholders(text: str, conv_dir: str, backend: str | None = None) -> str:
-    """Replace {CONV_DIR}/{AGI_BRAIN_DIR}/{HOME_DIR}/{SKILLS_DIR}/{PLATFORM} with
+    """Replace {CONV_DIR}/{ZILLA_HOME}/{HOME_DIR}/{SKILLS_DIR}/{PLATFORM} with
     real, OS-native, backend-correct values. Centralized so injection is
     identical everywhere."""
-    from zilla.config import AGI_BRAIN_DIR, HOME_DIR, get_skills_dir
+    from zilla.config import ZILLA_HOME, HOME_DIR, get_skills_dir
     return (
         text.replace("{CONV_DIR}", conv_dir)
-            .replace("{AGI_BRAIN_DIR}", AGI_BRAIN_DIR)
+            .replace("{ZILLA_HOME}", ZILLA_HOME)
             .replace("{HOME_DIR}", HOME_DIR)
             .replace("{SKILLS_DIR}", get_skills_dir(backend))
             .replace("{PLATFORM}", _platform_name())
@@ -403,12 +405,12 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
     switch a real "mode" change to the model. Returns "" only if there is
     genuinely nothing to inject.
     """
-    from zilla.config import AGI_BRAIN_DIR
+    from zilla.config import OUTBOX_DIR, BRIDGE_DIR
 
     if conv_dir is None:
-        conv_dir = os.path.join(AGI_BRAIN_DIR, "Outbox")
+        conv_dir = OUTBOX_DIR
 
-    relay = _relay_protocol(os.path.join(AGI_BRAIN_DIR, "Bridge"))
+    relay = _relay_protocol(BRIDGE_DIR)
     memory_block = _memory_block(ctx)
 
     if not is_new:

@@ -308,6 +308,7 @@ def test_detect_gui_smoke():
 def test_format_report_smoke():
     report = {
         "os": {"system": "Darwin", "release": "25.0", "python": "3.12.0", "gui": True},
+        "home": {"path": "/Users/tester/Zilla", "exists": True},
         "backend": {"active": "agy", "model": "Gemini 3.1 Pro (High)"},
         "clis": {"agy": {"reachable": True},
                  "claude": {"reachable": False, "logged_in": False, "auth_error": "nope"}},
@@ -319,6 +320,7 @@ def test_format_report_smoke():
     text = zdoctor.format_report(report)
     check("format_report: mentions backend", "agy" in text)
     check("format_report: flags missing flac", "flac" in text and "not found" in text)
+    check("format_report: shows the Zilla home path", "/Users/tester/Zilla" in text)
 
 
 # ══════════════════════════════════════════════════════════

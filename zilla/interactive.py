@@ -35,11 +35,9 @@ import secrets
 from dataclasses import dataclass, asdict
 
 try:
-    from zilla.config import AGI_BRAIN_DIR
+    from zilla.config import BRIDGE_DIR
 except Exception:  # keep the module importable in isolation / tests
-    AGI_BRAIN_DIR = os.path.join(os.path.expanduser("~"), "AGI-Brain")
-
-BRIDGE_DIR = os.path.join(AGI_BRAIN_DIR, "Bridge")
+    BRIDGE_DIR = os.path.join(os.path.expanduser("~"), "Zilla", "Runtime", "Bridge")
 
 # Allowed request kinds. 'otp'/'password' are secret → bot masks the reply.
 KINDS = ("otp", "text", "password", "confirm")

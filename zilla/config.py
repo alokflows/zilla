@@ -78,6 +78,41 @@ def _find_exe(name: str, *candidates: str) -> str:
 
 _IS_WIN = sys.platform == "win32"
 
+# --- ZILLA_HOME (PLAN.md §17/F1 storage constitution) ------
+# The one visible, owner-facing data home — "the knowledge is the product",
+# not a dot-dir. Every file Zilla writes lives under here (Memory/Media/
+# Outbox/Runtime, see below); the backends' OWN conversation stores
+# (BRAIN_DIR, AGY_SETTINGS_FILE, skills dirs) are explicitly NOT part of
+# this — they stay wherever the backend puts them (F1 step 3: conversations
+# belong to brains, knowledge belongs to you).
+ZILLA_HOME = os.getenv("ZILLA_HOME") or os.path.join(HOME_DIR, "Zilla")
+
+# --- Media (Inbox / Outbox / Kept, all under ZILLA_HOME) ---
+MEDIA_DIR = os.path.join(ZILLA_HOME, "Media")
+INBOX_DIR = os.path.join(MEDIA_DIR, "Inbox")
+INBOX_IMAGES = os.path.join(INBOX_DIR, "images")
+INBOX_AUDIO = os.path.join(INBOX_DIR, "audio")
+INBOX_DOCUMENTS = os.path.join(INBOX_DIR, "documents")
+MEDIA_KEPT_DIR = os.path.join(MEDIA_DIR, "Kept")  # F3: permanent, sweep-exempt
+OUTBOX_DIR = os.path.join(ZILLA_HOME, "Outbox")
+OUTBOX_DOCUMENTS = os.path.join(OUTBOX_DIR, "documents")
+OUTBOX_IMAGES = os.path.join(OUTBOX_DIR, "images")
+
+# --- Runtime (the machine's business: db, logs, pid, sock — PLAN.md §17) ---
+RUNTIME_DIR = os.path.join(ZILLA_HOME, "Runtime")
+LOG_DIR = os.path.join(RUNTIME_DIR, "logs")
+PID_FILE = os.path.join(RUNTIME_DIR, "zilla.pid")
+LOCK_FILE = os.path.join(RUNTIME_DIR, "zilla_bot_instance.lock")
+# Human-in-the-loop ask/answer relay files (zilla/interactive.py) — machine
+# plumbing, not owner-facing knowledge, so it lives in Runtime, not Memory.
+BRIDGE_DIR = os.path.join(RUNTIME_DIR, "Bridge")
+
+# M2's memory.py creates this tree (MEMORY.md, Journal/, etc). Now that F1
+# has landed, it lives under ZILLA_HOME, not the repo root (see the
+# migration in run_zilla_home_migration() below for owners upgrading from
+# M2-M4's repo-root layout).
+MEMORY_DIR = os.path.join(ZILLA_HOME, "Memory")
+
 # --- agy CLI (default backend) ---
 CLI_PATH = os.getenv("CLI_PATH") or _find_exe(
     "agy",
@@ -104,8 +139,8 @@ CLAUDE_PATH = os.getenv("CLAUDE_PATH") or _find_exe(
 PLAYWRIGHT_MCP_VERSION = os.getenv("PLAYWRIGHT_MCP_VERSION", "0.0.75")
 # Give the (cold) MCP server room to hand-shake before Claude gives up on its tools.
 MCP_STARTUP_TIMEOUT_MS = os.getenv("MCP_STARTUP_TIMEOUT_MS", "30000")
-# Generated MCP config files live in the git-ignored cache dir.
-MCP_CONFIG_DIR = os.path.join(BASE_DIR, "cache", "mcp")
+# Generated MCP config files are machine business — Runtime, not the repo.
+MCP_CONFIG_DIR = os.path.join(RUNTIME_DIR, "cache", "mcp")
 MCP_BROWSER_CONFIG = os.path.join(MCP_CONFIG_DIR, "browser.json")
 MCP_NONE_CONFIG = os.path.join(MCP_CONFIG_DIR, "none.json")
 
@@ -134,22 +169,11 @@ AGY_SETTINGS_FILE = os.getenv(
     os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "settings.json"),
 )
 
-# --- AGI Brain (Inbox / Outbox on disk) ---
-AGI_BRAIN_DIR = os.path.join(HOME_DIR, "AGI-Brain")
-INBOX_DIR = os.path.join(AGI_BRAIN_DIR, "Inbox")
-INBOX_IMAGES = os.path.join(INBOX_DIR, "images")
-INBOX_AUDIO = os.path.join(INBOX_DIR, "audio")
-INBOX_DOCUMENTS = os.path.join(INBOX_DIR, "documents")
-OUTBOX_DIR = os.path.join(AGI_BRAIN_DIR, "Outbox")
-OUTBOX_DOCUMENTS = os.path.join(OUTBOX_DIR, "documents")
-OUTBOX_IMAGES = os.path.join(OUTBOX_DIR, "images")
-
-
 # --- ffmpeg (voice-note transcription) ---
-# Windows: bundled copy under AGI-Brain\Tools. Unix: system ffmpeg (brew/apt).
+# Windows: bundled copy under ZILLA_HOME\Tools. Unix: system ffmpeg (brew/apt).
 FFMPEG_PATH = os.getenv("FFMPEG_PATH") or _find_exe(
     "ffmpeg",
-    os.path.join(AGI_BRAIN_DIR, "Tools", "ffmpeg", "ffmpeg.exe") if _IS_WIN else "ffmpeg",
+    os.path.join(ZILLA_HOME, "Tools", "ffmpeg", "ffmpeg.exe") if _IS_WIN else "ffmpeg",
 )
 
 # --- Skills (backend-aware: each "mode" has its own skill set) ---
@@ -174,17 +198,11 @@ KIMI_BRIDGE_URL = os.getenv("KIMI_BRIDGE_URL", "http://127.0.0.1:10086")
 # one zilla.db. Kept as four names (not one) because tests reassign these
 # individually to distinct tmp paths for isolation (test_core.py) and
 # production code still imports/passes them by their original names.
-DB_FILE = os.path.join(BASE_DIR, "zilla.db")
+DB_FILE = os.path.join(RUNTIME_DIR, "zilla.db")
 SESSIONS_FILE = DB_FILE
 SETTINGS_FILE = DB_FILE
 USERS_FILE = DB_FILE
 SCHEDULES_FILE = DB_FILE
-
-# M2's memory.py creates this tree (MEMORY.md, Journal/, etc). Declared here
-# now, ahead of M2, only so M1's secrets-hygiene perm hardening
-# (_harden_file_perms in bot.py) can find it — a guarded no-op path until
-# M2 actually creates it.
-MEMORY_DIR = os.path.join(BASE_DIR, "Memory")
 
 # Original pre-M1 locations, kept ONLY so run_first_start_migration() (below)
 # knows where to look for data to import. Never assign these to the *_FILE
@@ -194,6 +212,32 @@ _LEGACY_SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 _LEGACY_USERS_FILE = os.path.join(BASE_DIR, "authorized_users.json")
 _LEGACY_DENIED_FILE = os.path.join(BASE_DIR, "denied_users.json")
 _LEGACY_SCHEDULES_FILE = os.path.join(BASE_DIR, "schedules.json")
+
+# Pre-F1 (M1-M4) locations for zilla.db/Memory/AGI-Brain, kept ONLY so
+# run_zilla_home_migration() below knows where to look. F1 (PLAN.md §17)
+# was written assuming these still lived under ~/AGI-Brain; M1-M4 shipped
+# first and anchored zilla.db/Memory at the repo root instead — this is
+# the migration path off THAT reality, not the literal AGI-Brain-only
+# spec text.
+_LEGACY_AGI_BRAIN_DIR = os.path.join(HOME_DIR, "AGI-Brain")
+_LEGACY_DB_FILE = os.path.join(BASE_DIR, "zilla.db")
+_LEGACY_MEMORY_DIR = os.path.join(BASE_DIR, "Memory")
+
+
+def run_zilla_home_migration() -> dict:
+    """One-time move onto ZILLA_HOME (PLAN.md §17/F1) — legacy ~/AGI-Brain
+    Inbox/Outbox/Bridge plus the repo-root Memory/zilla.db that M1-M4
+    created before F1 existed. No-op once ZILLA_HOME already exists.
+    Must run before ensure_dirs()/memory.ensure_tree()/
+    run_first_start_migration() ever touch the new paths, so the
+    'ZILLA_HOME missing' gate is still true when this checks it."""
+    from zilla.migrate import migrate_zilla_home
+    return migrate_zilla_home(
+        zilla_home=ZILLA_HOME,
+        legacy_agi_brain_dir=_LEGACY_AGI_BRAIN_DIR,
+        legacy_memory_dir=_LEGACY_MEMORY_DIR,
+        legacy_db_file=_LEGACY_DB_FILE,
+    )
 
 
 def run_first_start_migration() -> dict:
@@ -472,8 +516,13 @@ def get_idle_kill_after() -> int:
 
 
 def ensure_dirs():
+    """Every directory in the ZILLA_HOME storage constitution (PLAN.md §17)
+    that isn't owned by a more specific ensure-tree (Memory/ is
+    memory.ensure_tree()'s job, so an owner's template edits are never
+    raced/clobbered by this generic makedirs)."""
     for d in [
-        INBOX_DIR, INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS,
+        INBOX_DIR, INBOX_IMAGES, INBOX_AUDIO, INBOX_DOCUMENTS, MEDIA_KEPT_DIR,
         OUTBOX_DIR, OUTBOX_DOCUMENTS, OUTBOX_IMAGES,
+        RUNTIME_DIR, BRIDGE_DIR,
     ]:
         os.makedirs(d, exist_ok=True)

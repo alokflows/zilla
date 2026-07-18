@@ -323,7 +323,7 @@ def format_file_size(size_bytes: int) -> str:
 # ── Outbox (files the agent PRODUCES) ─────────────────────
 #
 # The CLI writes generated files (reports, sheets, charts, screenshots…) into
-# ~/AGI-Brain/Outbox/{documents,images}. The bot auto-delivers what it can,
+# ~/Zilla/Outbox/{documents,images}. The bot auto-delivers what it can,
 # but the user also needs to browse/send/delete the rest from Telegram — same
 # UX as the Inbox. These mirror the inbox helpers (video split out of docs;
 # Outbox has no audio folder).
