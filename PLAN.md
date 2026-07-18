@@ -665,8 +665,10 @@ Seeded template:
    `!deep` prefix ⇒ `deep`; (b) `trivial` class ⇒ `fast`; (c) everything
    else ⇒ `standard`. Effort maps to backend+model per a `effort_map`
    setting (defaults: fast = cheapest chain model, e.g. claude haiku;
-   standard = session backend as configured; deep = the chain's strongest
-   model, e.g. claude opus / Gemini High). `deep` turns get a "thinking
+   standard = session backend as configured; deep = the strongest model
+   among per-invocation-flag backends ONLY, e.g. claude opus — an
+   `effort_map` entry naming an agy model is invalid and rejected at
+   settings-write time, per rule 4 below). `deep` turns get a "thinking
    deeply…" progress note (P4).
 4. **agy model-switching constraint (recorded reality):** agy's active
    model is a GLOBAL display string in its settings file — per-turn
