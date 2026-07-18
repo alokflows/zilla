@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import install
 import zilla.config as config
+from zilla.backend_registry import names as backend_names
 
-BACKEND_CHOICES = ["agy", "claude", "opencode"]
+# Derived from the registry (PLAN.md §17/F2) — a new adapter (e.g. R3's
+# opencode) appears here automatically, no edit needed.
+BACKEND_CHOICES = backend_names()
 VOICE_CHOICES = ["offline", "online"]
 WEB_CHOICES = ["headless", "my-browser", "off"]
 ALERT_CHOICES = ["silent", "verbose"]
@@ -120,8 +123,8 @@ def _print_menu(print_fn, state: dict, env: dict):
     _hr(print_fn)
     print_fn(f"  1) Backend priority & active backend   (active: {state['backend']}, "
               f"order: {','.join(state['priority'])})")
-    print_fn(f"  2) Model per backend                   (agy: {config.get_model_for('agy')} "
-              f"| claude: {config.get_model_for('claude')})")
+    models = " | ".join(f"{b}: {config.get_model_for(b)}" for b in BACKEND_CHOICES)
+    print_fn(f"  2) Model per backend                   ({models})")
     print_fn(f"  3) Fallback chain                      ({'on' if state['fallback'] else 'off'})")
     print_fn(f"  4) Voice mode                          ({state['voice']})")
     print_fn(f"  5) Web mode                            ({state['web']})")
@@ -135,7 +138,7 @@ def _print_menu(print_fn, state: dict, env: dict):
 
 
 def _menu_backend(input_fn, print_fn):
-    print_fn(f"  Available: {', '.join(BACKEND_CHOICES)} (opencode not yet integrated — Phase 8)")
+    print_fn(f"  Available: {', '.join(BACKEND_CHOICES)}")
     raw = input_fn("  Priority order, comma-separated (e.g. agy,claude): ").strip()
     order = parse_priority_order(raw, BACKEND_CHOICES)
     if order is None:
@@ -149,9 +152,9 @@ def _menu_backend(input_fn, print_fn):
 
 
 def _menu_model(input_fn, print_fn):
-    raw = input_fn("  Which backend? (agy/claude): ").strip().lower()
-    if raw not in ("agy", "claude"):
-        print_fn("  Not saved — choose 'agy' or 'claude'.")
+    raw = input_fn(f"  Which backend? ({'/'.join(BACKEND_CHOICES)}): ").strip().lower()
+    if raw not in BACKEND_CHOICES:
+        print_fn(f"  Not saved — choose one of: {', '.join(BACKEND_CHOICES)}.")
         return
     catalog = config.model_catalog_for(raw)
     if not catalog:

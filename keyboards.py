@@ -19,6 +19,7 @@ from config import (
     get_setting, get_idle_kill_after, get_backend, model_catalog,
 )
 from media import format_file_size
+from zilla.backend_registry import installed_backends
 
 # Injected by bot.py at startup (see module docstring).
 auth = None
@@ -139,11 +140,17 @@ def kb_model(current: str):
             buttons.append(row); row = []
     if row:
         buttons.append(row)
-    other = "claude" if get_backend() == "agy" else "agy"
-    buttons.append([
-        InlineKeyboardButton("✏️ Custom…", callback_data="model_custom"),
-        InlineKeyboardButton(f"🧠 Use {other}", callback_data="model_switch_backend"),
-    ])
+    buttons.append([InlineKeyboardButton("✏️ Custom…", callback_data="model_custom")])
+    # PLAN.md §17/F2: every OTHER backend that's actually installed gets a
+    # button — no button for one that isn't, and a 3rd registered backend
+    # (e.g. R3's opencode) shows up here with zero edits to this file.
+    active = get_backend()
+    switch_row = [
+        InlineKeyboardButton(f"🧠 Use {a.name}", callback_data=f"model_use_{a.name}")
+        for a in installed_backends() if a.name != active
+    ]
+    if switch_row:
+        buttons.append(switch_row)
     buttons.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
     return InlineKeyboardMarkup(buttons)
 
@@ -175,9 +182,17 @@ def kb_settings(uid: int = 0):
             callback_data="set_toggle_admin_model",
         )])
         rows.append([InlineKeyboardButton(
-            f"🧠 Backend: {get_backend()}  (tap to switch)",
-            callback_data="set_toggle_backend",
+            f"🧠 Backend: {get_backend()}", callback_data="noop",
         )])
+        # PLAN.md §17/F2: one button per OTHER installed backend, derived
+        # from the registry — not a fixed 2-way toggle.
+        active = get_backend()
+        switch_row = [
+            InlineKeyboardButton(f"Use {a.name}", callback_data=f"set_backend_{a.name}")
+            for a in installed_backends() if a.name != active
+        ]
+        if switch_row:
+            rows.append(switch_row)
     rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
     return InlineKeyboardMarkup(rows)
 

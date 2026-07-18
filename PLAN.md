@@ -1242,7 +1242,7 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] M2 Memory layout + injection *(done, 652 green)*
 - [x] M3 FTS5 + memory git + quiet runs *(done, 686 green)*
 - [x] F1 ZILLA_HOME replaces AGI-Brain (§17) *(done, 894 green)*
-- [ ] F2 Dynamic backend registry — no hard-coded backends (§17)
+- [x] F2 Dynamic backend registry — no hard-coded backends (§17) *(done, 950 green)*
 - [ ] F3 Media importance + retention controls (§17)
 - [ ] F4 System jobs invisible + silent (§17)
 - [ ] M4 Nightly distillation + /memory + change surfacing

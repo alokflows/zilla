@@ -25,10 +25,10 @@ import urllib.error
 import urllib.request
 
 import zilla.platform_compat as platform_compat
-from zilla.backends import claude_identity
+from zilla.backend_registry import status_all
 from zilla.config import (
     BRAIN_DIR, FFMPEG_PATH, HOME_DIR, KIMI_BRIDGE_URL, ZILLA_HOME,
-    agy_reachable, agy_models_live, get_backend, get_model,
+    get_backend, get_model,
 )
 
 
@@ -116,11 +116,7 @@ def environment_report(force: bool = False) -> dict:
     the text renderer below and a future TUI health screen can consume it.
     force=False never triggers a live network/subprocess probe beyond the
     cheap/cached form (same contract as core.health_report)."""
-    if force:
-        agy_models_live(force=True)
-    agy_ok = agy_reachable()
-    claude_status = claude_identity(force=force)
-    claude_ok = bool(claude_status.get("loggedIn"))
+    clis = status_all(force=force)
 
     ffmpeg_ok, ffmpeg_detail = check_ffmpeg()
     flac_ok, flac_detail = check_flac()
@@ -142,11 +138,7 @@ def environment_report(force: bool = False) -> dict:
         },
         "home": {"path": ZILLA_HOME, "exists": os.path.isdir(ZILLA_HOME)},
         "backend": {"active": get_backend(), "model": get_model()},
-        "clis": {
-            "agy": {"reachable": agy_ok},
-            "claude": {"reachable": claude_ok, "logged_in": claude_ok,
-                       "auth_error": claude_status.get("error")},
-        },
+        "clis": clis,
         "ffmpeg": {"ok": ffmpeg_ok, "detail": ffmpeg_detail},
         "flac": {"ok": flac_ok, "detail": flac_detail},
         "webbridge": {"ok": bridge_ok, "detail": bridge_detail},
@@ -179,15 +171,11 @@ def format_report(report: dict) -> str:
     lines.append(f"  • Zilla home: {home['path']}" + ("" if home["exists"] else "  (not created yet — first start will create it)"))
     lines.append(f"  • Backend: {report['backend']['active']}  (model: {report['backend']['model']})")
 
-    agy = report["clis"]["agy"]
-    lines.append(("  ✅ " if agy["reachable"] else "  ❌ ") +
-                 f"agy: {'reachable / logged in' if agy['reachable'] else 'not reachable — run `agy` once to log in'}")
-    cl = report["clis"]["claude"]
-    if cl["reachable"]:
-        lines.append("  ✅ claude: reachable / logged in")
-    else:
-        detail = f" ({cl['auth_error']})" if cl.get("auth_error") else ""
-        lines.append(f"  ❌ claude: not reachable{detail} — run `claude` once to log in")
+    # PLAN.md §17/F2: one line per REGISTERED backend, zero hard-coded names —
+    # a future adapter (e.g. R3's opencode) shows up here with no edit.
+    for name, cli in report["clis"].items():
+        ok = cli.get("ok")
+        lines.append(("  ✅ " if ok else "  ❌ ") + f"{name}: {cli.get('detail', '')}")
 
     ff = report["ffmpeg"]
     lines.append(("  ✅ " if ff["ok"] else "  ❌ ") + f"ffmpeg: {ff['detail']}")

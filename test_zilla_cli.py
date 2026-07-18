@@ -20,6 +20,7 @@
 import io
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -56,7 +57,9 @@ import zilla.configmenu as configmenu  # noqa: E402
 import zilla.security as zsecurity  # noqa: E402
 import zilla.doctor as zdoctor  # noqa: E402
 import zilla.cli as zcli  # noqa: E402
+import zilla.backend_registry as backend_registry  # noqa: E402
 import install  # noqa: E402
+import bot as _bot  # noqa: E402
 
 
 # ══════════════════════════════════════════════════════════
@@ -306,12 +309,15 @@ def test_detect_gui_smoke():
 
 
 def test_format_report_smoke():
+    # PLAN.md §17/F2: doctor's "clis" shape is now registry-shaped —
+    # {name: {installed, path, ok, detail}} for whatever IS registered,
+    # zero hard-coded agy/claude keys.
     report = {
         "os": {"system": "Darwin", "release": "25.0", "python": "3.12.0", "gui": True},
         "home": {"path": "/Users/tester/Zilla", "exists": True},
         "backend": {"active": "agy", "model": "Gemini 3.1 Pro (High)"},
-        "clis": {"agy": {"reachable": True},
-                 "claude": {"reachable": False, "logged_in": False, "auth_error": "nope"}},
+        "clis": {"agy": {"installed": True, "path": "/usr/local/bin/agy", "ok": True, "detail": "logged in"},
+                 "claude": {"installed": True, "path": "/usr/local/bin/claude", "ok": False, "detail": "not logged in"}},
         "ffmpeg": {"ok": True, "detail": "/usr/bin/ffmpeg"},
         "flac": {"ok": False, "detail": "not found"},
         "webbridge": {"ok": False, "detail": "unreachable"},
@@ -319,6 +325,8 @@ def test_format_report_smoke():
     }
     text = zdoctor.format_report(report)
     check("format_report: mentions backend", "agy" in text)
+    check("format_report: shows agy status detail", "logged in" in text)
+    check("format_report: shows claude status detail", "not logged in" in text)
     check("format_report: flags missing flac", "flac" in text and "not found" in text)
     check("format_report: shows the Zilla home path", "/Users/tester/Zilla" in text)
 
@@ -360,6 +368,91 @@ def test_cmd_logs_missing_returns_nonzero():
     check("cli: logs exits 0 or 1 without raising", rc in (0, 1))
 
 
+# ══════════════════════════════════════════════════════════
+#  backend_registry.py — dynamic backend adapters (PLAN.md §17/F2)
+# ══════════════════════════════════════════════════════════
+
+def test_backend_registry_has_agy_and_claude():
+    names = backend_registry.names()
+    check("backend_registry: agy registered", "agy" in names)
+    check("backend_registry: claude registered", "claude" in names)
+
+
+def test_backend_registry_get_unknown_is_none():
+    check("backend_registry: get() unknown -> None",
+          backend_registry.get("not-a-real-backend") is None)
+    check("backend_registry: get() is case/whitespace tolerant",
+          backend_registry.get(" Claude ") is backend_registry.get("claude"))
+
+
+def test_backend_registry_status_all_shape():
+    status = backend_registry.status_all()
+    check("backend_registry: status_all covers every registered name",
+          set(status.keys()) == set(backend_registry.names()))
+    for name, cli in status.items():
+        check(f"backend_registry: status_all[{name}] has the shared shape",
+              {"installed", "path", "ok", "detail"} <= set(cli.keys()))
+
+
+def test_backend_registry_adapter_fields():
+    for adapter in backend_registry.all_backends():
+        check(f"backend_registry: {adapter.name} has a non-empty label", bool(adapter.label))
+        check(f"backend_registry: {adapter.name}.models() returns a list",
+              isinstance(adapter.models(), list))
+
+
+# ══════════════════════════════════════════════════════════
+#  bot.py COMMAND_REGISTRY — unified slash-command registry (PLAN.md §17/F2)
+# ══════════════════════════════════════════════════════════
+
+def test_command_registry_names_and_aliases_unique():
+    seen = []
+    for spec in _bot.COMMAND_REGISTRY:
+        seen.append(spec.name)
+        seen.extend(spec.aliases)
+    check("COMMAND_REGISTRY: no duplicate command/alias names",
+          len(seen) == len(set(seen)), detail=str(seen))
+
+
+def test_command_registry_scopes_valid():
+    for spec in _bot.COMMAND_REGISTRY:
+        check(f"COMMAND_REGISTRY: {spec.name} has a valid scope",
+              spec.scope in ("default", "owner", "hidden"), detail=spec.scope)
+        check(f"COMMAND_REGISTRY: {spec.name}.handler is callable", callable(spec.handler))
+
+
+def test_command_registry_owner_only_handlers_are_owner_scoped():
+    # Regression guard for the pre-F2 bug: /memory, /adduser, /removeuser,
+    # /listusers are owner-gated INSIDE their handlers but had no menu entry
+    # at all (or the wrong one) — scope must say so explicitly now.
+    owner_gated = {"memory", "adduser", "removeuser", "listusers"}
+    for spec in _bot.COMMAND_REGISTRY:
+        if spec.name in owner_gated:
+            check(f"COMMAND_REGISTRY: {spec.name} is owner-scoped", spec.scope == "owner")
+
+
+def test_command_registry_1to1_with_telegram_handlers():
+    # Grep-gate (PLAN.md §17/F2 accept criteria): bot.py must construct
+    # CommandHandler(...) from COMMAND_REGISTRY alone — no second, drifting
+    # list of manual add_handler(CommandHandler("name", ...)) calls.
+    bot_src = _read_bot_source()
+    literal_command_handlers = re.findall(r'CommandHandler\(\s*"([a-z_]+)"', bot_src)
+    check("bot.py: zero hard-coded CommandHandler(\"name\", ...) call sites "
+          "outside the COMMAND_REGISTRY loop",
+          literal_command_handlers == [], detail=str(literal_command_handlers))
+
+    registry_names = {spec.name for spec in _bot.COMMAND_REGISTRY}
+    registry_names |= {a for spec in _bot.COMMAND_REGISTRY for a in spec.aliases}
+    menu_names = {spec.name for spec in _bot.COMMAND_REGISTRY if spec.scope in ("default", "owner")}
+    check("COMMAND_REGISTRY: every menu-visible command is a real, unique entry",
+          menu_names <= registry_names)
+
+
+def _read_bot_source() -> str:
+    with open(_bot.__file__, "r", encoding="utf-8") as f:
+        return f.read()
+
+
 def main():
     tests = [
         test_mask_token,
@@ -385,6 +478,14 @@ def main():
         test_build_parser_subcommands,
         test_cmd_status_returns_zero,
         test_cmd_logs_missing_returns_nonzero,
+        test_backend_registry_has_agy_and_claude,
+        test_backend_registry_get_unknown_is_none,
+        test_backend_registry_status_all_shape,
+        test_backend_registry_adapter_fields,
+        test_command_registry_names_and_aliases_unique,
+        test_command_registry_scopes_valid,
+        test_command_registry_owner_only_handlers_are_owner_scoped,
+        test_command_registry_1to1_with_telegram_handlers,
     ]
     print("Running zilla.cli / configmenu / security / doctor tests...\n")
     global _failed

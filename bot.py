@@ -46,7 +46,9 @@ import logging
 import time
 import json
 from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -79,6 +81,7 @@ from zilla.store import get_store
 from zilla import memory, heartbeat
 from sessions import SessionManager
 import zilla.core as zcore
+import zilla.backend_registry as backend_registry
 from zilla.cli_engine import detect_limit, backend_status, gc_orphaned_conv_dirs
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
@@ -610,22 +613,19 @@ async def _backend_panel() -> str:
     Runs the (cached) status lookup off the event loop so menus stay instant."""
     st = await asyncio.to_thread(backend_status)
     lines = [f"🧠 {st['label']}"]
-    if st["backend"] == "claude":
-        if st.get("logged_in"):
-            acct = st.get("account") or "unknown"
-            plan = (st.get("plan") or "").capitalize()
-            lines.append(f"✅ Logged in: {acct}" + (f" · {plan}" if plan else ""))
-        else:
-            err = f" ({st['error']})" if st.get("error") else ""
-            lines.append(f"🔴 Not logged in{err} — run: claude auth login")
-    else:  # agy
-        if not st.get("installed"):
-            lines.append("🔴 Not installed on this Mac yet (setup pending)")
-        elif st.get("logged_in"):
-            lines.append(f"✅ Logged in · {st.get('auth_method') or 'Google OAuth'}")
-        else:
-            err = f" ({st['error']})" if st.get("error") else ""
-            lines.append(f"🟡 Installed but not responding{err}")
+    if not st.get("installed"):
+        lines.append("🔴 Not installed on this Mac yet (setup pending)")
+    elif st.get("logged_in"):
+        acct = st.get("account")
+        plan = (st.get("plan") or "").capitalize()
+        method = st.get("auth_method")
+        detail = acct or method or "Google OAuth"
+        lines.append(f"✅ Logged in: {detail}" + (f" · {plan}" if plan else ""))
+    else:
+        err = f" ({st['error']})" if st.get("error") else ""
+        adapter = backend_registry.get(st["backend"])
+        login_hint = f" — run: {adapter.login_cmd} login" if adapter else ""
+        lines.append(f"🟡 Not logged in{err}{login_hint}")
     cur = st.get("model")
     if cur:
         label = next((lbl for lbl, val in model_catalog() if val == cur), cur)
@@ -662,12 +662,10 @@ async def _health_panel() -> str:
 
 def _model_note() -> str:
     """Backend-specific hint shown under the model picker."""
-    if get_backend() == "claude":
-        return ("ℹ️ Backend: Claude Code. Pick Opus/Sonnet/Haiku, or ✏️ Custom for "
-                "an exact model name. (Switch backend in /settings.)")
-    return ("ℹ️ Backend: agy. This is the LIVE list from your Antigravity account "
-            "(via `agy models`). Tap one to switch — it applies to your next "
-            "message. ✏️ Custom takes any exact name agy accepts.")
+    adapter = backend_registry.get(get_backend())
+    if adapter:
+        return adapter.hint
+    return "ℹ️ Pick a model, or ✏️ Custom for an exact model name."
 
 
 # ── File auto-delivery limits ─────────────────────────────
@@ -2230,11 +2228,14 @@ async def _cb_model(query, context, data, uid, chat_id):
             reply_markup=kb_model(current),
         )
 
-    elif data == "model_switch_backend":
+    elif data.startswith("model_use_"):
         if not auth.is_owner(uid):
             await query.answer("Only the owner can switch backend.", show_alert=True)
             return
-        new_backend = "claude" if get_backend() == "agy" else "agy"
+        new_backend = data.removeprefix("model_use_")
+        if not backend_registry.get(new_backend):
+            await query.answer("Unknown backend.", show_alert=True)
+            return
         set_backend(new_backend)
         current = get_model()
         await query.edit_message_text(
@@ -2336,11 +2337,14 @@ async def _cb_settings(query, context, data, uid, chat_id):
         set_setting("schedule_catchup", not current)
         await query.edit_message_text("⚙️ Settings\n═══════════", reply_markup=kb_settings(uid))
 
-    elif data == "set_toggle_backend":
+    elif data.startswith("set_backend_"):
         if not auth.is_owner(uid):
             await query.answer("Owner only.", show_alert=True)
             return
-        new_backend = "claude" if get_backend() == "agy" else "agy"
+        new_backend = data.removeprefix("set_backend_")
+        if not backend_registry.get(new_backend):
+            await query.answer("Unknown backend.", show_alert=True)
+            return
         set_backend(new_backend)
         await query.edit_message_text(
             f"🧠 Backend switched to: {new_backend}\n"
@@ -2790,37 +2794,64 @@ async def post_shutdown(application):
         _backup_task_handle = None
 
 
-# Base commands every admin/owner sees in the "/" menu.
-_BASE_COMMANDS = [
-    ("menu", "Open the control panel"),
-    ("schedule", "Add / manage scheduled jobs"),
-    ("model", "Select the AI model"),
-    ("settings", "Bot settings"),
-    ("sessions", "List your sessions"),
-    ("new", "Start a new session"),
-    ("switch", "Switch session"),
-    ("end", "End the current session"),
-    ("brain", "Inbox stats"),
-    ("browse", "Browser control (/browse <url>)"),
-    ("ping", "Status check"),
-    ("cancel", "Stop a running request"),
-    ("help", "Show all commands"),
-]
-# Extra commands only the owner needs.
-_OWNER_COMMANDS = [
-    ("adduser", "Add an admin"),
-    ("removeuser", "Remove an admin"),
-    ("listusers", "Manage admins"),
+# ============================================================
+#  COMMAND REGISTRY (PLAN.md §17/F2) — the ONE source of truth for every
+#  slash command: its handler, its "/" menu description, and who sees it
+#  in the menu. Replaces the old separate _BASE_COMMANDS/_OWNER_COMMANDS
+#  lists + 19 manual add_handler(CommandHandler(...)) calls, which had
+#  drifted out of sync (handlers existed for /start, /memory, /schedules
+#  with NO menu entry). register_commands() and the CommandHandler setup
+#  loop below both read this list, so they can never drift apart again —
+#  a grep-gate test (test_zilla_cli.py) enforces the 1:1 mapping.
+#
+#  scope:
+#    "default" — every user sees it in their "/" menu
+#    "owner"   — only the owner's chat sees it (in addition to default)
+#    "hidden"  — handler is registered but intentionally absent from
+#                both menus (e.g. /start — Telegram's own implicit entry
+#                point; /schedules — a bare alias for /schedule)
+#  aliases: extra command names that route to the SAME handler, never
+#           shown in the menu themselves (only the primary name is).
+# ============================================================
+
+@dataclass(frozen=True)
+class _CommandSpec:
+    name: str
+    description: str
+    handler: Callable
+    scope: str = "default"  # "default" | "owner" | "hidden"
+    aliases: tuple[str, ...] = ()
+
+
+COMMAND_REGISTRY: list[_CommandSpec] = [
+    _CommandSpec("start", "Start / welcome", cmd_start, scope="hidden"),
+    _CommandSpec("help", "Show all commands", cmd_help),
+    _CommandSpec("ping", "Status check", cmd_ping),
+    _CommandSpec("menu", "Open the control panel", cmd_menu),
+    _CommandSpec("cancel", "Stop a running request", cmd_cancel),
+    _CommandSpec("new", "Start a new session", cmd_new),
+    _CommandSpec("sessions", "List your sessions", cmd_sessions),
+    _CommandSpec("switch", "Switch session", cmd_switch),
+    _CommandSpec("end", "End the current session", cmd_end),
+    _CommandSpec("model", "Select the AI model", cmd_model),
+    _CommandSpec("settings", "Bot settings", cmd_settings),
+    _CommandSpec("brain", "Inbox stats", cmd_brain),
+    _CommandSpec("memory", "MEMORY.md, journal, recent memory commits", cmd_memory, scope="owner"),
+    _CommandSpec("schedule", "Add / manage scheduled jobs", cmd_schedule, aliases=("schedules",)),
+    _CommandSpec("browse", "Browser control (/browse <url>)", cmd_browse),
+    _CommandSpec("adduser", "Add an admin", cmd_adduser, scope="owner"),
+    _CommandSpec("removeuser", "Remove an admin", cmd_removeuser, scope="owner"),
+    _CommandSpec("listusers", "Manage admins", cmd_listusers, scope="owner"),
 ]
 
 
 async def _register_commands(application):
     """Push the slash-command list to Telegram (best effort; never blocks)."""
     try:
-        base = [BotCommand(c, d) for c, d in _BASE_COMMANDS]
-        await application.bot.set_my_commands(base, scope=BotCommandScopeDefault())
+        default_cmds = [BotCommand(c.name, c.description) for c in COMMAND_REGISTRY if c.scope == "default"]
+        await application.bot.set_my_commands(default_cmds, scope=BotCommandScopeDefault())
         if OWNER_CHAT_ID:
-            owner_cmds = [BotCommand(c, d) for c, d in (_BASE_COMMANDS + _OWNER_COMMANDS)]
+            owner_cmds = [BotCommand(c.name, c.description) for c in COMMAND_REGISTRY if c.scope in ("default", "owner")]
             await application.bot.set_my_commands(
                 owner_cmds, scope=BotCommandScopeChat(chat_id=OWNER_CHAT_ID),
             )
@@ -3008,26 +3039,11 @@ def main():
     # Auth gate — runs before ALL handlers
     app.add_handler(TypeHandler(Update, auth_middleware), group=-1)
 
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("new", cmd_new))
-    app.add_handler(CommandHandler("sessions", cmd_sessions))
-    app.add_handler(CommandHandler("switch", cmd_switch))
-    app.add_handler(CommandHandler("end", cmd_end))
-    app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("brain", cmd_brain))
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("schedule", cmd_schedule))
-    app.add_handler(CommandHandler("schedules", cmd_schedule))
-    app.add_handler(CommandHandler("browse", cmd_browse))
-    app.add_handler(CommandHandler("adduser", cmd_adduser))
-    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
-    app.add_handler(CommandHandler("listusers", cmd_listusers))
+    # Commands — every entry (+ aliases) from COMMAND_REGISTRY, the single
+    # source of truth for handler↔menu mapping (PLAN.md §17/F2).
+    for spec in COMMAND_REGISTRY:
+        for name in (spec.name, *spec.aliases):
+            app.add_handler(CommandHandler(name, spec.handler))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))

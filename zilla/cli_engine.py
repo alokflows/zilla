@@ -414,45 +414,24 @@ def get_selected_model() -> str | None:
 def backend_status() -> dict:
     """Normalized identity/health of the ACTIVE backend, for the model/menu
     panels. Honest: reports not-installed / not-logged-in instead of pretending.
-    Keys: backend, label, installed, logged_in, account, plan, model, error."""
-    import os as _os
-    from zilla.config import get_backend, get_model, CLAUDE_PATH, CLI_PATH, AGY_SETTINGS_FILE
+    Keys: backend, label, installed, logged_in, account, plan, model, error.
+    Delegates to the backend's own adapter (PLAN.md §17/F2) — adding a
+    backend never means editing this function again."""
+    from zilla.config import get_backend
+    from zilla.backend_registry import get as get_adapter
     b = get_backend()
-    if b == "claude":
-        from zilla.backends import claude_identity
-        ident = claude_identity()
+    adapter = get_adapter(b)
+    if adapter is None:
         return {
-            "backend": "claude",
-            "label": "Claude Code (Anthropic)",
-            "installed": _os.path.exists(CLAUDE_PATH),
-            "logged_in": bool(ident.get("loggedIn")),
-            "account": ident.get("email") or ident.get("orgName"),
-            "plan": ident.get("subscriptionType"),
-            "auth_method": ident.get("authMethod"),
-            "model": get_model(),
-            "error": ident.get("error"),
+            "backend": b, "label": b, "installed": False, "logged_in": False,
+            "account": None, "plan": None, "auth_method": None,
+            "model": None, "error": f"unknown backend '{b}'",
         }
-    # agy has no whoami command + auth lives in the Keychain, so "logged in" is
-    # inferred honestly from whether `agy models` returns real data (it needs auth).
-    from zilla.config import agy_reachable
-    installed = _os.path.exists(CLI_PATH)
-    reachable = agy_reachable() if installed else False
-    err = None
-    if not installed:
-        err = "agy not installed on this machine"
-    elif not reachable:
-        err = "agy installed but not responding — may be logged out (Google OAuth)"
-    return {
-        "backend": "agy",
-        "label": "Antigravity CLI (Gemini)",
-        "installed": installed,
-        "logged_in": reachable,
-        "account": None,                 # agy CLI exposes no account identity
-        "plan": None,
-        "auth_method": "Google OAuth" if installed else None,
-        "model": get_model() if installed else None,
-        "error": err,
-    }
+    data = adapter.identity(False)
+    data["backend"] = adapter.name
+    data["label"] = adapter.label
+    data["installed"] = bool(adapter.binary())
+    return data
 
 
 # Signals that the current model is rate-limited / unavailable. Matched
@@ -849,18 +828,15 @@ def run_cli(
 
 def _dispatch_turn(backend, prompt, conversation_id, progress_callback, cancel_event,
                    skip_permissions, use_browser=False, ctx=None):
-    """Run exactly one turn against the chosen backend. Returns (response, conv)."""
-    if backend == "claude":
-        from zilla.backends import run_claude
-        return run_claude(
-            prompt, conversation_id,
-            progress_callback=progress_callback, cancel_event=cancel_event,
-            skip_permissions=skip_permissions, model=get_model(),
-            use_browser=use_browser, ctx=ctx,
-        )
-    # default: agy (PTY + transcript)
-    return run_cli(prompt, conversation_id, progress_callback, cancel_event,
-                   skip_permissions, ctx=ctx)
+    """Run exactly one turn against the chosen backend. Returns (response, conv).
+    Picks the adapter's own dispatch() from the registry (PLAN.md §17/F2) —
+    agy is the fallback only if the configured backend isn't registered."""
+    from zilla.backend_registry import get as get_adapter
+    adapter = get_adapter(backend) or get_adapter("agy")
+    return adapter.dispatch(
+        prompt, conversation_id, progress_callback, cancel_event,
+        skip_permissions, use_browser=use_browser, ctx=ctx,
+    )
 
 
 def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip_permissions, ctx=None):
