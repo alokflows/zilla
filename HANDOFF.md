@@ -380,9 +380,13 @@ the owner screenshotted: `/schedules` never shows `system=1` rows anymore
 jobs no longer broadcast their full raw response — only an explicit
 `OWNER_ALERT:` line goes out as a DM, cooldown-gated via H2's
 `should_alert`/`mark_alerted`.
-**NEXT UNIT OF WORK: K1-K4 (graph memory)** — PLAN.md's phase order.
-THEN U1-U4, H4, B1-B2, THEN the existing R1→...→V1-V3 tail
-(unchanged). Full test gate before and after every step — the gate is now
+**NEXT UNIT OF WORK: F5 (conversational schedule access, new
+2026-07-18, owner-requested — small, only depends on M1's schedules.py,
+no reason to block on K), THEN K1-K4 (graph memory), THEN K5 (team
+relay, new 2026-07-18, owner-requested — depends on K2's alias
+resolution)** — PLAN.md's phase order. THEN U1-U4, H4, B1-B2, THEN the
+existing R1→...→V1-V3 tail (unchanged). Full test gate before and after
+every step — the gate is now
 15 files: test_fixes/test_interactive/test_core/test_schedules_seam/
 test_review/test_tui/test_zilla_cli/test_memory_m3/test_memory_m4/
 test_harness/test_health/test_heartbeat/test_quickfix/test_service/
@@ -495,7 +499,9 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **F2** Dynamic backend registry — no hard-coded backend buttons, includes slash-command registry (PLAN §17). DONE 2026-07-18. 950 green. See session log below for full detail.
 - [x] **F3** Media importance + retention controls (PLAN §17). DONE 2026-07-18. 980 green (full 15-file gate, freshly recounted — see note above). Built the retention-sweep mechanism itself (H1.4b) as a prerequisite it turned out was never actually shipped. See session log below for full detail.
 - [x] **F4** System jobs invisible + silent — fixes the live heartbeat noise the owner screenshotted (PLAN §17). DONE 2026-07-18. 1000 green (full 15-file gate). See session log below for full detail.
+- [ ] **F5** Conversational schedule access (`schedule_query.py` — agent answers "what's scheduled" in plain language, no menu tap required; PLAN §17) — owner-requested 2026-07-18.
 - [ ] **K1-K4** Relational graph memory (PLAN §6): schema+indexer, entity linking, curiosity loop, /graph views.
+- [ ] **K5** Team relay: delegated send & scheduling ("tell Priya X" / "remind Rahul every Monday") — owner-requested 2026-07-18, always-confirm policy (PLAN §6).
 - [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card.
 - [ ] **H4** Self-update with doctor-gated rollback (PLAN §8).
 - [ ] **B1-B2** Background task lane + /tasks; incognito sessions (PLAN §9).
@@ -587,6 +593,24 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
   symbols" in the menus is exactly PLAN.md's U3 (Design System /
   STYLE.md) scope — already planned, no new spec needed, executes in
   its existing phase slot.
+- **User-count question, answered 2026-07-18 pm (context for future
+  sessions, no code change from this alone):** there is no hard cap on
+  rows in `users`, but three real ceilings exist before a row-count
+  ever matters — (1) every `admin` is unattended, un-sandboxed code
+  execution on the host (`zilla/users.py`'s own docstring: agy/claude
+  run tools in headless mode regardless of permission flags), so
+  "add 20-30 people" means 20-30 people with effective shell access,
+  not a team tier; (2) `cli_engine.py`'s `ThreadPoolExecutor(max_workers=4)`
+  is GLOBAL, not per-user — a 5th simultaneous request queues with zero
+  visible feedback (`_pool_semaphore` is declared but never read for
+  that purpose — a real gap, not yet ticketed as its own phase item,
+  revisit if team-relay (K5) traffic makes queuing visible in practice);
+  (3) the whole memory/graph system is single-owner by design (§4 scope
+  guard) — a "team member" gets zero personalization, by design, not by
+  oversight. What the owner actually wanted from "manage a team" was
+  **delegation** (owner's Zilla reaches other people on the owner's
+  behalf), not multi-tenant memory — that's K5 above, not a re-open of
+  P1's single-owner architecture.
 
 - **Latency is the owner's #1 complaint** — every turn pays a full CLI call
   (17s–2m34s observed live). The P1.5 orchestration router is the fix.
