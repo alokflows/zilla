@@ -134,6 +134,21 @@ def _append_to_journal(text: str) -> str:
     return "📝 Noted."
 
 
+def _quiet_heartbeat_suppressed(s: dict, response: str) -> bool:
+    """Phase M3.4: a system=1 schedule (H1's heartbeat beat, M4's nightly
+    distillation — never a user's own schedule) whose response is or ends
+    with a line reading exactly HEARTBEAT_OK (case-insensitive) delivers
+    nothing; the tick still counts as a success, just quietly. A user
+    schedule is never suppressed, even if its own legitimate output happens
+    to end with that exact token — the `system` gate gets checked first."""
+    if not s.get("system"):
+        return False
+    stripped = (response or "").rstrip()
+    if not stripped:
+        return False
+    return stripped.splitlines()[-1].strip().casefold() == "heartbeat_ok"
+
+
 # ══════════════════════════════════════════════════════════
 #  EVENTS — the one vocabulary every frontend speaks
 #  (docs/dev/CORE_API.md). Turn events stream from
@@ -398,6 +413,18 @@ class ZillaCore:
         # "no special-case, run the schedule normally."
         self.schedule_pre_run = None
 
+        # Phase M3.3: git-autocommit Memory/ after a turn/scheduled run that
+        # changed it. Defaults OFF (unlike every other seam here, which is
+        # safe-by-construction) because test_schedules_seam.py is a frozen
+        # acceptance spec that constructs ZillaCore directly and calls
+        # _run_and_record/run_schedule_now WITHOUT isolating zilla.memory's
+        # MEMORY_DIR — turning this on unconditionally would make running
+        # that file `git init`/commit into the real repo's Memory/ tree.
+        # bot.py's real startup sets this True right after construction; every
+        # test (including the ones this session adds for M3 itself) opts in
+        # explicitly against an isolated MEMORY_DIR instead.
+        self.memory_autocommit_enabled = False
+
         self._sched_task: asyncio.Task | None = None
 
         # Recursion guard: uids whose CURRENT turn was started by a schedule.
@@ -636,6 +663,7 @@ class ZillaCore:
             log_event("route", route="share", user=user_id)
             yield Response(text=ack, files=(),
                            meta={"session": None, "conv_id": None, "canceled": False})
+            await self._autocommit_memory(f"journal entry — uid {user_id}")
             return
 
         if route == "smalltalk":
@@ -753,6 +781,7 @@ class ZillaCore:
                 meta={"session": sname, "conv_id": final_conv,
                       "canceled": cancel_event.is_set()},
             )
+            await self._autocommit_memory(f"chat turn — uid {user_id}")
         finally:
             if self._active_cancel.get(key) is cancel_event:
                 self._active_cancel.pop(key, None)
@@ -846,6 +875,17 @@ class ZillaCore:
         if mode == "main":
             return "main"
         return None  # "isolated" (or any unrecognized mode, safest default)
+
+    async def _autocommit_memory(self, context: str) -> None:
+        """Phase M3.3: git-commit Memory/ if this turn/run changed it. A
+        no-op unless memory_autocommit_enabled (see __init__ for why it
+        defaults off). Runs the git subprocess calls off the event loop —
+        memory.git_autocommit() itself never raises, so this can't break a
+        reply/delivery either way."""
+        if not self.memory_autocommit_enabled:
+            return
+        from zilla import memory as _memory
+        await asyncio.to_thread(_memory.git_autocommit, context)
 
     async def _execute_message_schedule(self, s: dict) -> tuple:
         """payload_type == 'message': a full CLI turn, same as a live chat
@@ -985,9 +1025,13 @@ class ZillaCore:
         ok, response, detail, meta = await self._execute_schedule(s)
         if meta.get("pin_mismatch"):
             self._maybe_notify_backend_pin(s)
+        await self._autocommit_memory(f"schedule — {title}"[:80])
         if ok:
             self.schedules.mark_success(sid)
             log_event("schedule_ok", id=sid, title=title[:40])
+            if _quiet_heartbeat_suppressed(s, response):
+                log_event("schedule_quiet", id=sid, title=title[:40])
+                return
             self._broadcast(ScheduledResult(
                 title=title, response=response, chat_id=s["chat_id"], user_id=s["user_id"],
                 schedule_id=sid, session=meta.get("session"), conv_id=meta.get("conv_id"),
@@ -1020,6 +1064,10 @@ class ZillaCore:
         ok, response, detail, meta = await self._execute_schedule(s)
         if meta.get("pin_mismatch"):
             self._maybe_notify_backend_pin(s)
+        await self._autocommit_memory(f"schedule — {s.get('title', '')}"[:80])
+        if ok and _quiet_heartbeat_suppressed(s, response):
+            log_event("schedule_quiet", id=sid, title=s.get("title", "")[:40])
+            return
         text = response if (response and response.strip()) else (detail or "(no output)")
         self._broadcast(ScheduledResult(
             title=s.get("title", ""), response=text, chat_id=s["chat_id"], user_id=s["user_id"],

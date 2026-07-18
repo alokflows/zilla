@@ -220,6 +220,11 @@ def _to_dict(row: dict) -> dict:
         "model": row.get("model"),
         "backend_pin_notified": bool(row.get("backend_pin_notified")),
         "fail_count": row.get("fail_count") or 0,
+        # Phase M3.4: a Zilla-owned job (H1's heartbeat beat, M4's nightly
+        # distillation) vs. a user's own schedule — gates quiet-run
+        # suppression (core._quiet_heartbeat_suppressed): only a system
+        # job's own "HEARTBEAT_OK" ack is ever swallowed.
+        "system": bool(row.get("system")),
     }
 
 
@@ -242,7 +247,8 @@ class ScheduleManager:
             title: str = "", session_name: str | None = None,
             session: str | None = None, payload_type: str = "message",
             backend: str | None = None, model: str | None = None,
-            is_owner: bool = False, now: float | None = None) -> dict | None:
+            is_owner: bool = False, now: float | None = None,
+            system: bool = False) -> dict | None:
         if kind not in VALID_KINDS:
             return None
         if payload_type not in VALID_PAYLOAD_TYPES:
@@ -270,6 +276,7 @@ class ScheduleManager:
             "backend": backend, "model": model,
             "backend_pin_notified": 0,
             "fail_count": 0,
+            "system": 1 if system else 0,
         }
         self._store.schedules_insert(row)
         return _to_dict(row)

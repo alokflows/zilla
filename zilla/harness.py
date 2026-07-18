@@ -330,6 +330,11 @@ def _memory_block(ctx: "TurnContext | None") -> str:
     from zilla import memory as _memory
     from zilla.config import MEMORY_DIR
 
+    # Phase M3: keep the FTS5 search index current before the turn starts —
+    # cheap when nothing changed (mtime+size stat per file), and this is the
+    # one place every owner turn passes through.
+    _memory.reindex()
+
     core_text = _memory.read_core()
     was_template = _memory.is_template(core_text)
     if len(core_text) > _MEMORY_SOFT_CAP:

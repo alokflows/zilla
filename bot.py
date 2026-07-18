@@ -2833,6 +2833,9 @@ def main():
     # settings.json into the shared zilla.db, once, before any manager
     # below touches the store. No-op (all zeros) once already migrated.
     run_first_start_migration()
+    # Phase M3.1: bring the FTS5 search index up to date at boot (cheap —
+    # one stat() per Markdown file, upserts only what changed since last run).
+    memory.reindex()
     sessions = SessionManager(SESSIONS_FILE)
     auth = AuthManager(USERS_FILE, OWNER_CHAT_ID)
     schedules_mgr = ScheduleManager(SCHEDULES_FILE)
@@ -2840,6 +2843,10 @@ def main():
     # migration steps 2 + 3 + 4)
     core = zcore.ZillaCore(sessions=sessions, auth=auth, schedules=schedules_mgr,
                           owner_chat_id=OWNER_CHAT_ID)
+    # Phase M3.3: real production is the only place this turns on — see
+    # ZillaCore.__init__'s comment on memory_autocommit_enabled for why
+    # every test leaves it off.
+    core.memory_autocommit_enabled = True
     keyboards.auth = auth  # the keyboard builders read auth for role-gated menus
 
     model = get_model()

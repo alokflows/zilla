@@ -522,6 +522,12 @@ class Store:
             )
         self._write(_do)
 
+    def mem_seen_all(self) -> list[dict]:
+        """Every indexed path (Phase M3's reindex() diffs this against what's
+        actually on disk to find deletions)."""
+        rows = self._r().execute("SELECT path, mtime, size FROM mem_seen").fetchall()
+        return [dict(row) for row in rows]
+
     # ── introspection (used by install.py --doctor, Phase M1 step 4) ────────
 
     def schema_version(self) -> int | None:

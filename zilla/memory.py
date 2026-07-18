@@ -22,10 +22,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime
 
 from zilla.config import MEMORY_DIR
+
+logger = logging.getLogger(__name__)
 
 WIKI_DIRNAME = "Wiki"
 JOURNAL_DIRNAME = "Journal"
@@ -186,3 +189,147 @@ def append_journal(text: str, date: datetime | None = None,
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"- {d.strftime('%H:%M')} — {text}\n")
     return path
+
+
+# ══════════════════════════════════════════════════════════
+#  SEARCH INDEX  (mem_fts / mem_seen — Phase M3)
+# ══════════════════════════════════════════════════════════
+#  reindex() keeps the SQLite FTS5 index (store.py's mem_fts/mem_seen
+#  tables, seeded by M1) in sync with the Markdown files on disk, diffed
+#  by mtime+size rather than content — a same-second edit that happens to
+#  land at the same byte size is a known, accepted blind spot (a full
+#  content hash would close it but costs a read on every scan for a case
+#  that hasn't mattered in practice). search() is the read side both
+#  memsearch.py and harness.py's memory block (via that script) use.
+
+def reindex(base: str | None = None) -> int:
+    """Scan Memory/**/*.md, diff against mem_seen, upsert changed docs into
+    mem_fts and drop entries for files that no longer exist. Cheap when
+    nothing changed (one stat() per file). Never raises — a broken index
+    must not break a turn or a search. Returns the count of docs (re)indexed."""
+    try:
+        from zilla.config import DB_FILE
+        from zilla import store as _store
+        db = _store.get_store(DB_FILE)
+        mem_dir = _mem_dir(base)
+        on_disk: set[str] = set()
+        touched = 0
+        for dirpath, _dirnames, filenames in os.walk(mem_dir):
+            for name in filenames:
+                if not name.endswith(".md"):
+                    continue
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, mem_dir).replace(os.sep, "/")
+                on_disk.add(rel)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                seen = db.mem_seen_get(rel)
+                if seen and seen["mtime"] == st.st_mtime and seen["size"] == st.st_size:
+                    continue
+                try:
+                    with open(full, "r", encoding="utf-8") as f:
+                        body = f.read()
+                except OSError:
+                    continue
+                title = next(
+                    (ln.lstrip("#").strip() for ln in body.splitlines() if ln.strip()), rel
+                )
+                db.fts_index(rel, title, body)
+                db.mem_seen_set(rel, st.st_mtime, st.st_size)
+                touched += 1
+        for seen_row in db.mem_seen_all():
+            if seen_row["path"] not in on_disk:
+                db.fts_delete(seen_row["path"])
+        return touched
+    except Exception as e:
+        logger.debug(f"[MEMORY] reindex failed: {e}")
+        return 0
+
+
+def _locate(full_path: str, query: str, fallback_snippet: str) -> tuple[int, str]:
+    """FTS5 ranks matches but carries no line numbers — find the first line
+    containing a query word and return it plus the line after it as a
+    2-line snippet. Falls back to line 1 + the FTS-generated snippet if the
+    file can't be read or no line matches (tokenization/stemming means a
+    literal substring scan sometimes won't line up with the FTS hit)."""
+    words = [w.lower() for w in query.split() if w]
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return (1, fallback_snippet)
+    for i, line in enumerate(lines):
+        if any(w in line.lower() for w in words):
+            snippet = "\n".join(ln.rstrip("\n") for ln in lines[i:i + 2])
+            return (i + 1, snippet or fallback_snippet)
+    return (1, fallback_snippet)
+
+
+def search(query: str, base: str | None = None, limit: int = 8) -> list[tuple[str, int, str]]:
+    """Full-text search over Memory/**/*.md (reindexes first, so results
+    reflect the latest edits — reindex is cheap when nothing changed).
+    Returns up to `limit` (relpath, line, 2-line snippet) tuples, best
+    match first. [] on no results or on any failure — a broken search
+    degrades to 'nothing found', not a crash."""
+    try:
+        reindex(base)
+        from zilla.config import DB_FILE
+        from zilla import store as _store
+        db = _store.get_store(DB_FILE)
+        rows = db.fts_search(query, limit=limit)
+        mem_dir = _mem_dir(base)
+        results = []
+        for row in rows:
+            full = os.path.join(mem_dir, row["path"])
+            line, snippet = _locate(full, query, row.get("snippet") or "")
+            results.append((row["path"], line, snippet))
+        return results
+    except Exception as e:
+        logger.debug(f"[MEMORY] search failed: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════
+#  GIT HISTORY  (Phase M3)
+# ══════════════════════════════════════════════════════════
+#  Memory/ is its own git repo, one commit per turn/scheduled run that
+#  actually changed something — the corruption/mistake recovery story for
+#  the owner's knowledge, and (from M4 on) what `/memory diff` reads.
+#  Zilla is the only writer, so a plain local repo with no remote is enough.
+
+def git_autocommit(context: str, base: str | None = None) -> bool:
+    """If Memory/ has uncommitted changes, `git add -A && git commit`.
+    Initializes the repo on first call if absent (author "Zilla
+    <zilla@local>", .git locked to 0700). Never raises — memory bookkeeping
+    must not be able to break a reply; any failure (git missing, a locked
+    file, disk full) is logged and swallowed. Returns True iff a commit was
+    actually made."""
+    import subprocess
+    mem_dir = _mem_dir(base)
+    git_dir = os.path.join(mem_dir, ".git")
+    try:
+        if not os.path.isdir(mem_dir):
+            return False
+        if not os.path.isdir(git_dir):
+            subprocess.run(["git", "init"], cwd=mem_dir,
+                           capture_output=True, text=True, timeout=10)
+            subprocess.run(["git", "config", "user.name", "Zilla"], cwd=mem_dir,
+                           capture_output=True, text=True, timeout=10)
+            subprocess.run(["git", "config", "user.email", "zilla@local"], cwd=mem_dir,
+                           capture_output=True, text=True, timeout=10)
+            if os.path.isdir(git_dir):
+                os.chmod(git_dir, 0o700)
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=mem_dir,
+                                capture_output=True, text=True, timeout=10)
+        if status.returncode != 0 or not status.stdout.strip():
+            return False
+        subprocess.run(["git", "add", "-A"], cwd=mem_dir,
+                       capture_output=True, text=True, timeout=10)
+        commit = subprocess.run(["git", "commit", "-m", context], cwd=mem_dir,
+                                capture_output=True, text=True, timeout=10)
+        return commit.returncode == 0
+    except Exception as e:
+        logger.debug(f"[MEMORY] git_autocommit failed: {e}")
+        return False
