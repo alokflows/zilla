@@ -331,22 +331,12 @@ todo list anymore.
 > LIGHT (owner decree 2026-07-17): current state, one line per session,
 > only notes a future session actually needs. History lives in git log.
 
-**NEXT STEP FOR THE NEXT SESSION, READ THIS FIRST (2026-07-19):** K4 is the
-last phase actually landed in code (commit `dd103f2`). **K5 (Team relay —
-PLAN.md §6/K5) is next, not U.** A session on 2026-07-19 confirmed the test
-gate green (19/19 `test_*.py` files pass under `.venv` — always
-`source .venv/bin/activate` first, plain `python3 test_x.py` fails with
-`ModuleNotFoundError: No module named 'telegram'` outside the venv, that is
-an environment gap not a code regression) and dispatched a research-only
-subagent to map K5's prerequisites (marker-parsing convention, confirm-card
-flow, alias resolution, `ScheduleManager.add`, `safe_send`, `auth_middleware`)
-but stopped BEFORE writing any K5 code — the owner hit their usage limit.
-**No K5 code exists yet, nothing is half-built** — the tree at this commit
-is exactly K4-complete, clean, and pushed to `origin/main`. Start K5 from
-PLAN.md §6/K5 fresh, normal protocol (build → verify → commit → relay).
-**Phase order after K5: U1-U4 next, with a special owner instruction
-attached to the U checklist item below (read it before finishing U) — that
-special handling does NOT apply to K5.**
+**Always `source .venv/bin/activate` before running tests** — plain
+`python3` fails on a missing `telegram` import (env gap, not a code
+regression). Next step = first unchecked item in the Checklist below
+(currently **K5**; see `docs/dev/K5_RESEARCH_NOTES.md` for prerequisite
+research already done). U-phase has a one-time owner instruction — see its
+checklist line, don't apply it to K5.
 
 **Current phase:** Phase 1 + P1.5 + P2 (entrypoint, TUI) are **DONE and
 merged** on this branch — that shipped, tested, live-running code is not
@@ -633,19 +623,7 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **K3** Curiosity loop (PLAN §6/K3) — DONE 2026-07-19. 1105 green (18-file gate + `test_memory_k3.py`'s 27). See session log below.
 - [x] **K4** Graph views (`/graph` HTML export + TUI Graph screen, PLAN §6/K4) — DONE 2026-07-19. 1142 green (19-file gate + `test_memory_k4.py`'s 35). See session log below.
 - [ ] **K5** Team relay: delegated send & scheduling ("tell Priya X" / "remind Rahul every Monday") — owner-requested 2026-07-18, always-confirm policy (PLAN §6).
-- [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card.
-  **OWNER DECREE 2026-07-19: special handling for Phase U only — DOES NOT
-  APPLY to K5 or any other phase.** When U1-U4 are all checked off and the
-  full test gate is green: (1) do NOT relay to a new session per the usual
-  §1 protocol — stay in this session and pause; (2) before pausing, polish
-  Phase U's own work ("make it perfect" — owner's words) rather than moving
-  on; (3) then run the `/ponytail-audit` skill over the WHOLE project (not
-  just the U-phase diff) and (4) give the owner a plain-language summary of
-  that audit's findings as your final message, then stop and wait for the
-  owner — no further phase work, no relay, until the owner responds. If a
-  session other than this one is the one that lands the final U checkbox
-  (serial relay chain), THAT session must carry out this note instead —
-  it is written here so it survives the handoff.
+- [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card. **Owner decree 2026-07-19 (U only, not K5 or any other phase): when U1-U4 are done and tests are green, don't relay — polish U, then run `/ponytail-audit` on the whole project, summarize it to the owner, and stop.**
 - [ ] **H4** Self-update with doctor-gated rollback (PLAN §8).
 - [ ] **B1-B2** Background task lane + /tasks; incognito sessions (PLAN §9).
 - [ ] **R1** Triage router refinement — MOSTLY DONE via `zilla/review.py` (P1.5 above); confirm against PLAN.md's exact spec before marking done, don't rebuild.
@@ -663,7 +641,7 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 
 | Date | What shipped |
 |---|---|
-| 2026-07-19 | Confirmed test gate green (19/19, `.venv` required — plain `python3` fails with a missing `telegram` module, environment gap not a regression). Dispatched a research-only subagent to map K5 prerequisites, then stopped before writing any K5 code — owner hit their usage limit and asked to wrap up cleanly instead of leaving partial work. Nothing built this session; tree is unchanged K4-complete, pushed to `origin/main`. Added the "NEXT STEP" pointer at the top of this status board and the Phase-U owner-decree note (special stop-and-audit handling for U only, does not apply to K5) so both survive to whichever session/machine picks this up next. |
+| 2026-07-19 | Test gate confirmed green (19/19). Stopped before K5 code (owner hit usage limit) — research saved to `docs/dev/K5_RESEARCH_NOTES.md`, no code changed. |
 | 2026-07-16 | Full codebase analysis + this handoff; Phase 0 findings (`docs/dev/PHASE0_FINDINGS.md`); modules moved into `zilla/` package with shims. |
 | 2026-07-16 | Turn-pipeline seam → `core.handle_message` (+`test_core.py`); scheduler seam Parts A+B → payload types, session modes, backend pins, retry ladder (+frozen `test_schedules_seam.py`). |
 | 2026-07-16 night | Live smoke: text/photo/doc/cancel ✅; `safe_send` 4× retry + raised PTB timeouts; voice fixed (`brew install flac` on Apple Silicon — add a doctor check in P2); reminder parser broadened; one-off reminders instant, `system_event` payloads (zero model call at fire), exact-time scheduler tick. |
