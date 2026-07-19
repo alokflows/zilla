@@ -288,8 +288,12 @@ def test_injection_line_cap():
 
         owner_ctx = TurnContext(uid=111, role="owner", is_owner=True)
         wrapped = wrap_prompt("what's up with Hub", is_new=False, ctx=owner_ctx)
-        # Isolate just the graph card block for a clean line count.
-        card = wrapped.split("[via graph]", 1)[1].split("\n\nUSER MESSAGE", 1)[0]
+        # Isolate just the graph card block for a clean line count — it ends
+        # at the next block boundary, which since Phase K3 may be the
+        # curiosity block (also owner-only) rather than always USER MESSAGE.
+        after_header = wrapped.split("[via graph]", 1)[1]
+        end_markers = [m for m in ("\n\n[curiosity]", "\n\nUSER MESSAGE") if m in after_header]
+        card = after_header[:min(after_header.index(m) for m in end_markers)]
         card_lines = card.strip("\n").split("\n")
         check("card line count respects the cap",
               len(card_lines) <= 25, len(card_lines))

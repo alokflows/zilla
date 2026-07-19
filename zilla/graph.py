@@ -72,15 +72,20 @@ def _parse_dates(paren: str | None) -> tuple[str | None, str | None]:
 
 
 def parse_entity_page(text: str) -> dict:
-    """Pure parser: entity page text -> {title, bio, type, aliases,
+    """Pure parser: entity page text -> {title, bio, type, aliases, attrs,
     relations: [{verb, target, valid_from, valid_to, line}], mentions:
-    [{target, line}]}. Never raises on unknown verbs or malformed dates —
-    the indexer must never fail on owner/agent-authored Markdown."""
+    [{target, line}]}. `attrs` is every "- key:: value" line seen before
+    "## Relations" (lowercased key -> raw value, including type/aliases
+    themselves) — K3's gap detection needs to know which plain attributes
+    (e.g. "contact::") a page does or doesn't carry; nothing else in the
+    parse result records that. Never raises on unknown verbs or malformed
+    dates — the indexer must never fail on owner/agent-authored Markdown."""
     lines = text.splitlines()
     title = lines[0].lstrip("#").strip() if lines and lines[0].strip() else ""
     bio = ""
     type_: str | None = None
     aliases: list[str] = []
+    attrs: dict[str, str] = {}
     relations: list[dict] = []
     mentions: list[dict] = []
     in_relations = False
@@ -118,6 +123,7 @@ def parse_entity_page(text: str) -> dict:
             key, value = m.groups()
             key_l = key.strip().lower()
             value = value.strip()
+            attrs[key_l] = value
             if key_l == "type":
                 type_ = value.lower()
             elif key_l == "aliases":
@@ -131,8 +137,54 @@ def parse_entity_page(text: str) -> dict:
 
     return {
         "title": title, "bio": bio, "type": type_, "aliases": aliases,
-        "relations": relations, "mentions": mentions,
+        "attrs": attrs, "relations": relations, "mentions": mentions,
     }
+
+
+# ══════════════════════════════════════════════════════════
+#  CURIOSITY GAP DETECTION — zero-AI, deterministic (PLAN.md §6.K3)
+# ══════════════════════════════════════════════════════════
+#  Two families: structural gaps on a REAL page's own declared type/attrs/
+#  relations (checked every time that page is (re)indexed, in index_page),
+#  and ghost-node gaps that only make sense graph-wide (checked once per
+#  full reindex_graph pass, after every page has landed). Both funnel into
+#  the same curiosity table via Store.curiosity_sync_node — the harness
+#  (K3 step 2) never does detection itself, only reads what's already there.
+
+GAP_NO_CONTACT = "no_contact"
+GAP_NO_LOCATED_IN = "no_located_in"
+GAP_GHOST_MULTI_REF = "ghost_multi_ref"
+
+_GHOST_MULTI_REF_THRESHOLD = 2
+
+
+def _structural_gaps(type_: str | None, attrs: dict, relations: list[dict]) -> list[str]:
+    """Gaps derivable from one page's own parsed content: a person with no
+    `contact::` attribute; an org/place with no `located_in::` relation."""
+    t = (type_ or "").lower()
+    gaps: list[str] = []
+    if t == "person" and not attrs.get("contact"):
+        gaps.append(GAP_NO_CONTACT)
+    if t in ("org", "place") and not any(r["verb"] == "located_in" for r in relations):
+        gaps.append(GAP_NO_LOCATED_IN)
+    return gaps
+
+
+def _sync_ghost_gaps(db) -> None:
+    """Ghost nodes referenced from >= 2 distinct pages get GAP_GHOST_MULTI_REF;
+    everything else (including ghosts with 0-1 references, and any node that
+    was promoted/demoted since the last pass) gets that gap cleared. Must run
+    AFTER the full page walk so promotions/demotions have already landed."""
+    ghosts = [n for n in db.graph_nodes_all() if n["is_ghost"]]
+    if not ghosts:
+        return
+    referrers: dict[int, set[int]] = {}
+    for e in db.graph_edges_all(history=True):
+        referrers.setdefault(e["dst"], set()).add(e["src"])
+    for node in ghosts:
+        refs = referrers.get(node["id"], set())
+        gaps = [GAP_GHOST_MULTI_REF] if len(refs) >= _GHOST_MULTI_REF_THRESHOLD else []
+        db.curiosity_sync_node(node["id"], gaps)
 
 
 # ══════════════════════════════════════════════════════════
@@ -191,6 +243,8 @@ def index_page(db, path: str, text: str) -> int:
             "provenance": f"{path}:{mention['line']}",
         })
     db.graph_edges_replace_for_path(path, edges)
+    db.curiosity_sync_node(node_id, _structural_gaps(parsed["type"], parsed["attrs"],
+                                                       parsed["relations"]))
     return node_id
 
 
@@ -236,6 +290,7 @@ def reindex_graph(db, mem_dir: str) -> int:
     indexed_paths = {n["path"] for n in db.graph_nodes_all() if n["path"] is not None}
     for stale in indexed_paths - on_disk:
         remove_page(db, stale)
+    _sync_ghost_gaps(db)
     return touched
 
 
@@ -487,3 +542,60 @@ def local_card_lines(db, node: dict, *, hops: int = 1) -> list[str]:
             hit_label = hit["node"]["title"] or "(untitled)"
             lines.append(f"    {arrow} {hit['rel']} {arrow} {hit_label}{dates}")
     return lines
+
+
+# ══════════════════════════════════════════════════════════
+#  TURN-TIME CURIOSITY  (harness.py's owner-turn injection, PLAN.md §6.K3)
+# ══════════════════════════════════════════════════════════
+#  Enforcement is code, not model judgment: at most ONE gap is ever
+#  surfaced per turn, and only for a node this turn's own alias_scan()
+#  already activated (the same relevance gate K2 uses for the graph
+#  card) — never a cold trawl of the whole curiosity table.
+
+_GAP_QUESTION_TEXT = {
+    GAP_NO_CONTACT: "we don't have their contact info saved yet",
+    GAP_NO_LOCATED_IN: "we don't have its location saved yet",
+    GAP_GHOST_MULTI_REF: "it's mentioned on multiple pages but has no page of its own yet",
+}
+
+_CURIOSITY_COOLDOWN_DAYS = 7
+
+
+def pending_curiosity(db, hits: list[dict], *, now: str | None = None) -> dict | None:
+    """Given this turn's alias_scan() hits (strongest match first), the one
+    gap Zilla may permit the model to ask about — the first hit (in hit
+    order) carrying an unasked-or-cooled-down gap. Marks it asked_at=now as
+    a side effect, so the same gap won't surface again for
+    `_CURIOSITY_COOLDOWN_DAYS` — the single mechanism that both keeps a
+    conversation to one question and honors the 7-day cooldown for an
+    unanswered one. Returns {"node", "gap", "question"} or None if no hit
+    has anything pending. Never raises; a broken read just means no
+    question gets asked this turn."""
+    if not hits:
+        return None
+    try:
+        from datetime import datetime, timedelta
+        now = now or datetime.now().isoformat(timespec="seconds")
+        cutoff = (
+            datetime.fromisoformat(now) - timedelta(days=_CURIOSITY_COOLDOWN_DAYS)
+        ).isoformat(timespec="seconds")
+        node_ids = [h["id"] for h in hits]
+        pending = db.curiosity_pending(node_ids, cooldown_before=cutoff)
+        if not pending:
+            return None
+        by_node: dict[int, list[str]] = {}
+        for row in pending:
+            by_node.setdefault(row["node_id"], []).append(row["gap"])
+        for node in hits:
+            gaps = by_node.get(node["id"])
+            if not gaps:
+                continue
+            gap = gaps[0]
+            db.curiosity_mark_asked(node["id"], gap, now)
+            return {
+                "node": node, "gap": gap,
+                "question": _GAP_QUESTION_TEXT.get(gap, "there's missing information"),
+            }
+        return None
+    except Exception:
+        return None

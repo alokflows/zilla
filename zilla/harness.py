@@ -473,25 +473,35 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
 _GRAPH_CARD_MAX_LINES = 25
 
 
-def _graph_block(user_message: str, ctx: "TurnContext | None") -> str:
-    """Deterministic alias scan of `user_message` against the relational
-    graph (zero AI calls). '' for any non-owner turn or ctx=None — same
-    single gate as `_memory_block` (the graph lives under Memory/Wiki, so
-    it is the owner's, never any other principal's). On a hit, returns a
-    compact `[via graph]` card (bio + current edges) per matched entity —
-    up to 3, the single strongest (longest-matched) getting a 2-hop card,
-    the rest 1-hop — capped overall at `_GRAPH_CARD_MAX_LINES` lines so a
-    busy graph can never bloat the prompt."""
+def _graph_hits(user_message: str, ctx: "TurnContext | None"):
+    """Shared alias_scan() call site for both the K2 graph card and the K3
+    curiosity question — same single owner-only gate as `_memory_block` (the
+    graph lives under Memory/Wiki, so it's the owner's, never any other
+    principal's). Returns (db, hits); (None, []) on any gate-closed or
+    error path so both callers degrade to their own no-op."""
     if ctx is None or not ctx.is_owner or not user_message:
-        return ""
+        return None, []
     try:
         from zilla import graph as _graph
         from zilla import store as _store
         from zilla.config import DB_FILE
         db = _store.get_store(DB_FILE)
-        hits = _graph.alias_scan(db, user_message, cap=3)
-        if not hits:
-            return ""
+        return db, _graph.alias_scan(db, user_message, cap=3)
+    except Exception as e:  # a broken graph read must never break a turn
+        logger.debug(f"[HARNESS] graph alias scan failed: {e}")
+        return None, []
+
+
+def _graph_block(db, hits: list[dict]) -> str:
+    """Given this turn's alias_scan() hits, a compact `[via graph]` card
+    (bio + current edges) per matched entity — up to 3, the single
+    strongest (longest-matched) getting a 2-hop card, the rest 1-hop —
+    capped overall at `_GRAPH_CARD_MAX_LINES` lines so a busy graph can
+    never bloat the prompt. '' if there are no hits."""
+    if db is None or not hits:
+        return ""
+    try:
+        from zilla import graph as _graph
         lines = ["[via graph]"]
         for i, node in enumerate(hits):
             lines.extend(_graph.local_card_lines(db, node, hops=2 if i == 0 else 1))
@@ -500,6 +510,34 @@ def _graph_block(user_message: str, ctx: "TurnContext | None") -> str:
         return "\n".join(lines)
     except Exception as e:  # a broken graph read must never break a turn
         logger.debug(f"[HARNESS] graph card failed: {e}")
+        return ""
+
+
+def _curiosity_block(db, hits: list[dict]) -> str:
+    """Given this turn's alias_scan() hits, AT MOST ONE permission-to-ask
+    line for a deterministically-detected knowledge gap (PLAN.md §6.K3) —
+    never a question Zilla writes itself, only the permission; phrasing is
+    the model's. Relevance-gated: only a node this turn's own alias scan
+    already activated is eligible (zilla.graph.pending_curiosity enforces
+    the gate, the cooldown, and the one-pick side effect). '' if nothing
+    is pending, ctx is non-owner, or the graph read fails."""
+    if db is None or not hits:
+        return ""
+    try:
+        from zilla import graph as _graph
+        pick = _graph.pending_curiosity(db, hits)
+        if pick is None:
+            return ""
+        title = pick["node"]["title"] or "this"
+        return (
+            "[curiosity]\n"
+            f"You may ask the owner ONE brief, natural question this turn about "
+            f"{title}: {pick['question']}. Only ask if it fits naturally in your "
+            "reply — skip silently otherwise. This is a one-time permission, not "
+            "an instruction to always ask."
+        )
+    except Exception as e:  # a broken graph read must never break a turn
+        logger.debug(f"[HARNESS] curiosity block failed: {e}")
         return ""
 
 
@@ -540,9 +578,12 @@ def wrap_prompt(user_message: str, *, is_new: bool, backend: str | None = None,
     # the task is complex (simple tasks stay lean = fast).
     from zilla.autoharness import plan_directive
     directive = plan_directive(user_message)
-    # Phase K2: deterministic alias scan -> local graph card (owner-only).
-    graph_block = _graph_block(user_message, ctx)
-    blocks = [b for b in (preamble, directive, graph_block) if b]
+    # Phase K2/K3: one deterministic alias scan feeds both the local graph
+    # card and the (at most one) curiosity permission line, owner-only.
+    _db, _hits = _graph_hits(user_message, ctx)
+    graph_block = _graph_block(_db, _hits)
+    curiosity_block = _curiosity_block(_db, _hits)
+    blocks = [b for b in (preamble, directive, graph_block, curiosity_block) if b]
     if not blocks:
         return user_message
     return (

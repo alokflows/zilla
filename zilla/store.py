@@ -114,6 +114,13 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
+CREATE TABLE IF NOT EXISTS curiosity (
+    node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    gap TEXT NOT NULL,
+    asked_at TEXT,
+    PRIMARY KEY (node_id, gap)
+);
+CREATE INDEX IF NOT EXISTS idx_curiosity_node ON curiosity(node_id);
 """
 
 
@@ -698,6 +705,60 @@ class Store:
         return self._r().execute(
             "SELECT COUNT(*) AS n FROM edges WHERE dst=?", (node_id,)
         ).fetchone()["n"]
+
+    # ── curiosity (Phase K3) ──────────────────────────────────────────────
+    # Deterministic gap-detection results, one row per (node, gap kind).
+    # asked_at is the only state that ISN'T re-derivable from the wiki on
+    # the next reindex (it's the cooldown clock) — curiosity_sync_node
+    # diffs against the gap set currently detected for one node so a gap
+    # that's still open keeps its asked_at, and a gap that's been closed
+    # (owner filled in the missing fact) simply disappears.
+
+    def curiosity_sync_node(self, node_id: int, gaps: list[str]) -> None:
+        gap_set = set(gaps)
+
+        def _do(conn):
+            existing = {
+                r["gap"] for r in conn.execute(
+                    "SELECT gap FROM curiosity WHERE node_id=?", (node_id,)
+                ).fetchall()
+            }
+            for gap in gap_set - existing:
+                conn.execute(
+                    "INSERT OR IGNORE INTO curiosity (node_id, gap, asked_at) "
+                    "VALUES (?, ?, NULL)", (node_id, gap),
+                )
+            for gap in existing - gap_set:
+                conn.execute(
+                    "DELETE FROM curiosity WHERE node_id=? AND gap=?", (node_id, gap)
+                )
+        self._write(_do)
+
+    def curiosity_pending(self, node_ids: list[int], *, cooldown_before: str) -> list[dict]:
+        """Rows for `node_ids` that are askable now: never asked, or asked
+        before `cooldown_before` (ISO timestamps sort lexically). []
+        for an empty node_ids list."""
+        if not node_ids:
+            return []
+        placeholders = ",".join("?" for _ in node_ids)
+        rows = self._r().execute(
+            f"SELECT * FROM curiosity WHERE node_id IN ({placeholders}) "
+            f"AND (asked_at IS NULL OR asked_at < ?) ORDER BY node_id",
+            (*node_ids, cooldown_before),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def curiosity_mark_asked(self, node_id: int, gap: str, asked_at: str) -> None:
+        def _do(conn):
+            conn.execute(
+                "UPDATE curiosity SET asked_at=? WHERE node_id=? AND gap=?",
+                (asked_at, node_id, gap),
+            )
+        self._write(_do)
+
+    def curiosity_all(self) -> list[dict]:
+        rows = self._r().execute("SELECT * FROM curiosity").fetchall()
+        return [dict(row) for row in rows]
 
     # ── introspection (used by install.py --doctor, Phase M1 step 4) ────────
 
