@@ -16,6 +16,7 @@ from textual.binding import Binding
 
 from zilla.tui.core_setup import build_core, cli_hint
 from zilla.tui.screens.chat import ChatScreen
+from zilla.tui.screens.graph import GraphScreen
 from zilla.tui.screens.health import HealthScreen
 from zilla.tui.screens.home import HomeScreen
 from zilla.tui.screens.settings import SettingsScreen
@@ -25,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 class ZillaApp(App):
-    """Home -> Chat -> Settings -> Skills -> Health, switched with the
-    F-keys; q/ctrl+c quits cleanly (stops the core's background tasks
+    """Home -> Chat -> Settings -> Skills -> Health -> Graph, switched with
+    the F-keys; q/ctrl+c quits cleanly (stops the core's background tasks
     first, so no bridge-watcher/scheduler task is left dangling)."""
 
     CSS_PATH = "app.tcss"
@@ -38,6 +39,7 @@ class ZillaApp(App):
         "settings": SettingsScreen,
         "skills": SkillsScreen,
         "health": HealthScreen,
+        "graph": GraphScreen,
     }
 
     BINDINGS = [
@@ -46,6 +48,7 @@ class ZillaApp(App):
         Binding("f3", "goto('settings')", "Settings"),
         Binding("f4", "goto('skills')", "Skills"),
         Binding("f5", "goto('health')", "Health"),
+        Binding("f6", "goto('graph')", "Graph"),
         Binding("q", "quit_app", "Quit", priority=True),
         Binding("ctrl+c", "quit_app", "Quit", priority=True, show=False),
     ]

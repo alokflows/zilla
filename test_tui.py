@@ -46,6 +46,11 @@ os.environ["BACKEND"] = "agy"
 import zilla.config as config  # noqa: E402
 config.SETTINGS_FILE = os.path.join(_tmpdir, "bot_settings.json")
 config._settings_cache = None
+# GraphScreen (zilla.tui.screens.graph) binds config.DB_FILE at import time
+# (same pattern bot.py uses) — must be overridden BEFORE `from zilla.tui.app
+# import ZillaApp` below, or the Graph screen would open the real, live
+# zilla.db on whatever machine runs this test.
+config.DB_FILE = os.path.join(_tmpdir, "zilla_test.db")
 
 import zilla.core as zcore  # noqa: E402
 from zilla.core import ZillaCore  # noqa: E402
@@ -227,7 +232,7 @@ def test_ask_event_renders_and_answers():
 # ── 4. Screens switch via the F-key actions ─────────────────────────
 
 def test_screens_switch():
-    print("\n[4] Screens switch — Home / Chat / Settings / Skills / Health")
+    print("\n[4] Screens switch — Home / Chat / Settings / Skills / Health / Graph")
     core = _fresh_core("switch")
     app = _app(core)
 
@@ -236,7 +241,7 @@ def test_screens_switch():
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             seen.append(app.screen.__class__.__name__)
-            for name in ("chat", "settings", "skills", "health", "home"):
+            for name in ("chat", "settings", "skills", "health", "graph", "home"):
                 if name == "health":
                     with _patched_health():
                         app.action_goto(name)
@@ -250,7 +255,7 @@ def test_screens_switch():
     seen = asyncio.run(run())
     check("visited every screen in order",
           seen == ["HomeScreen", "ChatScreen", "SettingsScreen", "SkillsScreen",
-                   "HealthScreen", "HomeScreen"],
+                   "HealthScreen", "GraphScreen", "HomeScreen"],
           f"got {seen}")
 
 

@@ -78,7 +78,7 @@ from config import (
     DB_FILE, MEMORY_DIR, LOG_DIR, PID_FILE, LOCK_FILE, RUNTIME_DIR,
 )
 from zilla.store import get_store
-from zilla import memory, heartbeat
+from zilla import memory, heartbeat, graph_html
 from sessions import SessionManager
 import zilla.core as zcore
 import zilla.backend_registry as backend_registry
@@ -972,7 +972,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  /removeuser <id> — remove an admin",
             "  /listusers — manage admins",
             "  /memory — MEMORY.md, today's journal, recent memory commits",
-            "  /memory diff — latest memory change\n",
+            "  /memory diff — latest memory change",
+            "  /graph [name] — visual map of what Zilla knows\n",
         ]
     await update.message.reply_text("\n".join(lines))
 
@@ -1157,6 +1158,39 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("Use /memory diff to see the latest change.")
     for chunk in split_message("\n".join(lines)):
         await update.message.reply_text(chunk)
+
+
+async def cmd_graph(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PLAN.md §6.K4: owner-only, self-contained single-file HTML export of
+    the relational graph (zilla/graph_html.py), sent via safe_send_file
+    (must live under OUTBOX_DIR to pass its allowlist). '/graph <name>'
+    opens directly in local view on that node — an unresolvable name just
+    falls back to global view (silent-safe, never an error reply)."""
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not auth.is_owner(uid):
+        await update.message.reply_text("Owner only.")
+        return
+
+    focus = " ".join(context.args).strip() if context.args else None
+    db = get_store(DB_FILE)
+    try:
+        html_text = await asyncio.to_thread(graph_html.render_graph_html, db, focus=focus)
+    except Exception as e:
+        logger.error(f"[GRAPH] render failed: {e}")
+        await update.message.reply_text("Couldn't build the graph view — try again shortly.")
+        return
+
+    os.makedirs(OUTBOX_DOCUMENTS, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(OUTBOX_DOCUMENTS, f"graph_{ts}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html_text)
+
+    caption = f"🕸️ Graph — local view: {focus}" if focus else "🕸️ Graph"
+    ok = await safe_send_file(context.bot, chat_id, path, caption=caption, user_id=uid)
+    if not ok:
+        await update.message.reply_text("Couldn't send the graph file.")
 
 
 # ══════════════════════════════════════════════════════════
@@ -2927,6 +2961,7 @@ COMMAND_REGISTRY: list[_CommandSpec] = [
     _CommandSpec("settings", "Bot settings", cmd_settings),
     _CommandSpec("brain", "Inbox stats", cmd_brain),
     _CommandSpec("memory", "MEMORY.md, journal, recent memory commits", cmd_memory, scope="owner"),
+    _CommandSpec("graph", "Visual map of what Zilla knows (/graph <name> to focus)", cmd_graph, scope="owner"),
     _CommandSpec("schedule", "Add / manage scheduled jobs", cmd_schedule, aliases=("schedules",)),
     _CommandSpec("browse", "Browser control (/browse <url>)", cmd_browse),
     _CommandSpec("adduser", "Add an admin", cmd_adduser, scope="owner"),
