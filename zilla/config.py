@@ -132,6 +132,15 @@ CLAUDE_PATH = os.getenv("CLAUDE_PATH") or _find_exe(
     else os.path.join(HOME_DIR, ".local", "bin", "claude"),
 )
 
+# --- opencode CLI (alternate backend, opencode.ai) ---
+# Open-source, multi-provider — the `opencode/` provider namespace is free,
+# no login required. >>> To point at a different binary, set OPENCODE_PATH. <<<
+OPENCODE_PATH = os.getenv("OPENCODE_PATH") or _find_exe(
+    "opencode",
+    os.path.join(HOME_DIR, ".local", "bin", "opencode.exe") if _IS_WIN
+    else os.path.join(HOME_DIR, ".local", "bin", "opencode"),
+)
+
 # --- Embedded browser (Playwright MCP, Claude backend only) ---
 # The browser is loaded ONLY for web/interactive turns (see autoharness.needs_browser)
 # so simple turns stay fast. We pin an EXACT version instead of "@latest": @latest
@@ -189,7 +198,10 @@ CLAUDE_SKILLS_DIR = os.path.join(HOME_DIR, ".claude", "skills")
 def get_skills_dir(backend: str | None = None) -> str:
     """Skills directory for the given backend (or the active one)."""
     b = (backend or get_backend()).strip().lower()
-    return CLAUDE_SKILLS_DIR if b == "claude" else SKILLS_DIR
+    # opencode has no skills dir of its own; it shares Claude's (both are
+    # general agentic CLIs reading plain-markdown skills, unlike agy's
+    # antigravity-specific format).
+    return CLAUDE_SKILLS_DIR if b in ("claude", "opencode") else SKILLS_DIR
 
 # --- Kimi WebBridge ---
 KIMI_BRIDGE_URL = os.getenv("KIMI_BRIDGE_URL", "http://127.0.0.1:10086")
@@ -435,14 +447,92 @@ CLAUDE_MODELS = [
 ]
 _CLAUDE_MODEL_FALLBACK = "sonnet"
 
+# --- opencode models (free tier, zero login) ----------------
+# `opencode models` prints one "provider/model" id per line, e.g.
+# "opencode/big-pickle" — that raw id is exactly what `opencode run --model`
+# wants back, so (unlike agy) there's no separate display-string format to
+# parse. The `opencode/` namespace is opencode.ai's own free-to-use models;
+# other providers (openai/, anthropic/, ...) would also show up here once
+# `opencode auth login` adds credentials, but we only ship the free ones as
+# the offline fallback.
+OPENCODE_MODELS_FALLBACK = [
+    "opencode/big-pickle",
+    "opencode/deepseek-v4-flash-free",
+    "opencode/hy3-free",
+    "opencode/mimo-v2.5-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/north-mini-code-free",
+]
+_OPENCODE_MODEL_FALLBACK = "opencode/big-pickle"
+
+_opencode_models_cache: dict = {"val": None, "ts": 0.0, "live": False}
+_OPENCODE_MODELS_TTL = 300.0
+
+
+def _run_opencode_models(timeout: float = 8.0) -> str | None:
+    """Raw stdout of `opencode models`, or None on any failure."""
+    try:
+        r = subprocess.run([OPENCODE_PATH, "models"], capture_output=True, text=True,
+                           timeout=timeout)
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return r.stdout
+    except Exception as e:
+        logger.debug(f"[CONFIG] `opencode models` failed: {e}")
+    return None
+
+
+def _parse_opencode_models(raw: str) -> list[str]:
+    """Pull 'provider/model' ids out of `opencode models` output."""
+    out = []
+    for line in (raw or "").splitlines():
+        s = line.strip()
+        if s and "/" in s and " " not in s and s not in out:
+            out.append(s)
+    return out
+
+
+def opencode_models_live(force: bool = False) -> list[str]:
+    """The REAL models opencode offers right now (cached). Falls back to the
+    offline free-tier list if the binary can't be reached."""
+    now = time.time()
+    if (not force and _opencode_models_cache["val"] is not None
+            and now - _opencode_models_cache["ts"] < _OPENCODE_MODELS_TTL):
+        return _opencode_models_cache["val"]
+    parsed = _parse_opencode_models(_run_opencode_models() or "")
+    val = parsed if parsed else list(OPENCODE_MODELS_FALLBACK)
+    _opencode_models_cache.update(val=val, ts=now, live=bool(parsed))
+    return val
+
+
+def opencode_reachable() -> bool:
+    """True if `opencode models` last returned real data (binary present and
+    working). Refreshes the cache if it's empty so the first call is meaningful."""
+    if _opencode_models_cache["val"] is None:
+        opencode_models_live()
+    return bool(_opencode_models_cache.get("live"))
+
+
+def _opencode_label(model_id: str) -> str:
+    """Compact button label from a raw id, e.g. 'opencode/big-pickle' ->
+    'Big Pickle (free)', 'opencode/deepseek-v4-flash-free' -> 'Deepseek V4
+    Flash (free)'. Keeps inline buttons short on a phone."""
+    provider, _, name = model_id.partition("/")
+    name = name or model_id
+    if name.endswith("-free"):
+        name = name[: -len("-free")]
+    label = name.replace("-", " ").replace("_", " ").title()
+    return f"{label} (free)" if provider == "opencode" else f"{label} ({provider})"
+
 
 def get_model_for(backend: str) -> str:
-    """Active model for a GIVEN backend (agy/claude), independent of which
-    backend is currently selected — lets a settings UI show/edit every
+    """Active model for a GIVEN backend (agy/claude/opencode), independent of
+    which backend is currently selected — lets a settings UI show/edit every
     backend's model without switching the active one."""
     b = (backend or "").strip().lower()
     if b == "claude":
         return get_setting("claude_model", _CLAUDE_MODEL_FALLBACK)
+    if b == "opencode":
+        return get_setting("opencode_model", _OPENCODE_MODEL_FALLBACK)
     return _read_agy_settings().get("model") or _AGY_MODEL_FALLBACK
 
 
@@ -452,6 +542,8 @@ def model_catalog_for(backend: str) -> list[tuple[str, str]]:
     b = (backend or "").strip().lower()
     if b == "claude":
         return [(label, val) for label, val in CLAUDE_MODELS]
+    if b == "opencode":
+        return [(_opencode_label(m), m) for m in opencode_models_live()]
     if b == "agy":
         return [(_agy_label(m), m) for m in agy_models_live()]
     return []
@@ -502,6 +594,9 @@ def set_model_for(backend: str, model_name: str) -> str:
     b = (backend or "").strip().lower()
     if b == "claude":
         set_setting("claude_model", model_name)
+        return model_name
+    if b == "opencode":
+        set_setting("opencode_model", model_name)
         return model_name
     if b == "agy":
         return _agy_set_model(model_name)

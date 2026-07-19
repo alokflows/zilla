@@ -2090,7 +2090,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stored = set_model(chosen)
         ok = stored == chosen
         head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
-        src = "Claude Code" if get_backend() == "claude" else "agy's settings.json"
+        adapter = backend_registry.get(get_backend())
+        src = f"{adapter.label}" if adapter and adapter.model_flag else "agy's settings.json"
         await update.message.reply_text(
             f"{head}\n{get_backend()} will now use: {stored}\n(via {src})"
         )
@@ -2341,11 +2342,13 @@ async def _cb_model(query, context, data, uid, chat_id):
             return
         chosen = data.removeprefix("model_")
         # set_model persists for the active backend and returns the stored
-        # value (agy: read back from its settings.json; claude: the alias).
+        # value (agy: read back from its settings.json; claude/opencode: the
+        # --model value itself, per that adapter's model_flag).
         stored = set_model(chosen)
         ok = stored == chosen
         head = "✅ Model changed" if ok else "⚠️ Stored, but readback differs"
-        src = "--model alias" if get_backend() == "claude" else "agy --model flag"
+        adapter = backend_registry.get(get_backend())
+        src = "--model flag" if adapter and adapter.model_flag else "agy --model flag"
         await query.edit_message_text(
             f"{head}\n════════════════\n"
             f"<b>{get_backend()}</b> will now use: <b>{stored}</b>\n"

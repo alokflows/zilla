@@ -29,7 +29,7 @@ import threading
 import subprocess
 from typing import Callable
 
-from zilla.config import CLAUDE_PATH, CLI_WORKING_DIR, MAX_TOTAL_RUNTIME
+from zilla.config import CLAUDE_PATH, CLI_WORKING_DIR, MAX_TOTAL_RUNTIME, OPENCODE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -233,3 +233,158 @@ def claude_limit_hint(text: str) -> bool:
         "rate limit", "usage limit", "quota", "overloaded",
         "too many requests", "credit balance", "upgrade",
     ))
+
+
+# ============================================================
+#  opencode (opencode.ai) — third backend, R3
+# ============================================================
+#  `opencode run --model <provider/model> --format json <prompt>` prints one
+#  JSON event per line (a step/text/error log), not a single object like
+#  Claude's `--output-format json` — see _parse_opencode_json. The free
+#  `opencode/` provider models need zero login, so unlike Claude there's no
+#  auth step; opencode_identity() below just confirms the binary answers.
+# ============================================================
+
+def run_opencode(
+    prompt: str,
+    conversation_id: str = None,
+    progress_callback: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    skip_permissions: bool = False,
+    model: str | None = None,
+    use_browser: bool = False,
+    ctx=None,
+) -> tuple[str, str | None]:
+    """
+    Run one turn through opencode and return (response_text, session_id).
+
+    - New conversation: omit --session; opencode mints a session id (present
+      on every streamed event) and we return it.
+    - Continue: pass the stored session id via --session.
+    Mirrors run_claude's contract so bot.py needs no special-casing.
+    skip_permissions/use_browser have no opencode equivalent on the free
+    tier (no tool/browser access) — accepted for signature parity, ignored.
+    """
+    from zilla.harness import wrap_prompt
+    from zilla.config import _OPENCODE_MODEL_FALLBACK
+    prompt = wrap_prompt(prompt, is_new=not conversation_id, backend="opencode", ctx=ctx)
+
+    cmd = [OPENCODE_PATH, "run", "--model", model or _OPENCODE_MODEL_FALLBACK, "--format", "json"]
+    if conversation_id:
+        cmd += ["--session", conversation_id]
+    cmd += [prompt]
+
+    if progress_callback:
+        try:
+            progress_callback("🤖 opencode is thinking…")
+        except Exception:
+            pass
+
+    conv_label = conversation_id[:8] if conversation_id else "new"
+    logger.info(f"[OPENCODE] run conv={conv_label} model={model or 'default'}")
+
+    max_runtime = MAX_TOTAL_RUNTIME if MAX_TOTAL_RUNTIME > 0 else 3600
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=CLI_WORKING_DIR,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError:
+        return (f"opencode not found at: {OPENCODE_PATH}\n"
+                f"Install it from opencode.ai, or set OPENCODE_PATH in .env.", None)
+    except Exception as e:
+        logger.error(f"[OPENCODE] spawn failed: {e}")
+        return (f"Could not start opencode: {e}", None)
+
+    start = time.time()
+    while True:
+        if proc.poll() is not None:
+            break
+        if cancel_event and cancel_event.is_set():
+            _kill(proc)
+            return ("🛑 Canceled.", conversation_id)
+        if time.time() - start > max_runtime:
+            _kill(proc)
+            logger.warning("[OPENCODE] max runtime hit")
+            return ("⏱️ Timed out.", conversation_id)
+        time.sleep(0.2)
+
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0 and not (stdout or "").strip():
+        msg = (stderr or "").strip() or f"opencode exited {proc.returncode}"
+        logger.warning(f"[OPENCODE] error: {msg[:300]}")
+        return (f"opencode error: {msg[:500]}", conversation_id)
+
+    return _parse_opencode_json(stdout, conversation_id)
+
+
+def _parse_opencode_json(stdout: str, conversation_id: str | None) -> tuple[str, str | None]:
+    """opencode --format json streams one JSON object per line: step_start /
+    text / step_finish / error, each carrying the session id. A reply can be
+    made of several text parts (each with its own part.id) — keep the LATEST
+    text seen per part.id (covers both 'one final event per part' and any
+    future growing-text-per-part streaming) and join parts in first-seen order."""
+    text = (stdout or "").strip()
+    if not text:
+        return ("No response from opencode.", conversation_id)
+
+    session_id = conversation_id
+    texts: dict[str, str] = {}
+    order: list[str] = []
+    error_msg = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        session_id = obj.get("sessionID") or session_id
+        part = obj.get("part") or {}
+        if obj.get("type") == "text" and part.get("text") is not None:
+            pid = part.get("id") or str(len(order))
+            if pid not in texts:
+                order.append(pid)
+            texts[pid] = part["text"]
+        elif obj.get("type") == "error":
+            err = obj.get("error") or {}
+            data = err.get("data") or {}
+            error_msg = data.get("message") or err.get("name") or "opencode reported an error."
+
+    result = "\n".join(texts[pid] for pid in order).strip()
+    if not result:
+        result = error_msg or "No response from opencode."
+    return (result, session_id)
+
+
+# ── Live identity: is opencode installed and actually answering? ──
+#  No login concept for the free `opencode/` models, so "logged in" here
+#  means "the binary runs and returned a real model list" — the honest
+#  equivalent of agy_reachable().
+_opencode_identity_cache = {"data": None, "ts": 0.0}
+_OPENCODE_IDENTITY_TTL = 60.0
+
+
+def opencode_identity(force: bool = False) -> dict:
+    """opencode's auth status, shaped like claude_identity()'s return value
+    so backend_registry can treat every adapter the same way."""
+    from zilla.config import opencode_reachable, opencode_models_live
+    now = time.time()
+    if not force and _opencode_identity_cache["data"] is not None and \
+            now - _opencode_identity_cache["ts"] < _OPENCODE_IDENTITY_TTL:
+        return _opencode_identity_cache["data"]
+    if force:
+        opencode_models_live(force=True)
+    reachable = opencode_reachable()
+    data = {
+        "loggedIn": reachable,
+        "authMethod": "none (free tier)" if reachable else None,
+        "error": None if reachable else f"opencode not responding at {OPENCODE_PATH}",
+    }
+    _opencode_identity_cache["data"] = data
+    _opencode_identity_cache["ts"] = now
+    return data

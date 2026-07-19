@@ -248,6 +248,7 @@ ones from scratch."""
 _BACKEND_LABEL = {
     "claude": "Claude Code (Anthropic)",
     "agy": "Antigravity CLI (Gemini)",
+    "opencode": "opencode (open source)",
 }
 
 

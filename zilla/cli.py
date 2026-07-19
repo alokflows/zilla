@@ -56,7 +56,7 @@ def cmd_doctor(args) -> int:
     report = zdoctor.environment_report(force=args.force)
     print(zdoctor.format_report(report))
     problems = 0
-    if not (report["clis"]["agy"]["ok"] or report["clis"]["claude"]["ok"]):
+    if not any(cli.get("ok") for cli in report["clis"].values()):
         problems += 1
     if not report["ffmpeg"]["ok"]:
         problems += 1

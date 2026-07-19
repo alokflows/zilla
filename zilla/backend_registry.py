@@ -175,3 +175,50 @@ register(BackendAdapter(
     binary=_claude_binary, identity=_claude_identity, models=_claude_models,
     dispatch=_claude_dispatch,
 ))
+
+
+# ── opencode adapter (R3) ────────────────────────────────────
+
+def _opencode_binary() -> str | None:
+    from zilla.config import OPENCODE_PATH
+    return OPENCODE_PATH if OPENCODE_PATH and os.path.exists(OPENCODE_PATH) else None
+
+
+def _opencode_identity(force: bool = False) -> dict:
+    from zilla.backends import opencode_identity
+    from zilla.config import get_model
+    ident = opencode_identity(force=force)
+    return {
+        "logged_in": bool(ident.get("loggedIn")),
+        "account": None, "plan": "free",
+        "auth_method": ident.get("authMethod"),
+        "model": get_model(), "error": ident.get("error"),
+    }
+
+
+def _opencode_models() -> list[tuple[str, str]]:
+    from zilla.config import model_catalog_for
+    return model_catalog_for("opencode")
+
+
+def _opencode_dispatch(prompt, conversation_id, progress_callback, cancel_event,
+                       skip_permissions, use_browser=False, ctx=None):
+    from zilla.backends import run_opencode
+    from zilla.config import get_model
+    return run_opencode(
+        prompt, conversation_id,
+        progress_callback=progress_callback, cancel_event=cancel_event,
+        skip_permissions=skip_permissions, model=get_model(),
+        use_browser=use_browser, ctx=ctx,
+    )
+
+
+register(BackendAdapter(
+    name="opencode", label="opencode (open source, free tier)", login_cmd="opencode",
+    model_flag=True,
+    hint=("ℹ️ Backend: opencode. Free `opencode/` models, no login needed. "
+          "Pick one below, or ✏️ Custom for an exact provider/model id. "
+          "(Switch backend in /settings.)"),
+    binary=_opencode_binary, identity=_opencode_identity, models=_opencode_models,
+    dispatch=_opencode_dispatch,
+))
