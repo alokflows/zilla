@@ -335,8 +335,7 @@ todo list anymore.
 `python3` fails on a missing `telegram` import (env gap, not a code
 regression). Next step = first unchecked item in the Checklist below
 (currently **K5**; see `docs/dev/K5_RESEARCH_NOTES.md` for prerequisite
-research already done). U-phase has a one-time owner instruction — see its
-checklist line, don't apply it to K5.
+research already done).
 
 **Current phase:** Phase 1 + P1.5 + P2 (entrypoint, TUI) are **DONE and
 merged** on this branch — that shipped, tested, live-running code is not
@@ -623,7 +622,7 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **K3** Curiosity loop (PLAN §6/K3) — DONE 2026-07-19. 1105 green (18-file gate + `test_memory_k3.py`'s 27). See session log below.
 - [x] **K4** Graph views (`/graph` HTML export + TUI Graph screen, PLAN §6/K4) — DONE 2026-07-19. 1142 green (19-file gate + `test_memory_k4.py`'s 35). See session log below.
 - [ ] **K5** Team relay: delegated send & scheduling ("tell Priya X" / "remind Rahul every Monday") — owner-requested 2026-07-18, always-confirm policy (PLAN §6).
-- [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card. **Owner decree 2026-07-19 (U only, not K5 or any other phase): when U1-U4 are done and tests are green, don't relay — polish U, then run `/ponytail-audit` on the whole project, summarize it to the owner, and stop.**
+- [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card.
 - [ ] **H4** Self-update with doctor-gated rollback (PLAN §8).
 - [ ] **B1-B2** Background task lane + /tasks; incognito sessions (PLAN §9).
 - [ ] **R1** Triage router refinement — MOSTLY DONE via `zilla/review.py` (P1.5 above); confirm against PLAN.md's exact spec before marking done, don't rebuild.
