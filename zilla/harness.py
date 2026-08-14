@@ -78,12 +78,28 @@ class TurnContext:
                turn can be written back. Enforcement that the model
                obeyed is core's (a Memory-tree snapshot around the turn) —
                this is only the injection half.
+    effort   — 'fast' | 'standard' | 'deep' (Phase R1). Decided by
+               zilla/router.py from deterministic rules, never by the
+               model. Plain context here; what it changes is below.
+    backend/model — a per-turn override chosen by the effort controller,
+               or None for "the session's backend, as configured".
+               `model` is only ever set for a backend with a
+               per-invocation model flag: agy's model is a global setting
+               shared with every agy terminal on the machine, so Zilla
+               never switches it mid-turn.
+    fast_profile — lean injection: core MEMORY.md only, no wiki index.
+               The caller pairs it with a throwaway conversation, so a
+               fast turn never advances the session's conv id (I-CONV).
     """
     uid: int
     role: str
     is_owner: bool
     origin: str = "user"
     incognito: bool = False
+    effort: str = "standard"
+    backend: str | None = None
+    model: str | None = None
+    fast_profile: bool = False
 
 
 # ══════════════════════════════════════════════════════════
@@ -383,7 +399,10 @@ def _memory_block(ctx: "TurnContext | None") -> str:
             f"(soft cap {_MEMORY_SOFT_CAP}) — nudge the agent to trim it"
         )
 
-    wiki_text = _memory.wiki_index_text(max_index_lines=_MEMORY_INDEX_MAX_LINES)
+    # Phase R1 fast profile: core MEMORY.md only. The wiki index is the
+    # expensive half of this block and a greeting has never needed it.
+    wiki_text = ("" if getattr(ctx, "fast_profile", False)
+                 else _memory.wiki_index_text(max_index_lines=_MEMORY_INDEX_MAX_LINES))
 
     recall_line = f"- To recall details: read/grep files under {MEMORY_DIR}"
     memsearch_path = os.path.join(_HERE, "memsearch.py")
@@ -443,9 +462,16 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         "## Your memory (persistent, yours to maintain)",
         core_text.strip() or "(empty)",
         "",
-        "## Wiki index (read pages with your file tools when you need details)",
-        wiki_text or "(no wiki pages yet)",
-        "",
+    ]
+    # On a fast turn the index is omitted entirely rather than shown empty —
+    # "(no wiki pages yet)" would be a false statement about the owner's memory.
+    if not getattr(ctx, "fast_profile", False):
+        parts += [
+            "## Wiki index (read pages with your file tools when you need details)",
+            wiki_text or "(no wiki pages yet)",
+            "",
+        ]
+    parts += [
         "## Memory protocol",
         recall_line,
         "- To remember something durable: edit MEMORY.md (keep it under 2000 "

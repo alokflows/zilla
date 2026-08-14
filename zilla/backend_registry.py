@@ -158,11 +158,14 @@ def _claude_models() -> list[tuple[str, str]]:
 def _claude_dispatch(prompt, conversation_id, progress_callback, cancel_event,
                      skip_permissions, use_browser=False, ctx=None):
     from zilla.backends import run_claude
-    from zilla.config import get_model
+    from zilla.config import get_model_for
+    # Phase R1: an effort-chosen model for THIS turn only (claude takes
+    # --model per invocation, so nothing global changes).
     return run_claude(
         prompt, conversation_id,
         progress_callback=progress_callback, cancel_event=cancel_event,
-        skip_permissions=skip_permissions, model=get_model(),
+        skip_permissions=skip_permissions,
+        model=(getattr(ctx, "model", None) or get_model_for("claude")),
         use_browser=use_browser, ctx=ctx,
     )
 
@@ -204,11 +207,14 @@ def _opencode_models() -> list[tuple[str, str]]:
 def _opencode_dispatch(prompt, conversation_id, progress_callback, cancel_event,
                        skip_permissions, use_browser=False, ctx=None):
     from zilla.backends import run_opencode
-    from zilla.config import get_model
+    from zilla.config import get_model_for
+    # Phase R1: same per-turn model override as claude (opencode also takes
+    # --model per invocation).
     return run_opencode(
         prompt, conversation_id,
         progress_callback=progress_callback, cancel_event=cancel_event,
-        skip_permissions=skip_permissions, model=get_model(),
+        skip_permissions=skip_permissions,
+        model=(getattr(ctx, "model", None) or get_model_for("opencode")),
         use_browser=use_browser, ctx=ctx,
     )
 

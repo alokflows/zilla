@@ -54,7 +54,8 @@ from zilla.config import (
 )
 from zilla.formatter import detect_file_paths
 from zilla.harness import log_event, TurnContext
-from zilla.review import review, classify_route
+from zilla import router
+from zilla.review import review
 from zilla.schedules import resolve_session_mode, backend_pin_mismatch
 
 logger = logging.getLogger(__name__)
@@ -117,14 +118,22 @@ _FAST_PREAMBLE = (
 def _run_fast_claude(prompt: str) -> str | None:
     """Blocking (run via asyncio.to_thread). A dedicated, lightweight one-shot
     Claude Code call for the smalltalk fast path — no --resume (always a fresh
-    turn; smalltalk carries no state worth keeping), pinned to _FAST_MODEL.
+    turn; smalltalk carries no state worth keeping).
     Returns the response text, or None if Claude Code could not be reached at
     all (spawn failure, timeout, non-zero exit with no output) — the caller
-    falls back to the full path transparently on None."""
+    falls back to the full path transparently on None.
+
+    Phase R1: the model comes from the effort controller's `fast` target when
+    that target is claude, so `effort_map` is the one place the cheap model is
+    named. Any other target (or none) leaves _FAST_MODEL as the default — this
+    path is claude-only by construction, and a non-claude fast target simply
+    means the full path handles the turn under the fast profile instead."""
     import subprocess
     from zilla.config import CLAUDE_PATH, CLI_WORKING_DIR
+    fast_backend, fast_model = router.target_for(router.FAST)
+    model = fast_model if fast_backend == "claude" and fast_model else _FAST_MODEL
     full_prompt = f"{_FAST_PREAMBLE}\n\nUser: {prompt}"
-    cmd = [CLAUDE_PATH, "-p", full_prompt, "--output-format", "json", "--model", _FAST_MODEL]
+    cmd = [CLAUDE_PATH, "-p", full_prompt, "--output-format", "json", "--model", model]
     try:
         proc = subprocess.run(
             cmd, cwd=CLI_WORKING_DIR, capture_output=True,
@@ -1261,7 +1270,15 @@ class ZillaCore:
         # ── P1.5 triage: deterministic, zero-model-call route decision BEFORE
         # the heavy CLI turn / lock (HANDOFF.md P1.5). 'full' is the safe
         # default and falls straight through to the unchanged pipeline below.
-        route = classify_route(text)
+        #
+        # Phase R1 folds the effort controller into the same pass: the class
+        # decides the route, the effort decides how hard the turn is allowed
+        # to try. Both are deterministic; the model is told neither.
+        decision = router.decide(text)
+        text = decision.text          # `!deep` stripped — the model never sees it
+        route = {router.SHARE: "share", router.TRIVIAL: "smalltalk"}.get(
+            decision.klass, "full")
+        log_event("router", user=user_id, **decision.as_log())
 
         # Journal is the OWNER's memory (PLAN.md §4 scope guard) — any other
         # principal's "share"-shaped message falls through to the full route
@@ -1334,7 +1351,11 @@ class ZillaCore:
                 # write every result back to that same session — never the now-active one.
                 self._active_cancel[key] = cancel_event
                 sname = self.sessions.get_active_name(user_id)
-                conv_id = self._conv_for_run(user_id, sname)
+                # Phase R1: a fast-profile turn runs in a THROWAWAY
+                # conversation on another backend, so it must not resume —
+                # and, below, must not write back — the session's conv id
+                # (I-CONV). H1's sweep reclaims the stray dir.
+                conv_id = None if decision.fast_profile else self._conv_for_run(user_id, sname)
 
                 # Phase B2 (PLAN.md §9/B2): pinned with the session, so a
                 # /switch mid-queue can't turn a private turn into a
@@ -1355,32 +1376,75 @@ class ZillaCore:
                     uid=user_id, role=self.auth.role_of(user_id),
                     is_owner=self.auth.is_owner(user_id), origin=origin,
                     incognito=incognito,
+                    effort=decision.effort, backend=decision.backend,
+                    model=decision.model, fast_profile=decision.fast_profile,
                 )
-                run_task = loop.create_task(run_cli_async(
-                    text, conv_id,
-                    progress_callback=_on_progress,
-                    cancel_event=cancel_event,
-                    skip_permissions=skip_permissions,
-                    ctx=ctx,
-                ))
-                try:
-                    while not run_task.done():
-                        getter = loop.create_task(progress_q.get())
-                        await asyncio.wait({run_task, getter},
-                                           return_when=asyncio.FIRST_COMPLETED)
-                        if getter.done():
-                            yield getter.result()
-                        else:
-                            getter.cancel()
-                    while not progress_q.empty():
-                        yield progress_q.get_nowait()
-                    response, detected_id = run_task.result()
-                finally:
-                    # Consumer closed us mid-run (frontend died): stop the
-                    # backend instead of leaving it running unobserved.
-                    if not run_task.done():
-                        cancel_event.set()
-                        run_task.cancel()
+
+                # One run, streaming its progress straight out of this
+                # generator. Written as a nested generator so the fast-profile
+                # rerun below can reuse it verbatim instead of duplicating the
+                # pump — the result lands in `out`.
+                out: dict = {}
+
+                async def _run_and_pump(_text, _conv, _ctx):
+                    task = loop.create_task(run_cli_async(
+                        _text, _conv,
+                        progress_callback=_on_progress,
+                        cancel_event=cancel_event,
+                        skip_permissions=skip_permissions,
+                        ctx=_ctx,
+                    ))
+                    try:
+                        while not task.done():
+                            getter = loop.create_task(progress_q.get())
+                            await asyncio.wait({task, getter},
+                                               return_when=asyncio.FIRST_COMPLETED)
+                            if getter.done():
+                                yield getter.result()
+                            else:
+                                getter.cancel()
+                        while not progress_q.empty():
+                            yield progress_q.get_nowait()
+                        out["result"] = task.result()
+                    finally:
+                        # Consumer closed us mid-run (frontend died): stop the
+                        # backend instead of leaving it running unobserved.
+                        if not task.done():
+                            cancel_event.set()
+                            task.cancel()
+
+                # P4: a deep turn says so up front, because it will take longer.
+                if decision.effort == router.DEEP:
+                    yield Progress(text=router.DEEP_NOTE)
+
+                async for ev in _run_and_pump(text, conv_id, ctx):
+                    yield ev
+                response, detected_id = out["result"]
+
+                # R1 step 2 — misclassification safety: a fast turn that came
+                # back empty or error-shaped is silently rerun as a normal one,
+                # on the session's own backend and conversation. The owner is
+                # never told about the cheap attempt.
+                if decision.fast_profile and not cancel_event.is_set():
+                    verdict = review(text, response)
+                    if verdict.verdict == "stop" and verdict.reason in ("empty", "error"):
+                        log_event("router_rerun", user=user_id, reason=verdict.reason,
+                                  was=decision.backend or "session")
+                        decision = decision.demoted()
+                        conv_id = self._conv_for_run(user_id, sname)
+                        ctx = TurnContext(
+                            uid=user_id, role=self.auth.role_of(user_id),
+                            is_owner=self.auth.is_owner(user_id), origin=origin,
+                            incognito=incognito, effort=router.STANDARD,
+                        )
+                        async for ev in _run_and_pump(text, conv_id, ctx):
+                            yield ev
+                        response, detected_id = out["result"]
+
+                if decision.fast_profile:
+                    # Throwaway conversation: nothing about it is recorded
+                    # against the session (I-CONV).
+                    detected_id = None
 
                 if detected_id and detected_id != conv_id:
                     self.sessions.set_conversation_id(detected_id, user_id=user_id,

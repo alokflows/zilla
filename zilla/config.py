@@ -319,6 +319,13 @@ def get_setting(key: str, default=None):
 
 
 def set_setting(key: str, value):
+    # Phase R1: effort_map is validated at WRITE time, where a person is
+    # looking, rather than failing quietly mid-turn. Raises ValueError with a
+    # plain-language reason (notably: it may never name agy, whose model is
+    # one global setting shared with every agy terminal on the machine).
+    if key == "effort_map" and value not in (None, "", {}):
+        from zilla.router import validate_effort_map
+        value = validate_effort_map(value)
     store.get_store(SETTINGS_FILE).set_setting(key, value)
 
 

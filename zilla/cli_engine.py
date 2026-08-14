@@ -870,7 +870,10 @@ def _run_blocking(prompt, conversation_id, progress_callback, cancel_event, skip
     (one corrective retry if the answer looks fabricated). Blocking; thread-pool."""
     from zilla.verify import assess, correction_prompt
     from zilla.autoharness import classify, needs_browser
-    backend = get_backend()
+    # Phase R1: the effort controller may point THIS turn at another backend
+    # (router.target_for — never agy, never the session's own tagging). The
+    # session keeps its backend; only this run moves.
+    backend = getattr(ctx, "backend", None) or get_backend()
     started = time.time()
     # Decide ONCE from the raw user message so the corrective retry keeps browser
     # access too (the retry prompt is a wrapper that may lack the web keywords).

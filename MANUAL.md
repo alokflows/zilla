@@ -194,6 +194,25 @@ A long job used to freeze your chat until it finished. Now it doesn't:
 
 Two jobs run at a time; the rest wait their turn. When one finishes, Zilla sends you the result. If the AI itself suggests moving something to the background, you get a card with a **Run it** button — nothing starts until you tap it.
 
+### Asking for a harder think 🧠
+
+Zilla decides how hard to work on a message by itself, from plain rules — the AI never
+grades its own homework:
+
+- "hi", "thanks", "ok" → a quick, cheap reply. It doesn't load your whole memory index for a
+  greeting, and it doesn't touch the notebook you're in.
+- Anything else → a normal turn.
+- **You override it, always.** Say **"think hard"**, **"think this through"**, **"take your
+  time"**, **"be thorough"** — or start the message with **`!deep`** — and Zilla uses the
+  strongest model it has, even for a one-word message. It tells you it's thinking deeply,
+  because it will take longer.
+
+One honest note about models: if your backend is **agy**, its model is a single global setting
+that every agy window on your computer shares — so Zilla will **not** switch it behind your
+back mid-message. "Think hard" moves the message to a backend that *can* take a model per
+request (Claude / opencode) if you have one installed; otherwise it runs normally. Change
+agy's own model yourself in `/settings`.
+
 ### The one thing to remember: use `/new` for new topics
 
 If you **never** send `/new`, every message keeps going into the **same** notebook. That's perfect for a continuing conversation — but if you run lots of *unrelated* tasks back-to-back without `/new`, they all pile into one giant notebook. The AI then starts dragging in old stuff, which can feel like it's "mixing things up" or repeating the whole chat.
