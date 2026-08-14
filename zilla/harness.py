@@ -384,6 +384,7 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         return ""
 
     from zilla import memory as _memory
+    from zilla import skills as _skills
     from zilla.config import MEMORY_DIR, MEDIA_KEPT_DIR
 
     # Phase M3: keep the FTS5 search index current before the turn starts —
@@ -492,6 +493,10 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         parts.append(schedule_line)
     if graph_line:
         parts.append(graph_line)
+    # Phase S (PLAN.md §11 step 2): the agent may PROPOSE a skill; only the
+    # owner's ✅ writes one. Owner-only by construction, like the two markers
+    # above — core.py drops the marker on anyone else's turn.
+    parts.append(_skills.PROPOSAL_PROTOCOL)
     if was_template:
         parts.append(
             "\nMEMORY.md is still empty — briefly interview the owner "
@@ -503,6 +508,41 @@ def _memory_block(ctx: "TurnContext | None") -> str:
     if len(block) > _MEMORY_HARD_CAP:
         block = block[:_MEMORY_HARD_CAP] + "\n[truncated — trim me]"
     return block
+
+
+# ══════════════════════════════════════════════════════════
+#  MANAGED SKILL INDEX  (PLAN.md §11 step 3 — the enforcement)
+# ══════════════════════════════════════════════════════════
+
+def _skills_block(ctx: "TurnContext | None") -> str:
+    """The `Memory/Skills/` index — and the ONLY place a managed skill is
+    ever advertised to the model.
+
+    Gated exactly like `_memory_block`: owner turns only (the skills live in
+    the owner's Memory tree), never in incognito (where the proposal
+    protocol must not run either), and skipped on a fast turn, which is lean
+    by definition.
+
+    Only APPROVED skills whose bytes still match the approved hash are
+    listed. Zilla cannot stop the CLI from executing a file it finds — what
+    it can do, deterministically, is never tell it the file is there
+    (PLAN.md §11 step 3). A read failure returns '' — closed, never open."""
+    if (ctx is None or not ctx.is_owner or getattr(ctx, "incognito", False)
+            or getattr(ctx, "fast_profile", False)):
+        return ""
+    try:
+        from zilla import skills as _skills
+        from zilla import store as _store
+        from zilla.config import DB_FILE, MEMORY_DIR
+        approved, _revoked = _skills.audit(_store.get_store(DB_FILE), MEMORY_DIR)
+        index = _skills.index_text(approved)
+        if not index:
+            return ""
+        return ("## Your skills (procedures you wrote and the owner approved)\n"
+                + index)
+    except Exception as e:  # a broken skills read must never break a turn
+        logger.debug(f"[HARNESS] skills index failed: {e}")
+        return ""
 
 
 # ══════════════════════════════════════════════════════════
@@ -533,11 +573,14 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
 
     relay = _relay_protocol(BRIDGE_DIR)
     memory_block = _memory_block(ctx)
+    skills_block = _skills_block(ctx)
 
     if not is_new:
         parts = [operating_contract(backend), relay]
         if memory_block:
             parts.append(memory_block)
+        if skills_block:
+            parts.append(skills_block)
         return "\n\n".join(parts)
 
     parts: list[str] = [engine_context(backend)]
@@ -545,7 +588,12 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
     if instructions:
         parts.append(_resolve_placeholders(instructions, conv_dir, backend))
 
-    skills = skills_summary(backend)
+    # Phase S step 4: the backend's OWN skills (~/.claude/skills, agy's skill
+    # dirs) are owner-installed artifacts outside Zilla's management — they
+    # coexist with Memory/Skills, and Zilla does not gate them. It does scope
+    # them: same owner-only guard as memory, so another principal's turn
+    # never carries the owner's installed tooling either.
+    skills = skills_summary(backend) if (ctx is not None and ctx.is_owner) else ""
     if skills:
         parts.append("AVAILABLE SKILLS (load only when the task needs one):\n" + skills)
 
@@ -553,6 +601,8 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
     parts.append(relay)
     if memory_block:
         parts.append(memory_block)
+    if skills_block:
+        parts.append(skills_block)
     return "\n\n".join(parts)
 
 

@@ -89,6 +89,14 @@ RELAY_MAX = 20
 BG_PROPOSAL_TTL = 3600.0
 BG_PROPOSAL_MAX = 20
 
+# Skills from chat (Phase S, PLAN.md §11): a `SKILL_PROPOSAL:` the owner
+# hasn't tapped yet, and — after a ✅ — the one-shot instruction that tells
+# the agent to write the files on the owner's NEXT turn. Both are in memory:
+# an un-tapped proposal is not a skill, and a restart forgetting a pending
+# write is the correct, safe behavior (nothing was created).
+SKILL_PROPOSAL_TTL = 3600.0
+SKILL_PROPOSAL_MAX = 10
+
 
 # ══════════════════════════════════════════════════════════
 #  P1.5 TRIAGE ROUTER — deterministic, zero-model-call classification
@@ -312,6 +320,33 @@ class TaskResult:
     chat_id: int = None
     duration: float = None
     card: dict = None
+
+
+@dataclass
+class SkillProposal:
+    """Phase S (PLAN.md §11 step 2): the model ended an OWNER turn with a
+    `SKILL_PROPOSAL:` marker — it thinks the procedure it just worked out is
+    worth keeping. Nothing is written when this fires: a frontend renders
+    `card` with a confirm tap and resolves `id` with core.skills.accept(id)
+    / .decline(id). A ✅ only buys the RIGHT TO WRITE the files; a skill that
+    arrives with code still needs a second, explicit approval tap before
+    Zilla will advertise or run it."""
+    id: str
+    uid: int
+    slug: str
+    name: str
+    description: str
+    card: str
+    chat_id: int = None
+
+
+@dataclass
+class SkillsChanged:
+    """Phase S step 5: the set of approved skills moved (one was saved,
+    approved, switched off, or auto-revoked), so the owner's slash-command
+    list has to be re-registered. Carries nothing but the reason — the
+    frontend re-reads core.skills.commands() itself."""
+    reason: str = ""
 
 
 @dataclass
@@ -880,6 +915,264 @@ class Tasks:
 
 
 # ══════════════════════════════════════════════════════════
+#  SKILLS FROM CHAT  (Phase S — PLAN.md §11)
+# ══════════════════════════════════════════════════════════
+#
+#  Same shape as Relay/Tasks above, and for the same reasons: the pending
+#  thing is born inside core.py (marker-parsed out of a model reply), so it
+#  cannot live in a frontend's per-chat state, and it is in memory because an
+#  un-tapped proposal is not a skill.
+#
+#  The lifecycle, end to end:
+#
+#    marker ──► propose()  (held, ✅/❌ card broadcast)
+#      ✅  ──► accept()    (a one-shot WRITE INSTRUCTION for the next turn)
+#     turn ──► decorate()  (that instruction rides the owner's next message)
+#     turn ──► finalize()  (the files exist? .md-only ⇒ live; code ⇒ held)
+#      /skills ──► approve() / disable()
+#     every owner turn ──► audit()  (bytes changed ⇒ switched off + one line)
+#
+#  The one invariant worth stating plainly, because everything else is UI:
+#  a skill Zilla has not approved is never named in a prompt and never
+#  becomes a slash command. The model's cooperation is not part of it.
+
+class Skills:
+    def __init__(self, core: "ZillaCore"):
+        self._core = core
+
+    def _db(self):
+        from zilla import store as _store
+        from zilla.config import DB_FILE
+        return _store.get_store(DB_FILE)
+
+    @staticmethod
+    def _mem_dir() -> str:
+        # Read at call time, never bound at import: tests (and the F1 home
+        # layout) repoint config.MEMORY_DIR.
+        from zilla.config import MEMORY_DIR
+        return MEMORY_DIR
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _changed(self, reason: str) -> None:
+        self._core._broadcast(SkillsChanged(reason=reason))
+
+    # ── proposals (model asked; owner hasn't tapped) ───────
+
+    def _prune(self) -> None:
+        now = time.time()
+        store = self._core._pending_skills
+        for pid in [p for p, v in store.items()
+                    if now - v.get("ts", 0) > SKILL_PROPOSAL_TTL]:
+            store.pop(pid, None)
+
+    def pending(self) -> list:
+        return [{"id": pid, **entry} for pid, entry in self._core._pending_skills.items()]
+
+    def propose(self, proposal: dict, uid: int, chat_id: int = None) -> str | None:
+        """Hold a `SKILL_PROPOSAL:` and broadcast SkillProposal so a frontend
+        can ask for the tap. None when the owner already said no to this slug
+        in this run, when it is already an approved skill, or when too many
+        offers are waiting."""
+        from zilla import skills as _skills
+        self._prune()
+        slug = proposal.get("slug", "")
+        if not slug or slug in self._core._declined_skills:
+            return None
+        store = self._core._pending_skills
+        if len(store) >= SKILL_PROPOSAL_MAX:
+            return None
+        if any(e.get("slug") == slug for e in store.values()):
+            return None
+        pid = secrets.token_hex(6)
+        store[pid] = {"slug": slug, "name": proposal.get("name") or slug,
+                      "description": proposal.get("description", ""),
+                      "uid": uid, "chat_id": chat_id, "ts": time.time()}
+        self._core._broadcast(SkillProposal(
+            id=pid, uid=uid, slug=slug, name=store[pid]["name"],
+            description=store[pid]["description"], chat_id=chat_id,
+            card=_skills.proposal_card(store[pid]["name"], store[pid]["description"])))
+        log_event("skill_proposed", user=uid, slug=slug)
+        return pid
+
+    def accept(self, pid: str) -> dict | None:
+        """The owner tapped ✅ — arm the write instruction for their next
+        turn (PLAN.md §11 step 2). Nothing is written yet, and nothing is
+        approved yet: the agent still has to produce the files."""
+        entry = self._core._pending_skills.pop(pid, None)
+        if entry is None:
+            return None
+        self._core._pending_skill_writes[entry["uid"]] = entry
+        log_event("skill_accepted", user=entry["uid"], slug=entry["slug"])
+        return entry
+
+    def decline(self, pid: str) -> dict | None:
+        """Discard an offer, and never make it again for this slug while the
+        process lives (PLAN.md §11 step 2: 'never re-proposed for that
+        session-task')."""
+        entry = self._core._pending_skills.pop(pid, None)
+        if entry is None:
+            return None
+        self._core._declined_skills.add(entry["slug"])
+        log_event("skill_declined", user=entry["uid"], slug=entry["slug"])
+        return entry
+
+    # ── the write turn ─────────────────────────────────────
+
+    def pending_write(self, uid: int) -> dict | None:
+        return self._core._pending_skill_writes.get(uid)
+
+    def decorate(self, text: str, ctx) -> str:
+        """Prepend the write instruction to THIS turn's prompt when the owner
+        tapped ✅ on their last one. Owner turns only, never incognito (a
+        private turn writes nothing to Memory), and never more than once —
+        `finalize()` clears it whatever the outcome."""
+        try:
+            if ctx is None or not ctx.is_owner or getattr(ctx, "incognito", False):
+                return text
+            entry = self._core._pending_skill_writes.get(ctx.uid)
+            if not entry:
+                return text
+            from zilla import skills as _skills
+            return f"{_skills.write_instruction(entry, self._mem_dir())}\n\n{text}"
+        except Exception as e:
+            logger.debug(f"[SKILLS] prompt decoration failed: {e}")
+            return text
+
+    def finalize(self, uid: int) -> str:
+        """Called once the write turn is over. Returns the one line the owner
+        gets appended to that reply ('' when there was nothing pending).
+
+        The safety decision lives here (PLAN.md §11 step 3, safest reading):
+
+          • Markdown only  → the ✅ tap already approved exactly what was
+            written, so the skill goes live and gets its command.
+          • anything else  → a script arrived. The owner approved SAVING a
+            skill, not running code they have never seen. It stays
+            unapproved — unindexed, uncallable — until they tap approve in
+            /skills.
+        """
+        entry = self._core._pending_skill_writes.pop(uid, None)
+        if not entry:
+            return ""
+        from zilla import skills as _skills
+        try:
+            mem_dir = self._mem_dir()
+            skill = _skills.read_skill(mem_dir, entry["slug"])
+            if skill is None:
+                log_event("skill_write_missing", user=uid, slug=entry["slug"])
+                return _skills.not_written_line(entry)
+            if skill["has_code"]:
+                log_event("skill_needs_approval", user=uid, slug=skill["slug"])
+                self._changed("saved-with-code")
+                return _skills.needs_approval_line(skill)
+            self._db().skill_approval_set(skill["slug"], skill["hash"],
+                                          self._now(), uid, enabled=1)
+            log_event("skill_approved", user=uid, slug=skill["slug"], auto=True)
+            self._changed("saved")
+            return _skills.saved_line(skill, self.command_for(skill["slug"]))
+        except Exception as e:
+            logger.error(f"[SKILLS] finalize failed: {e}", exc_info=True)
+            return _skills.not_written_line(entry)
+
+    # ── the approval table ─────────────────────────────────
+
+    def audit(self) -> list[dict]:
+        """Switch off every approved skill whose bytes no longer match the
+        approved hash, and return them so the caller can tell the owner in
+        one line each (PLAN.md §11 step 3). Reported exactly once per edit."""
+        from zilla import skills as _skills
+        try:
+            db = self._db()
+            _approved, revoked = _skills.audit(db, self._mem_dir())
+            for skill in revoked:
+                db.skill_approval_set_enabled(skill["slug"], False)
+                log_event("skill_revoked", slug=skill["slug"], reason="hash_mismatch")
+            if revoked:
+                self._changed("revoked")
+            return revoked
+        except Exception as e:
+            logger.error(f"[SKILLS] audit failed: {e}", exc_info=True)
+            return []
+
+    def listing(self) -> list[dict]:
+        """Every managed skill with its state — the `/skills` panel."""
+        from zilla import skills as _skills
+        try:
+            return _skills.listing(self._db(), self._mem_dir())
+        except Exception as e:
+            logger.debug(f"[SKILLS] listing failed: {e}")
+            return []
+
+    def get(self, slug: str) -> dict | None:
+        for skill in self.listing():
+            if skill["slug"] == slug:
+                return skill
+        return None
+
+    def approved(self) -> list[dict]:
+        from zilla import skills as _skills
+        try:
+            approved, _revoked = _skills.audit(self._db(), self._mem_dir())
+            return approved
+        except Exception as e:
+            logger.debug(f"[SKILLS] approved read failed: {e}")
+            return []
+
+    def approve(self, slug: str, uid: int) -> dict | None:
+        """Owner approval: the CURRENT bytes become the approved ones and the
+        skill goes live. This is the one and only path by which a skill
+        carrying code becomes usable."""
+        from zilla import skills as _skills
+        skill = _skills.read_skill(self._mem_dir(), slug)
+        if skill is None or not skill.get("hash"):
+            return None
+        self._db().skill_approval_set(slug, skill["hash"], self._now(), uid, enabled=1)
+        log_event("skill_approved", user=uid, slug=slug)
+        self._changed("approved")
+        return self.get(slug)
+
+    def disable(self, slug: str) -> dict | None:
+        """Switch a skill off: out of the index, out of the command list. The
+        row stays, so the owner can see it was theirs and turn it back on."""
+        skill = self.get(slug)
+        if skill is None:
+            return None
+        self._db().skill_approval_set_enabled(slug, False)
+        log_event("skill_disabled", slug=slug)
+        self._changed("disabled")
+        return self.get(slug)
+
+    # ── slash commands (PLAN.md §11 step 5) ────────────────
+
+    def commands(self, taken=()) -> list[dict]:
+        """[{slug, command, description}] for the approved skills, with
+        collisions against `taken` (the built-in command names) suffixed.
+        Only approved skills appear — an unapproved skill must never become
+        a callable command (P5)."""
+        from zilla import skills as _skills
+        return _skills.commands_for(self.approved(), taken)
+
+    def command_for(self, slug: str, taken=()) -> str:
+        for entry in self.commands(taken):
+            if entry["slug"] == slug:
+                return entry["command"]
+        return ""
+
+    def prompt_for_command(self, command: str, taken=()) -> str | None:
+        """The owner typed `/<command>` — the wording it stands for, or None
+        when that command is not (or is no longer) an approved skill."""
+        from zilla import skills as _skills
+        for entry in self.commands(taken):
+            if entry["command"] == command:
+                skill = self.get(entry["slug"])
+                return _skills.prompt_for(skill) if skill else None
+        return None
+
+
+# ══════════════════════════════════════════════════════════
 #  CORE
 # ══════════════════════════════════════════════════════════
 
@@ -938,6 +1231,16 @@ class ZillaCore:
         self._bg_runners: dict[str, asyncio.Task] = {}
         self._bg_locks: dict[str, asyncio.Lock] = {}
         self.tasks = Tasks(self)
+
+        # Skills from chat (Phase S). Approvals are durable (SQLite); these
+        # three are the live half — offers the owner hasn't tapped, the
+        # one-shot write instruction a ✅ arms for their next turn, and the
+        # slugs they said no to (never offered again while this process
+        # lives).
+        self._pending_skills: dict[str, dict] = {}
+        self._pending_skill_writes: dict[int, dict] = {}
+        self._declined_skills: set[str] = set()
+        self.skills = Skills(self)
 
         # Per-(chat, user) cancel events — set to cancel the active CLI
         # request for that user in that chat. Keyed by a (chat_key, user_id)
@@ -1382,6 +1685,13 @@ class ZillaCore:
                     model=decision.model, fast_profile=decision.fast_profile,
                 )
 
+                # Phase S step 2: the owner tapped ✅ on a skill offer last
+                # turn, so THIS turn carries the instruction to write the
+                # files. Only the prompt sent to the model changes — review(),
+                # the router's decision and the memory gates all still see the
+                # owner's own words.
+                run_text = self.skills.decorate(text, ctx)
+
                 # One run, streaming its progress straight out of this
                 # generator. Written as a nested generator so the fast-profile
                 # rerun below can reuse it verbatim instead of duplicating the
@@ -1419,7 +1729,7 @@ class ZillaCore:
                 if decision.effort == router.DEEP:
                     yield Progress(text=router.DEEP_NOTE)
 
-                async for ev in _run_and_pump(text, conv_id, ctx):
+                async for ev in _run_and_pump(run_text, conv_id, ctx):
                     yield ev
                 response, detected_id = out["result"]
 
@@ -1439,7 +1749,7 @@ class ZillaCore:
                             is_owner=self.auth.is_owner(user_id), origin=origin,
                             incognito=incognito, effort=router.STANDARD,
                         )
-                        async for ev in _run_and_pump(text, conv_id, ctx):
+                        async for ev in _run_and_pump(run_text, conv_id, ctx):
                             yield ev
                         response, detected_id = out["result"]
 
@@ -1471,7 +1781,7 @@ class ZillaCore:
                                 backend=candidate,
                             )
                             async for ev in _run_and_pump(
-                                    f"{chain.primer(text)}\n\n{text}", None, alt_ctx):
+                                    f"{chain.primer(text)}\n\n{run_text}", None, alt_ctx):
                                 yield ev
                             alt_response, _alt_conv = out["result"]
                             tried.append(candidate)
@@ -1534,6 +1844,12 @@ class ZillaCore:
             # running job — same strip-then-hold discipline as the relay
             # markers above.
             final_text = self._process_bg_markers(final_text, ctx, chat_key)
+
+            # Phase S: a `SKILL_PROPOSAL:` marker becomes an offer, never a
+            # skill — and if the owner already said ✅ last turn, this is
+            # where the files they just authorized are checked and either
+            # switched on or held for a second tap.
+            final_text = self._process_skill_markers(final_text, ctx, chat_key)
 
             yield Response(
                 text=final_text,
@@ -1964,6 +2280,48 @@ class ZillaCore:
             return "\n\n".join([clean, *notes]) if notes else clean
         except Exception as e:
             logger.error(f"[TASK] marker processing failed: {e}", exc_info=True)
+            return text
+
+    def _process_skill_markers(self, text: str, ctx, chat_key: int | None) -> str:
+        """Phase S (PLAN.md §11 steps 2-3): everything that happens to this
+        turn's reply on account of skills, in one pass —
+
+          1. strip any `SKILL_PROPOSAL:` marker and hold it for the ✅ tap;
+          2. if the owner tapped ✅ last turn, finalize what the agent just
+             wrote (live if it is Markdown only, held if it carries code);
+          3. audit the approved skills and say so, in one line, if any was
+             edited behind Zilla's back.
+
+        The three properties the other marker paths have hold here too: the
+        raw protocol never reaches a chat, markers are honored on OWNER turns
+        only (so an instruction injected into someone else's document can't
+        get a skill written onto this machine), and any unexpected failure
+        degrades to delivering the reply unchanged."""
+        try:
+            from zilla import skills as _skills
+            clean, proposals = _skills.parse_markers(text or "")
+            notes: list[str] = []
+
+            if proposals and (ctx is None or not ctx.is_owner):
+                log_event("skill_blocked", user=getattr(ctx, "uid", None),
+                          count=len(proposals))
+                proposals = []
+            if ctx is not None and ctx.is_owner and not getattr(ctx, "incognito", False):
+                notes.append(self.skills.finalize(ctx.uid))
+                notes.extend(_skills.revoked_line(s) for s in self.skills.audit())
+            for proposal in proposals:
+                if getattr(ctx, "incognito", False):
+                    break  # a private turn leaves nothing behind, not even an offer
+                if proposal.get("error"):
+                    log_event("skill_malformed", user=ctx.uid)
+                    notes.append(_skills.MALFORMED_LINE)
+                    continue
+                self.skills.propose(proposal, ctx.uid,
+                                    chat_key if chat_key is not None else ctx.uid)
+            notes = [n for n in notes if n]
+            return "\n\n".join([clean, *notes]) if notes else clean
+        except Exception as e:
+            logger.error(f"[SKILLS] marker processing failed: {e}", exc_info=True)
             return text
 
     # ── Phase R2: fallback chain support ───────────────────

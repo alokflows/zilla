@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS usage (
 CREATE TABLE IF NOT EXISTS skill_approvals (
     slug TEXT PRIMARY KEY,
     code_hash TEXT NOT NULL,
-    approved_at TEXT NOT NULL, approved_by INTEGER NOT NULL
+    approved_at TEXT NOT NULL, approved_by INTEGER NOT NULL,
+    enabled INTEGER DEFAULT 1
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(
     path, title, body, tokenize='porter unicode61'
@@ -153,6 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_uid ON tasks(uid);
 # and one created after is untouched.
 _ADDED_COLUMNS = (
     ("sessions", "incognito", "INTEGER DEFAULT 0"),
+    ("skill_approvals", "enabled", "INTEGER DEFAULT 1"),
 )
 
 
@@ -549,16 +551,42 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
-    def skill_approval_set(self, slug: str, code_hash: str, approved_at: str, approved_by: int) -> None:
+    def skill_approval_set(self, slug: str, code_hash: str, approved_at: str,
+                           approved_by: int, enabled: int = 1) -> None:
+        """Approving re-arms the row: the CURRENT bytes become the approved
+        ones and the skill goes back on. That is the only way a skill whose
+        files changed (Phase S auto-revoke) becomes usable again — the owner
+        looks at what changed and taps approve."""
         def _do(conn):
             conn.execute(
-                "INSERT INTO skill_approvals (slug, code_hash, approved_at, approved_by) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(slug) DO UPDATE SET "
+                "INSERT INTO skill_approvals (slug, code_hash, approved_at, approved_by, enabled) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(slug) DO UPDATE SET "
                 "code_hash=excluded.code_hash, approved_at=excluded.approved_at, "
-                "approved_by=excluded.approved_by",
-                (slug, code_hash, approved_at, approved_by),
+                "approved_by=excluded.approved_by, enabled=excluded.enabled",
+                (slug, code_hash, approved_at, approved_by, int(enabled)),
             )
         self._write(_do)
+
+    def skill_approvals_all(self) -> list[dict]:
+        """Every approval row, slug-sorted. The index gate (Phase S) reads
+        this on every owner turn, so it stays one cheap query."""
+        rows = self._r().execute(
+            "SELECT * FROM skill_approvals ORDER BY slug"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def skill_approval_set_enabled(self, slug: str, enabled: bool) -> bool:
+        def _do(conn):
+            cur = conn.execute("UPDATE skill_approvals SET enabled=? WHERE slug=?",
+                               (1 if enabled else 0, slug))
+            return cur.rowcount > 0
+        return self._write(_do)
+
+    def skill_approval_delete(self, slug: str) -> bool:
+        def _do(conn):
+            cur = conn.execute("DELETE FROM skill_approvals WHERE slug=?", (slug,))
+            return cur.rowcount > 0
+        return self._write(_do)
 
     # ── relay log (Phase K5 — the /relay audit trail) ───────────
     #

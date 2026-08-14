@@ -89,20 +89,21 @@ review gate, every route logged).
 | **K5** | Team relay: "tell Priya to send the report" / "remind Rahul every Monday at 9" → resolved against the graph, owner taps ✅, then it goes. `/relay` audit log. A relay target's reply is reported to the owner and never becomes a turn |
 | **U1-U4** | Generative UI: the model emits a fenced ```zui block and Telegram renders it natively — buttons/card/table/contacts/location (`zilla/zui.py`) · the protocol is taught in the preamble, never hard-coded · one design system (`docs/dev/STYLE.md`) applied across every menu · presence replaces the startup blast: one pinned status card edited in place, a new message only for a first install, an update, or real downtime (`zilla/presence.py`) |
 | **R3** | opencode as a third backend |
+| **S** | Skills from chat, ask-first: the agent OFFERS to save a procedure, the owner taps, and the skill index — the only place a skill is ever advertised — carries approved, unmodified skills only (`zilla/skills.py`, `/skills`). Every approved skill is also a slash command |
 | **B1-B2** | Background lane: a job runs in its own session under its own lock, so the chat never waits (`zilla/tasks.py`, `core.Tasks`, `/bg`, `/tasks`) · incognito sessions (`/new incognito`) where nothing is remembered — enforced by reverting the memory tree after the turn, not by asking the model nicely |
 
-**Tests: 1870 green across 26 files** (as of 2026-08-14), plus the import
+**Tests: 2024 green across 27 files** (as of 2026-08-14), plus the import
 smoke: `import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
 import schedule_query; import zilla.graph; import zilla.graph_html; import
 memgraph; import zilla.relay; import zilla.zui; import zilla.presence; import
-zilla.update; import zilla.tasks; import zilla.router; import zilla.chain`. `test_schedules_seam.py` is a frozen
+zilla.update; import zilla.tasks; import zilla.router; import zilla.chain;
+import zilla.skills`. `test_schedules_seam.py` is a frozen
 acceptance spec — never edit it. Recount fresh per file rather than trusting
 any grand total.
 
 ### Checklist — build in this order (PLAN.md §13)
 
-- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4 · B1-B2 · R1-R2
-- [ ] **S** Skills from chat, one owner approval tap before code-type skills run
+- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4 · B1-B2 · R1-R2 · S
 - [ ] **C1-C3** Brain export/import · connectors screen · cloud backup +
       bootstrap-from-cloud (PLAN §12)
 - [ ] **G1** Engine facade: Unix-socket IPC daemon-attach. The riskiest
@@ -189,6 +190,9 @@ schedules scroll (R18, wants pagination) · `kb_user_detail` has no `✕ Close`
 - H4: one full `/update` round-trip on the Linux service — the tap, the
   quiet minute, and the single result line coming back from the detached
   updater. Only the pipeline is unit-tested; the restart is the real-box part.
+- S in the real chat: solve something multi-step, tap ✅ on the offer, send one
+  more message so the files get written, then check `/<name>` shows up in
+  Telegram's own "/" autocomplete and running it produces the skill's answer.
 - U-phase in the real chat: ask for something that earns a card/table, tap a
   ZUI button (say / copy / url), and confirm the pinned card gets edited —
   not re-posted — across a restart.
@@ -199,6 +203,7 @@ schedules scroll (R18, wants pagination) · `kb_user_detail` has no `✕ Close`
 
 | Date | What shipped |
 |---|---|
+| 2026-08-14 | **S skills from chat** — `zilla/skills.py` (pure) + `skill_approvals.enabled` + `core.Skills` + `/skills`. The agent may only OFFER (`SKILL_PROPOSAL: <name> — <one-liner>`, owner-turn-only, never in incognito, never re-offered after a ❌); ✅ arms a one-shot write instruction that rides the owner's NEXT prompt, and the turn after it Zilla reads what was actually written. **Ambiguity in §11 resolved the safe way:** a Markdown-only skill goes live on the tap that authorized it, but anything carrying a script stays unapproved — unindexed, uncallable — until a second explicit tap in `/skills`, so no code-type skill ever runs without an owner approval tap. The index gate is the enforcement, not the model: only a live approval row whose sha256 (SKILL.md + every other byte) still matches disk gets named to the model or turned into a command, so a SKILL.md that appeared out-of-band is invisible; an edit after approval auto-switches it off with one owner line. Every approved skill is also an owner-scope slash command running the skill's wording through the same `_run_text_turn` path as typed text (`handle_message` refactored onto it). Legacy backend-native skills coexist ungated but became owner-turn-only. `test_skills.py` (152). 2024 green. Live Telegram smoke of the offer → ✅ → `/` autocomplete round trip not run. |
 | 2026-08-14 | **R2 fallback chain** — `zilla/chain.py` + the walk inside `core.handle_message`. Fires on error channels ONLY: a backend error, an empty answer after cli_engine's own retry, or a limit signal inside an error-shaped response. The shape gate moved into `review()` itself, which fixes a live bug — a long correct answer about quotas/429s was being replaced by a "you're rate-limited" notice. Each chain entry (setting `backend_chain`, default agy → opencode → claude, filtered to installed binaries) is gated on a fresh `health.login_ok` probe (stale ⇒ probed on demand), tried once, in a throwaway conv carrying one primer line, and the winner's answer ships with `↷ answered via <backend>`. The session keeps its own backend and conv id. `usage.fallbacks` bumped per attempt; exhausted ⇒ one honest sentence. Also: every test file now pins `ZILLA_HOME` to a tmpdir — the suite was writing into the owner's real `~/Zilla/Runtime/logs`. `test_chain.py` (61). 1870 green. |
 | 2026-08-14 | **R1 router + effort controller** — `zilla/router.py`: one pre-lock pass decides the class (command/share/trivial/normal, built on `review.classify_route`) and the effort (fast/standard/deep). The rules are fixed and the owner is on top of them — "think hard"/"take your time"/`!deep` beat the classifier even on a one-word message, and the marker is stripped before the model sees it. `effort_map` (setting) maps an effort to `backend:model`, validated at write time: naming agy is refused with a plain reason, since agy's model is one global string shared with every agy terminal on the machine. A fast turn injects core MEMORY.md only, runs in a throwaway conv and never advances the session's conv id; empty or error-shaped ⇒ silently rerun as a normal turn. Per-turn model override now reaches claude/opencode's `--model` (agy's dispatch structurally cannot take one). `test_router.py` (105). 1807 green. |
 | 2026-08-14 | **B1-B2 background lane + incognito** — `zilla/tasks.py` (pure marker parse + owner-facing copy), `tasks` table (+ `sessions.incognito`, both added by an idempotent `ALTER` on open), `core.Tasks`: a job runs in its own `task:<id>` session under a per-task lock, never the chat lock, capped at `max_bg_tasks` (2) with a bounded queue; `/bg`, `/tasks` board with stop/retry, `BG_TASK:` marker owner-turn-only and tap-gated, a job's own output can neither relay nor spawn work, crashed rows failed at boot. B2: `/new incognito` injects no memory/graph/curiosity and is enforced in code — mtime snapshot around the turn, `git checkout`/`clean` in `Memory/` on any change, one plain notice; the zero-model `share` route is gated too (it wrote the message verbatim into the journal before the lock); `/end` deletes the conv dir. `test_tasks.py` (165). 1702 green. Live Telegram smoke of B1 not run. |

@@ -82,6 +82,7 @@ from zilla.store import get_store
 from zilla import (
     memory, heartbeat, graph_html, relay as zrelay, zui as zzui,
     presence as zpresence, update as zupdate, tasks as ztasks,
+    skills as zskills,
 )
 from sessions import SessionManager
 import zilla.core as zcore
@@ -110,6 +111,7 @@ from keyboards import (
     kb_inbox_categories, kb_inbox_list, kb_outbox_categories, kb_outbox_list,
     kb_schedules, kb_health, kb_sysjobs, _can_change_model, _fmt_next,
     kb_tasks, kb_task_confirm, kb_task_retry,
+    kb_skills, kb_skill_confirm, kb_skill_detail,
     _IDLE_OPTIONS, _RETENTION_OPTIONS, INBOX_PAGE, INBOX_CAT_META, OUTBOX_CAT_META,
 )
 
@@ -1619,6 +1621,174 @@ async def _deliver_task_result(ev) -> None:
 
 
 # ══════════════════════════════════════════════════════════
+#  SKILLS  (Phase S — PLAN.md §11)
+# ══════════════════════════════════════════════════════════
+#  core.skills owns the gate (which skills may be advertised and called);
+#  this is the Telegram remainder — the panel, the taps, the offer card, and
+#  keeping the owner's "/" menu in step with what is approved.
+#
+#  Owner-only throughout. A skill is a procedure Zilla will follow on this
+#  computer, and Memory/Skills is the owner's tree; nobody else proposes,
+#  approves, or runs one.
+
+async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/skills — what I've saved, what's switched on, and what the AI itself
+    came with (PLAN.md §11 step 4: the two sources, labelled distinctly)."""
+    uid = update.effective_user.id
+    if not auth.is_owner(uid):
+        await update.message.reply_text("Owner only.")
+        return
+    managed = core.skills.listing()
+    await _open_menu(update, context,
+                     zskills.menu_text(managed, _legacy_skill_names()),
+                     kb_skills(managed), parse_mode="HTML")
+
+
+def _legacy_skill_names() -> list[str]:
+    """The backend's own installed skills (~/.claude/skills, agy's dirs) —
+    reported, never gated (PLAN.md §11 step 4)."""
+    try:
+        from zilla.config import get_skills_dir
+        root = get_skills_dir(get_backend())
+        return sorted(name for name in os.listdir(root)
+                      if os.path.isfile(os.path.join(root, name, "SKILL.md")))
+    except Exception:
+        return []
+
+
+async def _cb_skills(query, context, data, uid, chat_id):
+    """The taps: ✅/❌ on an offer, and switch a saved skill on or off."""
+    if not auth.is_owner(uid):
+        return
+
+    if data.startswith("skp_no_"):
+        entry = core.skills.decline(data.removeprefix("skp_no_"))
+        await query.edit_message_text(
+            "Left it — nothing saved." if entry
+            else "⏳ That offer expired or was already handled.")
+        return
+
+    if data.startswith("skp_ok_"):
+        entry = core.skills.accept(data.removeprefix("skp_ok_"))
+        await query.edit_message_text(
+            f"💾 I'll write down how to do “{entry['name']}” on your next "
+            "message." if entry
+            else "⏳ That offer expired or was already handled.")
+        return
+
+    if data.startswith("skill_view_"):
+        skill = core.skills.get(data.removeprefix("skill_view_"))
+        if skill is None:
+            await query.edit_message_text("That skill isn't there any more.")
+            return
+        await query.edit_message_text(
+            zskills.detail_text(skill),
+            reply_markup=kb_skill_detail(skill["slug"], skill.get("state", "")),
+            parse_mode="HTML")
+        return
+
+    if data.startswith("skill_ok_"):
+        skill = core.skills.approve(data.removeprefix("skill_ok_"), uid)
+        if skill is None:
+            await query.edit_message_text("I couldn't read that skill's file.")
+            return
+        await _sync_skill_commands()
+        await query.edit_message_text(
+            zskills.approved_line(skill, core.skills.command_for(
+                skill["slug"], _builtin_command_names())),
+            reply_markup=kb_skill_detail(skill["slug"], skill.get("state", "")))
+        return
+
+    if data.startswith("skill_off_"):
+        skill = core.skills.disable(data.removeprefix("skill_off_"))
+        if skill is None:
+            await query.edit_message_text("That skill isn't there any more.")
+            return
+        await _sync_skill_commands()
+        await query.edit_message_text(
+            zskills.disabled_line(skill),
+            reply_markup=kb_skill_detail(skill["slug"], skill.get("state", "")))
+        return
+
+    if data == "menu_skills":
+        managed = core.skills.listing()
+        await query.edit_message_text(
+            zskills.menu_text(managed, _legacy_skill_names()),
+            reply_markup=kb_skills(managed), parse_mode="HTML")
+
+
+async def _deliver_skill_proposal(ev) -> None:
+    """Render a core.SkillProposal — the agent wants to keep what it just
+    worked out. Nothing is written until _cb_skills resolves ev.id."""
+    if _application is None:
+        return
+    target = ev.chat_id or OWNER_CHAT_ID
+    if not target:
+        return
+    try:
+        await _application.bot.send_message(chat_id=target, text=ev.card,
+                                            reply_markup=kb_skill_confirm(ev.id))
+    except Exception as e:
+        logger.error(f"[SKILLS] could not show the offer: {e}")
+
+
+# ── every approved skill is also a slash command (PLAN.md §11 step 5) ──
+#
+#  This is how the owner adds a new /command going forward — there is no
+#  second mechanism. The command runs the skill's stored wording through the
+#  SAME pipeline as typed text (memory injection, effort routing, the review
+#  gate all apply): a shortcut for the words, never a different execution
+#  path and never a permissions bypass. Only APPROVED skills get one, so a
+#  skill Zilla hasn't approved is not callable either.
+
+# Skill command name -> handler registration state, so re-syncing after an
+# approval only adds what's genuinely new (PTB has no remove-handler by name).
+_skill_handlers: set[str] = set()
+
+
+def _builtin_command_names() -> set:
+    names = {spec.name for spec in COMMAND_REGISTRY}
+    names |= {a for spec in COMMAND_REGISTRY for a in spec.aliases}
+    return names
+
+
+async def cmd_skill_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for every skill-derived command. Resolves the typed name back
+    to an APPROVED skill at call time — a skill switched off (or auto-revoked
+    because its files changed) stops working immediately, even though its
+    handler object is still registered."""
+    uid = update.effective_user.id
+    if not auth.is_owner(uid):
+        return
+    typed = (update.message.text or "").split()[0].lstrip("/").split("@")[0]
+    prompt = core.skills.prompt_for_command(typed, _builtin_command_names())
+    if not prompt:
+        await update.message.reply_text(
+            "That skill isn't switched on any more. /skills shows why.")
+        return
+    extra = " ".join(context.args).strip() if context.args else ""
+    await _run_text_turn(update, context, uid, update.effective_chat.id,
+                         f"{prompt} {extra}".strip())
+
+
+async def _sync_skill_commands() -> None:
+    """Re-register the owner's "/" menu and add a handler for any new skill
+    command. Best effort: a Telegram failure here must never break the tap
+    that caused it."""
+    if _application is None:
+        return
+    try:
+        for entry in core.skills.commands(_builtin_command_names()):
+            if entry["command"] not in _skill_handlers:
+                _application.add_handler(
+                    CommandHandler(entry["command"], cmd_skill_run))
+                _skill_handlers.add(entry["command"])
+        await _register_commands(_application)
+    except Exception as e:
+        logger.warning(f"[SKILLS] command sync failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════
 #  UPDATE  (Phase H4 — PLAN.md §8/H4)
 # ══════════════════════════════════════════════════════════
 #  Owner-only, and never without a tap. The pipeline restarts Zilla as one
@@ -2027,6 +2197,10 @@ async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> Non
                 await _deliver_task_proposal(ev)
             elif isinstance(ev, zcore.TaskResult):
                 await _deliver_task_result(ev)
+            elif isinstance(ev, zcore.SkillProposal):
+                await _deliver_skill_proposal(ev)
+            elif isinstance(ev, zcore.SkillsChanged):
+                await _sync_skill_commands()
         except Exception as e:
             logger.error(f"[SCHED] event render failed: {e}", exc_info=True)
 
@@ -2644,6 +2818,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await _send_screenshot_now(update, context, uid, chat_id):
                 return
 
+    await _run_text_turn(update, context, uid, chat_id, user_message)
+
+
+async def _run_text_turn(update, context, uid: int, chat_id: int, user_message: str):
+    """One ordinary typed turn: the working indicator, the core run, the
+    reply. Shared by the text handler and by a skill's slash command
+    (PLAN.md §11 step 5) — that is what makes `/<skill>` a shortcut for the
+    wording rather than a second execution path."""
     logger.info(f"Message in [{sessions.get_active_name(uid)}]")
 
     stop_typing = asyncio.Event()
@@ -3353,6 +3535,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_update(query, context, data, uid, chat_id)
         elif data.startswith("bgt_") or data.startswith("task_"):
             await _cb_tasks(query, context, data, uid, chat_id)
+        elif data == "menu_skills" or data.startswith("skp_") or data.startswith("skill_"):
+            await _cb_skills(query, context, data, uid, chat_id)
         elif data.startswith("zui_"):
             await _cb_zui(query, context, data, uid, chat_id)
         else:
@@ -3507,8 +3691,9 @@ async def post_init(application):
     global _presence_task_handle
     _application = application
 
-    # Register the native Telegram slash-command menu (the "/" autocomplete).
-    await _register_commands(application)
+    # Register the native Telegram slash-command menu (the "/" autocomplete),
+    # including a handler + entry for every approved skill (Phase S step 5).
+    await _sync_skill_commands()
 
     # Wire the one Telegram-specific fast path the scheduler needs, then start
     # the core's scheduler runtime and bridge watcher (zilla/core.py — CORE_API
@@ -3607,6 +3792,8 @@ COMMAND_REGISTRY: list[_CommandSpec] = [
     _CommandSpec("graph", "Visual map of what Zilla knows (/graph <name> to focus)", cmd_graph, scope="owner"),
     _CommandSpec("relay", "Relay log — messages I sent to other people for you",
                  cmd_relay, scope="owner"),
+    _CommandSpec("skills", "Things I've learned to do — switch them on or off",
+                 cmd_skills, scope="owner"),
     _CommandSpec("schedule", "Add / manage scheduled jobs", cmd_schedule, aliases=("schedules",)),
     _CommandSpec("browse", "Browser control (/browse <url>)", cmd_browse),
     _CommandSpec("update", "Update Zilla to the newest version", cmd_update, scope="owner"),
@@ -3623,6 +3810,11 @@ async def _register_commands(application):
         await application.bot.set_my_commands(default_cmds, scope=BotCommandScopeDefault())
         if OWNER_CHAT_ID:
             owner_cmds = [BotCommand(c.name, c.description) for c in COMMAND_REGISTRY if c.scope in ("default", "owner")]
+            # Phase S step 5: every APPROVED skill is also a command, in the
+            # owner's own scope only — this is how the owner adds a new
+            # /command, and an unapproved skill never appears here.
+            owner_cmds += [BotCommand(e["command"], e["description"])
+                           for e in core.skills.commands(_builtin_command_names())]
             await application.bot.set_my_commands(
                 owner_cmds, scope=BotCommandScopeChat(chat_id=OWNER_CHAT_ID),
             )

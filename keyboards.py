@@ -467,3 +467,49 @@ def kb_task_retry(tid: str):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("▶ Try again", callback_data=f"task_retry_{tid}"),
     ]])
+
+
+# Phase S (PLAN.md §11): the skills panel. One row per skill opens it; the
+# on/off decision lives on the detail screen, so the list stays readable on
+# a phone once a few skills exist (R18).
+SKILLS_PAGE = 6
+
+
+def kb_skill_confirm(pid: str):
+    """The agent offered to save a skill — one tap saves it, one drops it.
+    A card attached to a message carries no Close (R20)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💾 Save it", callback_data=f"skp_ok_{pid}"),
+        InlineKeyboardButton("No thanks", callback_data=f"skp_no_{pid}"),
+    ]])
+
+
+def kb_skills(skills: list):
+    """The /skills list — one row per managed skill, opening its detail."""
+    rows = []
+    for s in skills[:SKILLS_PAGE]:
+        icon = {"ok": "✅", "unapproved": "⏸", "disabled": "🚫",
+                "changed": "⚠️"}.get(s.get("state"), "•")
+        rows.append([InlineKeyboardButton(
+            f"{icon} {(s.get('name') or s.get('slug') or '')[:24]}",
+            callback_data=f"skill_view_{s['slug']}",
+        )])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_skill_detail(slug: str, state: str):
+    """One skill: switch it on (approve the bytes as they are now) or off.
+    An approved-and-unchanged skill offers only 'off', so the owner is never
+    asked to re-approve something that hasn't moved."""
+    row = []
+    if state != "ok":
+        row.append(InlineKeyboardButton("✅ Switch on",
+                                        callback_data=f"skill_ok_{slug}"))
+    if state in ("ok", "changed"):
+        row.append(InlineKeyboardButton("🚫 Switch off",
+                                        callback_data=f"skill_off_{slug}"))
+    rows = [row] if row else []
+    rows.append([InlineKeyboardButton("◀ Back", callback_data="menu_skills"),
+                 _close_btn()])
+    return InlineKeyboardMarkup(rows)
