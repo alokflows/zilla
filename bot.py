@@ -75,12 +75,12 @@ from config import (
     SCHEDULES_FILE, agy_models_live,
     model_catalog, get_backend, set_backend,
     run_first_start_migration, run_zilla_home_migration,
-    DB_FILE, MEMORY_DIR, LOG_DIR, PID_FILE, LOCK_FILE, RUNTIME_DIR,
+    DB_FILE, MEMORY_DIR, LOG_DIR, PID_FILE, LOCK_FILE, RUNTIME_DIR, BASE_DIR,
 )
 from zilla.store import get_store
 from zilla import (
     memory, heartbeat, graph_html, relay as zrelay, zui as zzui,
-    presence as zpresence,
+    presence as zpresence, update as zupdate,
 )
 from sessions import SessionManager
 import zilla.core as zcore
@@ -1447,6 +1447,81 @@ async def cmd_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{icons.get(r.get('status'), '•')} {r.get('ts', '')} → "
                      f"{r.get('name') or r.get('alias')}: {summary}")
     await update.message.reply_text("\n".join(lines))
+
+
+# ══════════════════════════════════════════════════════════
+#  UPDATE  (Phase H4 — PLAN.md §8/H4)
+# ══════════════════════════════════════════════════════════
+#  Owner-only, and never without a tap. The pipeline restarts Zilla as one
+#  of its steps, so it can't run inside the bot process — the tap spawns
+#  `zilla update --announce <chat>` detached, and that process delivers the
+#  single result line itself once everything (including a rollback, if the
+#  checks fail) has settled.
+
+def _kb_confirm_update():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Update now", callback_data="upd_go"),
+         InlineKeyboardButton("Cancel", callback_data="upd_no")],
+    ])
+
+
+def _spawn_update(chat_id: int) -> bool:
+    """Start the update pipeline in its own detached process. Uses the SAME
+    interpreter the bot is running under, so it stays inside the venv."""
+    import subprocess
+    cmd = [sys.executable, "-m", "zilla.cli", "update", "--announce", str(chat_id)]
+    kwargs = {"cwd": BASE_DIR, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, **kwargs)
+        return True
+    except Exception as e:
+        logger.error(f"[UPDATE] could not start the updater: {e}")
+        return False
+
+
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Phase H4 step 1: show what an update would do, then wait for the tap."""
+    uid = update.effective_user.id
+    if not auth.is_owner(uid):
+        await update.message.reply_text("Owner only.")
+        return
+    try:
+        state = await asyncio.to_thread(zupdate.update_available)
+        available = bool(state.get("available"))
+    except Exception as e:
+        logger.warning(f"[UPDATE] availability check failed: {e}")
+        available = False
+    line = ("There's a newer version ready." if available
+            else "I'm already on the newest version I can see.")
+    await update.message.reply_text(
+        "⬆️ Update\n\n"
+        f"{line}\n"
+        "I'll install it, check everything still works, and put the old "
+        "version back if it doesn't.\n\n"
+        "Zilla goes quiet for a minute or two.",
+        reply_markup=_kb_confirm_update(),
+    )
+
+
+async def _cb_update(query, context, data, uid, chat_id):
+    if not auth.is_owner(uid):
+        return
+    if data == "upd_no":
+        await query.edit_message_text("Left as it is.")
+        return
+    if data != "upd_go":
+        return
+    if _spawn_update(chat_id):
+        await query.edit_message_text(
+            "Updating now — I'll message you when it's done.")
+    else:
+        await query.edit_message_text(
+            "I couldn't start the update just now — try again shortly.")
 
 
 # ══════════════════════════════════════════════════════════
@@ -3101,6 +3176,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_approvals(query, context, data, uid, chat_id)
         elif data.startswith("relay_"):
             await _cb_relay(query, context, data, uid, chat_id)
+        elif data.startswith("upd_"):
+            await _cb_update(query, context, data, uid, chat_id)
         elif data.startswith("zui_"):
             await _cb_zui(query, context, data, uid, chat_id)
         else:
@@ -3355,6 +3432,7 @@ COMMAND_REGISTRY: list[_CommandSpec] = [
                  cmd_relay, scope="owner"),
     _CommandSpec("schedule", "Add / manage scheduled jobs", cmd_schedule, aliases=("schedules",)),
     _CommandSpec("browse", "Browser control (/browse <url>)", cmd_browse),
+    _CommandSpec("update", "Update Zilla to the newest version", cmd_update, scope="owner"),
     _CommandSpec("adduser", "Add an admin", cmd_adduser, scope="owner"),
     _CommandSpec("removeuser", "Remove an admin", cmd_removeuser, scope="owner"),
     _CommandSpec("listusers", "Manage admins", cmd_listusers, scope="owner"),

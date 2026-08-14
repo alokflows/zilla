@@ -1547,6 +1547,13 @@ class ZillaCore:
                 _health.mark_alerted(kind)
                 log_event("health_alert", kind=kind, detail=(res.get("detail") or "")[:200])
 
+        # H4 (PLAN.md §8): "is a newer version available" — a `git fetch
+        # --dry-run` that self-limits to 1x/day and only ever writes a cached
+        # flag a beat may mention. It is NOT a probe: an available update is
+        # not a fault and never alerts.
+        from zilla import update as _update
+        await asyncio.to_thread(_update.refresh_update_check)
+
     async def _health_loop(self) -> None:
         logger.info("[HEALTH] probe loop started")
         while True:

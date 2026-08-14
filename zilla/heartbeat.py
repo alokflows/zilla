@@ -89,7 +89,11 @@ def prepare_beat(s: dict, base: str | None = None) -> dict | None:
     now = datetime.now().astimezone()
     tz_name = now.tzname() or "local"
     from zilla import health as _health
-    flags = _health.beat_flag_lines()
+    from zilla import update as _update
+    # H4 (PLAN.md §8): a beat may MENTION an available update, never install
+    # one. Cache-only read — the daily `git fetch --dry-run` runs on the
+    # health timer, so a beat never shells out.
+    flags = _health.beat_flag_lines() + _update.beat_flag_lines()
     s = dict(s)
     s["prompt"] = build_beat_prompt(now, s.get("last_run"), tz_name, flags=flags)
     return s

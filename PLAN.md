@@ -1379,7 +1379,7 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] U2 Agent ZUI education + contacts loop
 - [x] U3 Design system (STYLE.md + menu refactor)
 - [x] U4 Presence (pinned status card, silent restarts)
-- [ ] H4 Self-update with rollback
+- [x] H4 Self-update with rollback — 2026-08-14 *(`zilla/update.py`: owner-triggered pipeline, doctor-gated, rolls back commit + database. The gate is two signals, not one — a failed import always rolls back, an environment problem that predates the update never does, so a box missing `flac` can't revert a good release. `/update` shows a confirm card and the tap spawns `zilla update --announce <chat>` detached, since the pipeline restarts the bot mid-run. `test_update.py` (99).)*
 - [ ] B1 Background task lane + /tasks
 - [ ] B2 Incognito sessions
 - [ ] R1 Triage router + effort controller

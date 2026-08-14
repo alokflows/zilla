@@ -1,7 +1,7 @@
 # ============================================================
 #  CLI — the `zilla` console entrypoint (Phase 2 steps 1-2)
 # ============================================================
-#  Subcommands: config / doctor / start / stop / status / logs.
+#  Subcommands: config / doctor / start / stop / status / update / logs.
 #  These PROMOTE what already exists — install.py --doctor, start.sh /
 #  stop.sh, the pid/lock files — never duplicate their logic; every
 #  subcommand here is a thin wrapper that imports and calls the real
@@ -130,6 +130,27 @@ def cmd_logs(args) -> int:
     return 0
 
 
+def cmd_update(args) -> int:
+    """PLAN.md §8/H4. Typing `zilla update` IS the confirmation — nothing
+    below runs on its own. `--check` only looks; `--announce <chat id>`
+    delivers the single result line to Telegram (how the chat-triggered run
+    reports back, since it restarts the bot mid-pipeline)."""
+    import zilla.update as zupdate
+
+    if args.check:
+        state = zupdate.update_available(force=args.force)
+        print("  An update is available — run `zilla update` to install it."
+              if state["available"] else "  Zilla is up to date.")
+        return 0
+
+    print("  Updating Zilla…")
+    result = zupdate.run_update()
+    print(zupdate.format_steps(result))
+    if args.announce:
+        zupdate.notify(args.announce, result["message"])
+    return 0 if result["ok"] else 1
+
+
 def cmd_bare(_args) -> int:
     """Bare `zilla`: launch the TUI if it exists, else a friendly fallback."""
     try:
@@ -158,6 +179,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop", help="stop the bot")
     sub.add_parser("status", help="is the bot running")
 
+    p_update = sub.add_parser("update", help="update Zilla, with automatic rollback")
+    p_update.add_argument("--check", action="store_true", help="only report whether one is available")
+    p_update.add_argument("--force", action="store_true", help="with --check, bypass the daily cache")
+    p_update.add_argument("--announce", type=int, default=0, metavar="CHAT_ID",
+                          help="send the one-line result to this Telegram chat")
+
     p_logs = sub.add_parser("logs", help="tail the bot log")
     p_logs.add_argument("-n", "--lines", type=int, default=50, help="lines to show (default 50)")
     p_logs.add_argument("-f", "--follow", action="store_true", help="keep tailing")
@@ -181,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         "start": cmd_start,
         "stop": cmd_stop,
         "status": cmd_status,
+        "update": cmd_update,
         "logs": cmd_logs,
     }
     handler = handlers.get(args.command, cmd_bare)
