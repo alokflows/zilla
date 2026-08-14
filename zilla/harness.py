@@ -244,6 +244,27 @@ first (what's already there, why it might be that way) rather than assuming. \
 Prefer existing tools/libraries already in this project over building custom \
 ones from scratch."""
 
+# Phase U2 (PLAN.md §7/U2): teach the ZUI protocol, don't hard-code widgets.
+# The agent decides WHEN and WHAT; zilla/zui.py decides HOW and enforces the
+# limits — an invalid block is dropped and the text still delivers, so the
+# model can attempt a widget without risking the answer.
+_ZUI_PROTOCOL = """\
+INTERFACE: you may end a reply with at most 2 fenced ```zui blocks, each one \
+JSON, to answer with real interface instead of more text. Kinds:
+• buttons — offer next actions as taps: {"kind":"buttons","items":[{"label":"Book \
+the 6pm ticket","say":"book the 6pm ticket"},{"label":"Open site","url":"https://…"}]} \
+(verbs: say = submits that text as the user's next message, url = http/https link, \
+copy = value sent back for long-press copy)
+• card — a structured answer (a booking, a plan, a summary): \
+{"kind":"card","title":"Flight to Delhi","subtitle":"Tue 12 Aug","fields":[{"label":"Depart","value":"18:05"}],"footer":"Prices change"}
+• table — comparisons or lists of records: {"kind":"table","headers":["Item","Price"],"rows":[["Rice","₹120"]]}
+• contacts — a person's reachable info: {"kind":"contacts","items":["Ramesh"]} — \
+NAME them only; the number comes from their page, never from you
+• location — {"kind":"location","place":"Shop"} or explicit {"lat":…,"lon":…}
+Use one when it genuinely helps (options → buttons, records → table, a person's \
+number → contacts). Plain prose stays plain — never a widget for its own sake, \
+and never a button whose text you wouldn't want submitted as the user's words."""
+
 # Backend display names (the "mode" the model is running as).
 _BACKEND_LABEL = {
     "claude": "Claude Code (Anthropic)",
@@ -269,7 +290,8 @@ def engine_context(backend: str | None = None) -> str:
 
 def operating_contract(backend: str | None = None) -> str:
     """The compact, always-on rule block (sent every turn, both backends)."""
-    return f"{engine_context(backend)}\n\n{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}\n\n{_SELF_HEAL}"
+    return (f"{engine_context(backend)}\n\n{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}\n\n"
+            f"{_ZUI_PROTOCOL}\n\n{_SELF_HEAL}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -475,7 +497,7 @@ def build_preamble(*, is_new: bool, backend: str | None = None,
     if skills:
         parts.append("AVAILABLE SKILLS (load only when the task needs one):\n" + skills)
 
-    parts.append(f"{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}\n\n{_SELF_HEAL}")
+    parts.append(f"{_TRUST_CONTRACT}\n\n{_STYLE_CONTRACT}\n\n{_ZUI_PROTOCOL}\n\n{_SELF_HEAL}")
     parts.append(relay)
     if memory_block:
         parts.append(memory_block)

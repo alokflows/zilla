@@ -1375,10 +1375,10 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] K3 Curiosity loop *(done 2026-07-19, 1105 green — store.py `curiosity(node_id, gap, asked_at)` table; graph.py `_structural_gaps()` (person w/o `contact::`, org/place w/o `located_in::` relation, checked every page reindex) + `_sync_ghost_gaps()` (ghost referenced from >=2 distinct pages, checked once per full reindex pass) both funnel into `Store.curiosity_sync_node()` which preserves `asked_at` for a gap still open and drops it once closed; `graph.pending_curiosity(db, hits)` is the harness-facing read: given this turn's alias_scan() hits (relevance gate, same set K2 already computed), picks the single strongest hit with a pending gap, marks it asked now (the same mechanism that both caps a turn to one question and gives an unanswered gap a 7-day cooldown before it can resurface), returns permission-to-ask text (phrasing stays the model's). harness.py's `wrap_prompt()` gained a `[curiosity]` block, owner-only, appended after the K2 graph card, sharing one alias_scan() call via new `_graph_hits()`. Live-smoked against a throwaway ZILLA_HOME/Memory through the real claude backend: mentioning a new person ("priya") with no saved contact info got a reply that naturally asked for her number/a good day to meet; mentioning her again in the same conversation did not repeat the ask (cooldown holding).)*
 - [x] K4 Graph views (/graph HTML) — 2026-07-19
 - [x] K5 Team relay: delegated send & scheduling — 2026-08-14
-- [ ] U1 ZUI protocol (cards/tables/contacts/buttons)
-- [ ] U2 Agent ZUI education + contacts loop
-- [ ] U3 Design system (STYLE.md + menu refactor)
-- [ ] U4 Presence (pinned status card, silent restarts)
+- [x] U1 ZUI protocol (cards/tables/contacts/buttons)
+- [x] U2 Agent ZUI education + contacts loop
+- [x] U3 Design system (STYLE.md + menu refactor)
+- [x] U4 Presence (pinned status card, silent restarts)
 - [ ] H4 Self-update with rollback
 - [ ] B1 Background task lane + /tasks
 - [ ] B2 Incognito sessions

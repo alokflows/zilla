@@ -37,15 +37,18 @@ no paid dependencies.
 | Repo | `alokflows/zilla`, branch `main` |
 | Live bot | @Mangomangos_bot on the owner's MacBook |
 
-Pushing needs the alokflows token — the keychain answers with a different
-account:
+Switch the GitHub account before any push or `gh` call
+(`~/Documents/Work/AGENTS.md` is the machine contract; this folder is the
+`alokflows` account):
 
 ```
-export GH_TOKEN_ALOK=$(gh auth token --user alokflows)
-git -c credential.helper= \
-    -c credential.helper='!f() { test "$1" = get && printf "username=alokflows\npassword=%s\n" "$GH_TOKEN_ALOK"; }; f' \
-    push origin main
+gh auth switch --user alokflows
+git push origin main
 ```
+
+"Repository not found" means the wrong account is active — check with
+`gh api user --jq .login`. Never put an AI attribution or a `Co-Authored-By`
+trailer in a commit.
 
 ---
 
@@ -84,20 +87,19 @@ review gate, every route logged).
 | **F1-F5** | One clean `ZILLA_HOME` layout · dynamic backend + slash-command registry (no hard-coded buttons) · media importance/retention · system jobs invisible and silent · conversational schedule answers (`schedule_query.py`) |
 | **K1-K4** | Relational memory: entity pages → `nodes`/`aliases`/`edges` graph (`memgraph.py`) · turn-time entity linking, so mentioning a person surfaces what Zilla knows · curiosity loop (asks one good question about a real gap) · `/graph` self-contained HTML map + TUI graph screen |
 | **K5** | Team relay: "tell Priya to send the report" / "remind Rahul every Monday at 9" → resolved against the graph, owner taps ✅, then it goes. `/relay` audit log. A relay target's reply is reported to the owner and never becomes a turn |
+| **U1-U4** | Generative UI: the model emits a fenced ```zui block and Telegram renders it natively — buttons/card/table/contacts/location (`zilla/zui.py`) · the protocol is taught in the preamble, never hard-coded · one design system (`docs/dev/STYLE.md`) applied across every menu · presence replaces the startup blast: one pinned status card edited in place, a new message only for a first install, an update, or real downtime (`zilla/presence.py`) |
 | **R3** | opencode as a third backend |
 
-**Tests: 1254 green across 20 files** (as of 2026-08-14), plus the import
+**Tests: 1432 green across 22 files** (as of 2026-08-14), plus the import
 smoke: `import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
 import schedule_query; import zilla.graph; import zilla.graph_html; import
-memgraph; import zilla.relay`. `test_schedules_seam.py` is a frozen
+memgraph; import zilla.relay; import zilla.zui; import zilla.presence`. `test_schedules_seam.py` is a frozen
 acceptance spec — never edit it. Recount fresh per file rather than trusting
 any grand total.
 
 ### Checklist — build in this order (PLAN.md §13)
 
-- [x] M1-M4 · H1-H3 · F1-F5 · K1-K4 · K5 · R3
-- [ ] **U1-U4** Generative UI: ZUI protocol (cards/tables/contacts/buttons),
-      agent education, design system (`STYLE.md`), pinned status card (PLAN §7)
+- [x] M1-M4 · H1-H3 · F1-F5 · K1-K4 · K5 · R3 · U1-U4
 - [ ] **H4** Self-update with doctor-gated rollback (PLAN §8)
 - [ ] **B1-B2** Background task lane + `/tasks`; incognito sessions (PLAN §9)
 - [ ] **R1** Triage router refinement — mostly shipped as `zilla/review.py`;
@@ -172,6 +174,14 @@ directly · `WIKI_DIRNAME` is defined in both `zilla/memory.py` and
 `zilla/graph.py` · `SESSIONS_FILE`/`SETTINGS_FILE`/`USERS_FILE`/`SCHEDULES_FILE`
 all alias `DB_FILE` since M1 and could collapse.
 
+Left over from the U3 style pass (all live in `bot.py`, which was busy that
+session — see `docs/dev/STYLE.md` rule numbers): panel titles still use `═══`
+divider rows and shouty headings (R10) · the inbox panel's redundant `📤`
+button shares its callback with the filename button, so drop the button and
+the "or 📤" copy together · `kb_schedules` uses two rows per schedule, so 5+
+schedules scroll (R18, wants pagination) · `kb_user_detail` has no `✕ Close`
+(R15) · `zilla/zui.py`'s own renderers were never style-audited.
+
 ## Live smokes still to do (need the owner's own devices/people)
 
 - K5 relay end to end: a second real person on Telegram — watch the confirm
@@ -179,6 +189,9 @@ all alias `DB_FILE` since M1 and could collapse.
 - The `Memory/` + `zilla.db` migration on the owner's real `zilla start`
   (wired and idempotent, just never run against production yet).
 - Menu Close and the callback-failure notice in the real chat.
+- U-phase in the real chat: ask for something that earns a card/table, tap a
+  ZUI button (say / copy / url), and confirm the pinned card gets edited —
+  not re-posted — across a restart.
 
 ---
 
@@ -186,6 +199,7 @@ all alias `DB_FILE` since M1 and could collapse.
 
 | Date | What shipped |
 |---|---|
+| 2026-08-14 | **U1-U4 generative UI** — `zilla/zui.py` (```zui block → buttons/card/table/contacts/location, caps + owner gate + `ButtonStore`), `_ZUI_PROTOCOL` taught in `harness.py`, `docs/dev/STYLE.md` (22 numbered rules) applied across `keyboards.py`, `zilla/presence.py` + pinned status card replacing the startup blast, `/status` alias. `test_zui.py` (137) + `test_presence.py` (41). 1432 green. |
 | 2026-08-14 | **K5 team relay** — `zilla/relay.py` (marker parse/strip, alias→`telegram_uid::` resolution), `relay_log` table, `RelayRequest` + `core.relay` hold/confirm/audit, owner-only marker processing on the turn pipeline, confirm card + `/relay` + inbound-report carve-out in `bot.py`, `test_memory_k5.py` (107 checks). Ticked R3 (shipped 2026-07-19). 1254 green. |
 | 2026-08-14 | HANDOFF split: this short brief at the root, full history moved to `docs/dev/HANDOFF_ARCHIVE.md`. |
 | ≤2026-07-19 | Foundation, M1-M4, H1-H3, F1-F5, K1-K4, R3 — one line per session in the archive. |

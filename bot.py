@@ -78,7 +78,10 @@ from config import (
     DB_FILE, MEMORY_DIR, LOG_DIR, PID_FILE, LOCK_FILE, RUNTIME_DIR,
 )
 from zilla.store import get_store
-from zilla import memory, heartbeat, graph_html, relay as zrelay
+from zilla import (
+    memory, heartbeat, graph_html, relay as zrelay, zui as zzui,
+    presence as zpresence,
+)
 from sessions import SessionManager
 import zilla.core as zcore
 import zilla.backend_registry as backend_registry
@@ -288,6 +291,10 @@ _core_events_queue: asyncio.Queue = None
 _core_events_task_handle: asyncio.Task = None
 # Nightly db-backup checker (started in post_init, cancelled in post_shutdown).
 _backup_task_handle: asyncio.Task = None
+
+# Phase U4: the pinned-status-card refresher (started in post_init, cancelled
+# in post_shutdown).
+_presence_task_handle: asyncio.Task = None
 
 # Per-chat id of the CURRENT live menu message. When a new menu opens we strip
 # the previous one's buttons so old menus in the chat history can't be tapped
@@ -791,11 +798,130 @@ def _sysjobs_panel_text(items: list) -> str:
 #  RESPONSE PIPELINE
 # ══════════════════════════════════════════════════════════
 
+# Phase U1: pending button payloads (callback_data is 64 bytes, so a button
+# carries a short id and the payload lives here). Identity-checked on tap.
+_zui_buttons = zzui.ButtonStore()
+
+
+def _zui_keyboard(block: dict, user_id: int) -> InlineKeyboardMarkup:
+    """One validated `buttons` block → an inline keyboard, two per row.
+    `url` buttons are native links; `say`/`copy` become callbacks bound to
+    THIS user, so nobody else's tap can fire them."""
+    row, rows = [], []
+    for item in block["items"]:
+        if item["verb"] == "url":
+            button = InlineKeyboardButton(item["label"], url=item["value"])
+        else:
+            bid = _zui_buttons.put(user_id, item["verb"], item["value"])
+            button = InlineKeyboardButton(item["label"], callback_data=f"zui_{bid}")
+        row.append(button)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def _deliver_zui_block(context, block: dict, user_id: int, chat_id: int) -> None:
+    """Render one validated block with the native widget for its kind.
+    Every failure here is one logged line — a widget that can't be sent
+    never turns into an error message for the owner (P4)."""
+    kind = block["kind"]
+    # contacts/location read the OWNER's entity pages, so they only ever
+    # render for the owner — the same scope guard memory injection uses,
+    # enforced here in code rather than trusted to the model.
+    if kind in ("contacts", "location") and not auth.is_owner(user_id):
+        logger.info(f"[ZUI] {kind} block suppressed for non-owner {user_id}")
+        return
+    try:
+        if kind in ("card", "table"):
+            await safe_send(context.bot, chat_id, zzui.render_text(block),
+                            parse_mode="HTML")
+
+        elif kind == "buttons":
+            await context.bot.send_message(
+                chat_id=chat_id, text="Next steps:",
+                reply_markup=_zui_keyboard(block, user_id))
+
+        elif kind == "contacts":
+            # Numbers come from the entity pages, never from the model.
+            people = zzui.resolve_contacts(get_store(DB_FILE), block["items"], MEMORY_DIR)
+            for person in people:
+                await context.bot.send_contact(
+                    chat_id=chat_id, phone_number=person["phone"],
+                    first_name=person["name"])
+            if not people:
+                logger.info("[ZUI] contacts block resolved to nobody with a phone::")
+
+        elif kind == "location":
+            place = zzui.resolve_location(get_store(DB_FILE), block, MEMORY_DIR)
+            if place is None:
+                logger.info("[ZUI] location block had no resolvable coordinates")
+                return
+            await context.bot.send_venue(
+                chat_id=chat_id, latitude=place["lat"], longitude=place["lon"],
+                title=place["title"] or "Location",
+                address=place["address"] or place["title"] or "")
+    except Exception as e:
+        logger.error(f"[ZUI] could not deliver a {kind} block: {e}")
+
+
+async def _cb_zui(query, context, data, uid, chat_id):
+    """Phase U1 step 2: a tapped `say` or `copy` button.
+
+    `say` replays the button's text through the NORMAL turn pipeline as the
+    tapping user — this is what makes a reply feel alive: the agent offers
+    next actions and a tap takes them. `copy` echoes the value as monospace
+    for a long-press copy. An unknown/expired id, or a tap from anyone the
+    block wasn't addressed to, gets one calm line and nothing else."""
+    entry = _zui_buttons.get(data.removeprefix("zui_"), uid)
+    if entry is None:
+        # handle_callback already spent query.answer(), so say it in the chat.
+        await safe_send(context.bot, chat_id, "That option isn't available any more.")
+        return
+
+    if entry["verb"] == "copy":
+        await safe_send(context.bot, chat_id,
+                        f"<code>{zzui._esc(entry['value'])}</code>", parse_mode="HTML")
+        return
+
+    # say — run it as a real turn for this user.
+    await safe_send(context.bot, chat_id, f"➤ {entry['value']}")
+    stop_typing = asyncio.Event()
+    progress = _ProgressBubble()
+    typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop_typing, progress))
+    response = ""
+    try:
+        response = await _relay_cli_turn(None, uid, chat_id, entry["value"],
+                                        auto_title=True, progress=progress)
+    except Exception as e:
+        response = _friendly_error(e)
+        logger.error(f"[ZUI] say-turn failed: {e}", exc_info=True)
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+    await send_response(None, context, response, uid, chat_id)
+
+
 async def send_response(update, context, response: str, user_id: int, chat_id: int):
-    formatted_text, parse_mode = format_for_telegram(response)
-    chunks = split_message(formatted_text)
-    for chunk in chunks:
-        await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
+    # Phase U1: pull any ```zui block out of the reply and render it as real
+    # widgets after the text. A block that fails validation is simply gone —
+    # the text still ships (P4).
+    response, zui_blocks, zui_dropped = zzui.extract(response or "")
+    if zui_dropped:
+        logger.info(f"[ZUI] dropped {zui_dropped} invalid block(s)")
+
+    # A reply that is ONLY a widget sends no text bubble — never the
+    # "No response." placeholder.
+    if response.strip() or not zui_blocks:
+        formatted_text, parse_mode = format_for_telegram(response)
+        chunks = split_message(formatted_text)
+        for chunk in chunks:
+            await safe_send(context.bot, chat_id, chunk, parse_mode=parse_mode)
+
+    for block in zui_blocks:
+        await _deliver_zui_block(context, block, user_id, chat_id)
 
     # Model rate-limited? Tell the user which model is blocked and let them
     # switch right here (only if they're allowed to change the model).
@@ -1085,13 +1211,13 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     active = sessions.get_active_name(uid)
     conv_id = sessions.get_conversation_id(user_id=uid)
+    # Phase U4: the same line the pinned card carries, on demand.
     await update.message.reply_text(
-        f"🏓 Pong!\n"
-        f"Session: [{active}] | Conv: {'active' if conv_id else 'new'}\n"
+        f"{_presence_card_text(online=True)}\n"
+        f"Session: [{active}] · conversation {'active' if conv_id else 'new'}\n"
         f"Model: {get_model()}\n"
         f"Uptime: {get_uptime_str()}\n"
-        f"Audio: {get_audio_status()}\n"
-        f"Version: v{BOT_VERSION}"
+        f"Audio: {get_audio_status()}"
     )
 
 
@@ -2975,6 +3101,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_approvals(query, context, data, uid, chat_id)
         elif data.startswith("relay_"):
             await _cb_relay(query, context, data, uid, chat_id)
+        elif data.startswith("zui_"):
+            await _cb_zui(query, context, data, uid, chat_id)
         else:
             await _cb_misc(query, context, data, uid, chat_id)
     except Exception as e:
@@ -3014,8 +3142,117 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 #  STARTUP
 # ══════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════
+#  PRESENCE  (Phase U4 — PLAN.md §7/U4)
+# ══════════════════════════════════════════════════════════
+#  One pinned card in the owner's chat, edited in place (an edit sends no
+#  notification). A new message only when it carries information. The
+#  decision logic and all the copy live in zilla/presence.py; this is the
+#  Telegram half: pin once, edit forever, and keep a liveness stamp so the
+#  next start can tell a routine restart from real downtime.
+
+PRESENCE_REFRESH_SEC = 900.0
+
+
+def _last_system_beat() -> float | None:
+    """When a Zilla-owned job (H1's heartbeat, M4's distillation) last ran —
+    the honest "I was alive at" signal for the card."""
+    try:
+        runs = [s.get("last_run") for s in core.schedules.list_system(OWNER_CHAT_ID)]
+        runs = [r for r in runs if r]
+        return max(runs) if runs else None
+    except Exception:
+        return None
+
+
+def _presence_card_text(online: bool = True, since: float | None = None) -> str:
+    beat = _last_system_beat()
+    return zpresence.card_text(online=online, backend=get_backend(),
+                               version=BOT_VERSION, last_beat=beat, since=since)
+
+
+async def _presence_write_card(application, text: str) -> None:
+    """Edit the pinned card in place; if it has gone (owner deleted it),
+    post and pin a fresh one. Every failure is one log line."""
+    state = zpresence.read_state()
+    card_id = state["card_id"]
+    if card_id is not None:
+        try:
+            await application.bot.edit_message_text(
+                chat_id=OWNER_CHAT_ID, message_id=card_id, text=text)
+            return
+        except Exception as e:
+            # "message is not modified" is the common, harmless case.
+            if "not modified" in str(e).lower():
+                return
+            logger.info(f"[PRESENCE] card edit failed, posting a new one: {e}")
+    try:
+        msg = await application.bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
+        zpresence.write_state(card_id=msg.message_id)
+        try:
+            await application.bot.pin_chat_message(
+                chat_id=OWNER_CHAT_ID, message_id=msg.message_id,
+                disable_notification=True)
+        except Exception as e:
+            logger.info(f"[PRESENCE] could not pin the card: {e}")
+    except Exception as e:
+        logger.warning(f"[PRESENCE] could not post the card: {e}")
+
+
+async def _presence_startup(application) -> None:
+    if not OWNER_CHAT_ID:
+        return
+    state = zpresence.read_state()
+    verdict = zpresence.decide_startup(
+        now=time.time(), last_seen=state["last_seen"],
+        stored_version=state["version"], version=BOT_VERSION,
+        card_id=state["card_id"],
+        downtime_notify_min=zpresence.downtime_notify_min())
+    logger.info(f"[PRESENCE] start: {verdict['reason']}")
+
+    if verdict["message"]:
+        try:
+            await safe_send(application.bot, OWNER_CHAT_ID, verdict["message"])
+        except Exception as e:
+            logger.warning(f"[PRESENCE] notice failed: {e}")
+
+    await _presence_write_card(application, _presence_card_text(online=True))
+    zpresence.write_state(version=BOT_VERSION)
+    zpresence.touch_seen()
+
+
+async def _presence_shutdown(application) -> None:
+    """Best-effort on a clean stop: flip the card to Offline. A crash or a
+    dead battery skips this, which is exactly why the card also carries the
+    last-check time."""
+    if not OWNER_CHAT_ID or application is None:
+        return
+    try:
+        await _presence_write_card(
+            application, zpresence.card_text(online=False, backend=get_backend(),
+                                             version=BOT_VERSION, since=time.time()))
+    except Exception as e:
+        logger.debug(f"[PRESENCE] shutdown card update skipped: {e}")
+
+
+async def _presence_loop() -> None:
+    """Keep the liveness stamp fresh and the card's last-check line current.
+    Silent by construction — it only ever edits."""
+    while True:
+        try:
+            await asyncio.sleep(PRESENCE_REFRESH_SEC)
+            zpresence.touch_seen()
+            if _application is not None and OWNER_CHAT_ID:
+                await _presence_write_card(_application, _presence_card_text(online=True))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[PRESENCE] refresh skipped: {e}")
+
+
 async def post_init(application):
     global _application, _core_events_queue, _core_events_task_handle, _backup_task_handle
+    global _presence_task_handle
     _application = application
 
     # Register the native Telegram slash-command menu (the "/" autocomplete).
@@ -3033,25 +3270,23 @@ async def post_init(application):
     _backup_task_handle = application.create_task(_backup_loop())
     await core.start()
 
-    if OWNER_CHAT_ID:
-        try:
-            await application.bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text=(
-                    f"⚡ Zilla is online (v{BOT_VERSION})\n"
-                    f"Model: {get_model()}\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                ),
-            )
-        except Exception as e:
-            logger.warning(f"[STARTUP] Owner notify failed: {e}")
+    # Phase U4: presence, not announcements. A routine restart edits the
+    # pinned card silently; only real news gets its own message.
+    await _presence_startup(application)
+    _presence_task_handle = application.create_task(_presence_loop())
 
 
 async def post_shutdown(application):
     """Mirror of post_init's startup wiring: stop the core's scheduler task,
     the event-render consumer, and the db-backup checker cleanly on
     shutdown."""
-    global _core_events_task_handle, _backup_task_handle
+    global _core_events_task_handle, _backup_task_handle, _presence_task_handle
+    # Phase U4: best-effort "offline since" on a clean shutdown, before the
+    # loop that maintains the card is cancelled.
+    await _presence_shutdown(application)
+    if _presence_task_handle is not None:
+        _presence_task_handle.cancel()
+        _presence_task_handle = None
     try:
         await core.stop()
     except Exception as e:
@@ -3104,7 +3339,7 @@ class _CommandSpec:
 COMMAND_REGISTRY: list[_CommandSpec] = [
     _CommandSpec("start", "Start / welcome", cmd_start, scope="hidden"),
     _CommandSpec("help", "Show all commands", cmd_help),
-    _CommandSpec("ping", "Status check", cmd_ping),
+    _CommandSpec("ping", "Status check", cmd_ping, aliases=("status",)),
     _CommandSpec("menu", "Open the control panel", cmd_menu),
     _CommandSpec("cancel", "Stop a running request", cmd_cancel),
     _CommandSpec("new", "Start a new session", cmd_new),

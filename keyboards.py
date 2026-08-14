@@ -5,6 +5,11 @@
 #  item lists, the current model, the user id) into a Telegram
 #  InlineKeyboardMarkup. No business logic, no network I/O.
 #
+#  Every label here obeys `docs/dev/STYLE.md` (Phase U3): sentence
+#  case, no decorative emoji (the accent emoji lives in the screen
+#  title, which bot.py owns), only the functional glyphs of R13,
+#  primary action above the nav row, `✕ Close` always last-row-right.
+#
 #  The only runtime dependency on the rest of the bot is `auth`
 #  (the AuthManager instance), which bot.py injects at startup
 #  via `keyboards.auth = auth`. It is None until then, but these
@@ -27,10 +32,10 @@ auth = None
 
 # Idle-reaper cycle options shown in Settings.
 _IDLE_OPTIONS = [
-    (120, "2 min — Fast"),
-    (180, "3 min — Default"),
-    (300, "5 min — Patient"),
-    (0, "No reaper"),
+    (120, "2 min — quick"),
+    (180, "3 min — normal"),
+    (300, "5 min — patient"),
+    (0, "Never"),
 ]
 
 # F3: media retention sweep options (owner-facing, button values only —
@@ -44,17 +49,18 @@ _RETENTION_OPTIONS = [
 
 # Inbox/Outbox pagination + category metadata.
 INBOX_PAGE = 10
+# Labels carry no emoji (STYLE.md R12) — the accent icon is in the panel title.
 INBOX_CAT_META = [
-    ("images", "📷 Images"),
-    ("audio", "🎵 Audio"),
-    ("video", "🎬 Video"),
-    ("documents", "📄 Documents"),
+    ("images", "Images"),
+    ("audio", "Audio"),
+    ("video", "Video"),
+    ("documents", "Documents"),
 ]
 # Outbox (agent-produced files) — same UX as the Inbox, but no audio.
 OUTBOX_CAT_META = [
-    ("images", "📷 Images"),
-    ("video", "🎬 Video"),
-    ("documents", "📄 Documents"),
+    ("images", "Images"),
+    ("video", "Video"),
+    ("documents", "Documents"),
 ]
 
 
@@ -73,14 +79,14 @@ def _idle_label(val: int) -> str:
     for v, label in _IDLE_OPTIONS:
         if v == val:
             return label
-    return f"{val}s"
+    return f"{val} seconds"
 
 
 def _retention_label(days: int) -> str:
     for v, label in _RETENTION_OPTIONS:
         if v == days:
             return label
-    return f"{days}d"
+    return f"{days} days"
 
 
 def _fmt_next(ts) -> str:
@@ -92,26 +98,26 @@ def _fmt_next(ts) -> str:
 def kb_menu(uid: int = 0):
     is_admin = bool(auth and auth.can(uid, "admin"))
     rows = [
-        [InlineKeyboardButton("📁 Sessions", callback_data="menu_sessions"),
-         InlineKeyboardButton("📥 Inbox", callback_data="menu_inbox")],
-        [InlineKeyboardButton("📤 Outbox", callback_data="menu_outbox")],
+        [InlineKeyboardButton("Sessions", callback_data="menu_sessions"),
+         InlineKeyboardButton("Inbox", callback_data="menu_inbox")],
+        [InlineKeyboardButton("Outbox", callback_data="menu_outbox")],
     ]
     if is_admin:
-        # ⏰ Schedules previously had NO menu entry (command-only) — added here.
+        # Schedules previously had NO menu entry (command-only) — added here.
         rows.append([
-            InlineKeyboardButton("⏰ Schedules", callback_data="menu_schedules"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
+            InlineKeyboardButton("Schedules", callback_data="menu_schedules"),
+            InlineKeyboardButton("Settings", callback_data="menu_settings"),
         ])
-        model_row = [InlineKeyboardButton("🌐 Browse", callback_data="menu_browse")]
+        model_row = [InlineKeyboardButton("Browse", callback_data="menu_browse")]
         if _can_change_model(uid):
-            model_row.insert(0, InlineKeyboardButton("🤖 Model", callback_data="menu_model"))
+            model_row.insert(0, InlineKeyboardButton("Model", callback_data="menu_model"))
         rows.append(model_row)
     rows.append([
-        InlineKeyboardButton("🖥️ Status", callback_data="menu_status"),
-        InlineKeyboardButton("🩺 Health", callback_data="menu_health"),
+        InlineKeyboardButton("Status", callback_data="menu_status"),
+        InlineKeyboardButton("Health", callback_data="menu_health"),
     ])
     if auth and auth.is_owner(uid):
-        rows.append([InlineKeyboardButton("👥 Users", callback_data="menu_users")])
+        rows.append([InlineKeyboardButton("Users", callback_data="menu_users")])
     rows.append([_close_btn()])
     return InlineKeyboardMarkup(rows)
 
@@ -119,18 +125,20 @@ def kb_menu(uid: int = 0):
 def kb_sessions(all_sessions: dict, active: str):
     buttons = []
     for name, info in all_sessions.items():
-        marker = " ◀" if name == active else ""
+        # State glyph leads the label (STYLE.md R20); ✓ marks the live session.
+        marker = "✓ " if name == active else ""
         msgs = info.get("messages", 0)
         # Switch on the left, delete (🗑) on the right of the same row.
         buttons.append([
             InlineKeyboardButton(
-                f"{name}{marker} ({msgs} msgs)",
+                f"{marker}{name} · {msgs} messages",
                 callback_data=f"sess_switch_{name}",
             ),
             InlineKeyboardButton("🗑", callback_data=f"sess_delete_{name}"),
         ])
+    # Action above navigation (R16); Close last-row-right (R15).
+    buttons.append([InlineKeyboardButton("➕ New session", callback_data="sess_new")])
     buttons.append([
-        InlineKeyboardButton("➕ New", callback_data="sess_new"),
         InlineKeyboardButton("◀ Menu", callback_data="menu_back"),
         _close_btn(),
     ])
@@ -139,8 +147,9 @@ def kb_sessions(all_sessions: dict, active: str):
 
 def kb_session_delete(name: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes, delete", callback_data=f"sess_confirm_del_{name}"),
-         InlineKeyboardButton("❌ Cancel", callback_data="sess_list")],
+        # R19: the confirm button names the action; cancel sits on the right.
+        [InlineKeyboardButton("🗑 Delete session", callback_data=f"sess_confirm_del_{name}"),
+         InlineKeyboardButton("Cancel", callback_data="sess_list")],
     ])
 
 
@@ -157,13 +166,13 @@ def kb_model(current: str):
             buttons.append(row); row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("✏️ Custom…", callback_data="model_custom")])
+    buttons.append([InlineKeyboardButton("Custom…", callback_data="model_custom")])
     # PLAN.md §17/F2: every OTHER backend that's actually installed gets a
     # button — no button for one that isn't, and a 3rd registered backend
     # (e.g. R3's opencode) shows up here with zero edits to this file.
     active = get_backend()
     switch_row = [
-        InlineKeyboardButton(f"🧠 Use {a.name}", callback_data=f"model_use_{a.name}")
+        InlineKeyboardButton(f"Use {a.name}", callback_data=f"model_use_{a.name}")
         for a in installed_backends() if a.name != active
     ]
     if switch_row:
@@ -176,30 +185,30 @@ def kb_settings(uid: int = 0):
     auto_photo = get_setting("auto_describe_photos", False)
     rows = [
         [InlineKeyboardButton(
-            f"📸 Auto-analyze photos: {'ON' if auto_photo else 'OFF'}",
+            f"Describe photos: {'on' if auto_photo else 'off'}",
             callback_data="set_toggle_photo",
         )],
     ]
     if auth and auth.can(uid, "admin"):
         idle_kill = get_idle_kill_after()
         rows.append([InlineKeyboardButton(
-            f"⏱️ Idle reaper: {_idle_label(idle_kill)}",
+            f"Close idle chats: {_idle_label(idle_kill)}",
             callback_data="set_cycle_idle",
         )])
     if auth and auth.can(uid, "admin"):
         catchup = get_setting("schedule_catchup", True)
         rows.append([InlineKeyboardButton(
-            f"⏰ Catch up missed schedules: {'ON' if catchup else 'OFF'}",
+            f"Catch up missed schedules: {'on' if catchup else 'off'}",
             callback_data="set_toggle_catchup",
         )])
     if auth and auth.is_owner(uid):
         admins_model = get_setting("admins_can_change_model", True)
         rows.append([InlineKeyboardButton(
-            f"🤖 Admins can change model: {'ON' if admins_model else 'OFF'}",
+            f"Admins can change model: {'on' if admins_model else 'off'}",
             callback_data="set_toggle_admin_model",
         )])
         rows.append([InlineKeyboardButton(
-            f"🧠 Backend: {get_backend()}", callback_data="noop",
+            f"AI engine: {get_backend()}", callback_data="noop",
         )])
         # PLAN.md §17/F2: one button per OTHER installed backend, derived
         # from the registry — not a fixed 2-way toggle.
@@ -211,7 +220,7 @@ def kb_settings(uid: int = 0):
         if switch_row:
             rows.append(switch_row)
         rows.append([InlineKeyboardButton(
-            f"🗄️ Storage: {_retention_label(get_media_retention_days())}",
+            f"Storage: {_retention_label(get_media_retention_days())}",
             callback_data="set_storage",
         )])
     rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
@@ -244,21 +253,23 @@ def kb_health():
     System jobs sub-panel (heartbeat/distillation/etc — deliberately
     absent from /schedules now)."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗄️ System jobs", callback_data="menu_sysjobs")],
+        [InlineKeyboardButton("System jobs", callback_data="menu_sysjobs")],
         [InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()],
     ])
 
 
 def kb_sysjobs(items: list):
-    """Row per system job: [state · title · last run] toggles pause/resume.
+    """Row per system job: [state · title] toggles pause/resume.
     Never a delete button — system jobs are pausable only (ScheduleManager.
     remove refuses them)."""
     rows = []
     for s in items:
+        # One line, no timestamp: the panel text above already carries
+        # "last run" (R4/R18 — the button must not wrap).
         state = "✅" if s.get("enabled") else "⏸"
-        title = s.get("title", "")[:40]
+        title = s.get("title", "")[:28]
         rows.append([InlineKeyboardButton(
-            f"{state} {title} · last {_fmt_next(s.get('last_run'))}",
+            f"{state} {title}",
             callback_data=f"sysjob_toggle_{s['id']}",
         )])
 
@@ -268,8 +279,10 @@ def kb_sysjobs(items: list):
 
 def kb_error():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Retry", callback_data="err_retry"),
-         InlineKeyboardButton("🤖 Change Model", callback_data="err_model")],
+        # R5/R14: the recovery action first, plainly named. No Close on a
+        # card attached to a message (R20).
+        [InlineKeyboardButton("Try again", callback_data="err_retry"),
+         InlineKeyboardButton("Change model", callback_data="err_model")],
     ])
 
 
@@ -279,10 +292,10 @@ def kb_users(users: dict):
         name = info.get("name") or f"User {uid_int}"
         role = info.get("role", "admin")
         buttons.append([InlineKeyboardButton(
-            f"[{role}] {name}", callback_data=f"user_detail_{uid_int}",
+            f"{name} · {role}", callback_data=f"user_detail_{uid_int}",
         )])
+    buttons.append([InlineKeyboardButton("➕ Add user", callback_data="user_add_start")])
     buttons.append([
-        InlineKeyboardButton("➕ Add User", callback_data="user_add_start"),
         InlineKeyboardButton("◀ Menu", callback_data="menu_back"),
         _close_btn(),
     ])
@@ -294,13 +307,13 @@ def kb_user_detail(target_id: int, role: str = "admin"):
     # but every request waits for the owner's approval (Approval mode).
     if role == "limited":
         toggle = InlineKeyboardButton(
-            "🔓 Give full access", callback_data=f"user_role_admin_{target_id}")
+            "Give full access", callback_data=f"user_role_admin_{target_id}")
     else:
         toggle = InlineKeyboardButton(
-            "🔒 Put in Approval mode", callback_data=f"user_role_limited_{target_id}")
+            "Put in approval mode", callback_data=f"user_role_limited_{target_id}")
     return InlineKeyboardMarkup([
         [toggle],
-        [InlineKeyboardButton("🗑️ Remove", callback_data=f"user_remove_{target_id}"),
+        [InlineKeyboardButton("🗑 Remove", callback_data=f"user_remove_{target_id}"),
          InlineKeyboardButton("◀ Back", callback_data="user_list")],
     ])
 
@@ -324,7 +337,8 @@ def kb_inbox_list(category: str, items: list, offset: int):
     for i, item in enumerate(page):
         idx = offset + i
         name = item["name"]
-        label = name if len(name) <= 24 else name[:21] + "…"
+        # 18 chars: this row holds three buttons (STYLE.md R4/R17).
+        label = name if len(name) <= 18 else name[:17] + "…"
         send_cb = f"ibx_send_{category}_{idx}"
         rows.append([
             InlineKeyboardButton(
@@ -335,10 +349,10 @@ def kb_inbox_list(category: str, items: list, offset: int):
     nav = []
     if offset > 0:
         nav.append(InlineKeyboardButton(
-            "⬅️ Prev", callback_data=f"ibx_cat_{category}_{max(0, offset - INBOX_PAGE)}"))
+            "◀ Previous", callback_data=f"ibx_cat_{category}_{max(0, offset - INBOX_PAGE)}"))
     if offset + INBOX_PAGE < len(items):
         nav.append(InlineKeyboardButton(
-            "More ➡️", callback_data=f"ibx_cat_{category}_{offset + INBOX_PAGE}"))
+            "Next ▶", callback_data=f"ibx_cat_{category}_{offset + INBOX_PAGE}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_inbox"), _close_btn()])
@@ -374,7 +388,8 @@ def kb_outbox_list(category: str, items: list, offset: int):
     for i, item in enumerate(page):
         idx = offset + i
         name = item["name"]
-        label = name if len(name) <= 24 else name[:21] + "…"
+        # 18 chars: this row holds three buttons (STYLE.md R4/R17).
+        label = name if len(name) <= 18 else name[:17] + "…"
         send_cb = f"obx_send_{category}_{idx}"
         rows.append([
             InlineKeyboardButton(
@@ -385,10 +400,10 @@ def kb_outbox_list(category: str, items: list, offset: int):
     nav = []
     if offset > 0:
         nav.append(InlineKeyboardButton(
-            "⬅️ Prev", callback_data=f"obx_cat_{category}_{max(0, offset - INBOX_PAGE)}"))
+            "◀ Previous", callback_data=f"obx_cat_{category}_{max(0, offset - INBOX_PAGE)}"))
     if offset + INBOX_PAGE < len(items):
         nav.append(InlineKeyboardButton(
-            "More ➡️", callback_data=f"obx_cat_{category}_{offset + INBOX_PAGE}"))
+            "Next ▶", callback_data=f"obx_cat_{category}_{offset + INBOX_PAGE}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("◀ Categories", callback_data="menu_outbox"), _close_btn()])
@@ -396,17 +411,18 @@ def kb_outbox_list(category: str, items: list, offset: int):
 
 
 def kb_schedules(items: list):
-    """Row per schedule: [▶ toggle/title · next] then [▶️ run | 🗑] underneath."""
+    """Row per schedule: [state · title] toggles it, then [▶ run | 🗑] underneath."""
     rows = []
     for s in items:
+        # One line per row: the panel text above already carries "next run".
         state = "✅" if s.get("enabled") else "⏸"
-        title = s.get("title", "")[:24]
+        title = s.get("title", "")[:28]
         rows.append([InlineKeyboardButton(
-            f"{state} {title} · {_fmt_next(s.get('next_run'))}",
+            f"{state} {title}",
             callback_data=f"sched_toggle_{s['id']}",
         )])
         rows.append([
-            InlineKeyboardButton("▶️ Run now", callback_data=f"sched_run_{s['id']}"),
+            InlineKeyboardButton("▶ Run now", callback_data=f"sched_run_{s['id']}"),
             InlineKeyboardButton("🗑 Delete", callback_data=f"sched_del_{s['id']}"),
         ])
     rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
