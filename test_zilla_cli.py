@@ -49,6 +49,12 @@ with open(_fake_agy, "w", encoding="utf-8") as f:
 os.environ["AGY_SETTINGS_FILE"] = _fake_agy
 os.environ["BACKEND"] = "agy"
 
+# Tests must never write into the owner's real ~/Zilla (logs, media,
+# Memory). config binds every path off ZILLA_HOME at import time, so this
+# has to happen before the first zilla import in this file.
+import os as _os, tempfile as _tf  # noqa: E402
+_os.environ.setdefault("ZILLA_HOME", _tf.mkdtemp(prefix="zilla_test_home_"))
+_os.makedirs(_os.path.join(_os.environ["ZILLA_HOME"], "Runtime", "logs"), exist_ok=True)
 import zilla.config as config  # noqa: E402
 config.SETTINGS_FILE = os.path.join(_tmpdir, "bot_settings.json")
 config._settings_cache = None

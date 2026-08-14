@@ -54,6 +54,8 @@ from zilla.config import (
 )
 from zilla.formatter import detect_file_paths
 from zilla.harness import log_event, TurnContext
+from zilla import chain
+from zilla import health as _health
 from zilla import router
 from zilla.review import review
 from zilla.schedules import resolve_session_mode, backend_pin_mismatch
@@ -1441,6 +1443,56 @@ class ZillaCore:
                             yield ev
                         response, detected_id = out["result"]
 
+                # Phase R2 — the fallback chain. Only ever on an error
+                # channel, and only from inside the lock: a rescue turn is
+                # still this user's turn.
+                if not cancel_event.is_set():
+                    fired, why = chain.should_fallback(review(text, response), response)
+                    if fired:
+                        ran_from = decision.backend or get_backend()
+                        tried = [ran_from]
+                        rescued = None
+                        for candidate in chain.order(self._installed_backends()):
+                            if candidate in tried:
+                                continue
+                            probe = await asyncio.to_thread(
+                                _health.login_ok, candidate, chain.PROBE_MAX_AGE)
+                            if not probe.get("ok"):
+                                log_event("chain_skip", user=user_id, backend=candidate,
+                                          detail=str(probe.get("detail"))[:120])
+                                continue
+                            log_event("chain_try", user=user_id, backend=candidate,
+                                      after=ran_from, reason=why)
+                            yield Progress(text=f"↷ {ran_from} couldn't answer — trying {candidate}…")
+                            alt_ctx = TurnContext(
+                                uid=user_id, role=self.auth.role_of(user_id),
+                                is_owner=self.auth.is_owner(user_id), origin=origin,
+                                incognito=incognito, effort=router.STANDARD,
+                                backend=candidate,
+                            )
+                            async for ev in _run_and_pump(
+                                    f"{chain.primer(text)}\n\n{text}", None, alt_ctx):
+                                yield ev
+                            alt_response, _alt_conv = out["result"]
+                            tried.append(candidate)
+                            self._record_fallback(candidate)
+                            again, _ = chain.should_fallback(
+                                review(text, alt_response), alt_response)
+                            if not again:
+                                rescued = (alt_response, candidate)
+                                break
+                        if rescued:
+                            response = chain.with_footnote(*rescued)
+                            log_event("chain_ok", user=user_id, backend=rescued[1])
+                        elif len(tried) > 1:
+                            response = chain.exhausted_note(tried)
+                            log_event("chain_exhausted", user=user_id, tried=tried)
+                        # A fallback turn is a throwaway conversation on a
+                        # backend this session never chose — the session keeps
+                        # its own conv id (I-CONV).
+                        if len(tried) > 1:
+                            detected_id = None
+
                 if decision.fast_profile:
                     # Throwaway conversation: nothing about it is recorded
                     # against the session (I-CONV).
@@ -1913,6 +1965,34 @@ class ZillaCore:
         except Exception as e:
             logger.error(f"[TASK] marker processing failed: {e}", exc_info=True)
             return text
+
+    # ── Phase R2: fallback chain support ───────────────────
+
+    @staticmethod
+    def _installed_backends() -> dict:
+        """Which chain entries have a binary on this machine. Read through
+        the backend registry so adding a backend never means editing this."""
+        from zilla.backend_registry import get as _get_adapter
+        out = {}
+        for name in chain.DEFAULT_ORDER:
+            adapter = _get_adapter(name)
+            try:
+                out[name] = bool(adapter and adapter.binary())
+            except Exception:
+                out[name] = False
+        return out
+
+    def _record_fallback(self, backend: str) -> None:
+        """One rescue attempt on `backend` — counted so the usage view shows
+        how often the primary is failing. Never breaks the turn."""
+        try:
+            from zilla import store as _store
+            from zilla.config import DB_FILE
+            _store.get_store(DB_FILE).usage_bump(
+                datetime.now().strftime("%Y-%m-%d"), backend,
+                turns=1, fallbacks=1)
+        except Exception as e:
+            logger.debug(f"[CHAIN] usage bump failed: {e}")
 
     def _is_incognito(self, uid: int, sname: str) -> bool:
         """Phase B2: does this session carry the incognito flag? Any failure

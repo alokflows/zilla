@@ -151,6 +151,51 @@ def probe_claude_login(force: bool = False, claude_path: str | None = None,
     return _cached("claude_login", CLAUDE_PING_TTL, force, compute)
 
 
+def probe_opencode_login(force: bool = False) -> dict:
+    """opencode's free `opencode/` namespace needs no login at all, so this
+    is a reachability check rather than an auth one — but it goes through the
+    same cache/TTL shape as the others so the chain can treat every backend
+    identically."""
+    def compute():
+        from zilla.backends import opencode_identity
+        ident = opencode_identity(force=force) or {}
+        if ident.get("error"):
+            return {"ok": False, "detail": str(ident["error"])[:200]}
+        return {"ok": True, "detail": "opencode reachable"}
+    return _cached("opencode_login", _AGY_LOGIN_TTL, force, compute)
+
+
+_LOGIN_PROBES = {
+    "agy": probe_agy_login,
+    "claude": probe_claude_login,
+    "opencode": probe_opencode_login,
+}
+
+
+def login_ok(backend: str, max_age: float | None = None) -> dict:
+    """Phase R2 eligibility: is THIS backend logged in, according to a probe
+    that is still fresh? A stale (or missing) result is re-probed on demand
+    rather than assumed either way — assuming yes hands a turn to a logged-out
+    CLI that will hang on a login prompt, and assuming no silently shortens
+    the chain to nothing.
+
+    Returns the probe dict ({'ok', 'detail', 'ts'}) with an added 'stale'
+    flag, or ok=False for a backend that has no probe at all."""
+    probe = _LOGIN_PROBES.get((backend or "").strip().lower())
+    if probe is None:
+        return {"ok": False, "detail": f"no login probe for '{backend}'", "stale": False}
+    kind = f"{backend}_login"
+    prev = _cache.get(kind)
+    fresh_enough = (
+        prev is not None
+        and (max_age is None or (time.time() - prev["ts"]) < max_age)
+    )
+    if fresh_enough:
+        return {**prev, "stale": False}
+    result = probe(force=prev is not None)
+    return {**result, "stale": True}
+
+
 def run_probes(active_backend: str, db_path: str, force: bool = False) -> dict:
     """The full probe set for one health tick (PLAN.md §6/H2 step 1): disk,
     db writability, both backend binaries on PATH (cheap, always checked),

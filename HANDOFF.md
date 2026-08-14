@@ -91,18 +91,17 @@ review gate, every route logged).
 | **R3** | opencode as a third backend |
 | **B1-B2** | Background lane: a job runs in its own session under its own lock, so the chat never waits (`zilla/tasks.py`, `core.Tasks`, `/bg`, `/tasks`) · incognito sessions (`/new incognito`) where nothing is remembered — enforced by reverting the memory tree after the turn, not by asking the model nicely |
 
-**Tests: 1807 green across 25 files** (as of 2026-08-14), plus the import
+**Tests: 1870 green across 26 files** (as of 2026-08-14), plus the import
 smoke: `import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
 import schedule_query; import zilla.graph; import zilla.graph_html; import
 memgraph; import zilla.relay; import zilla.zui; import zilla.presence; import
-zilla.update; import zilla.tasks; import zilla.router`. `test_schedules_seam.py` is a frozen
+zilla.update; import zilla.tasks; import zilla.router; import zilla.chain`. `test_schedules_seam.py` is a frozen
 acceptance spec — never edit it. Recount fresh per file rather than trusting
 any grand total.
 
 ### Checklist — build in this order (PLAN.md §13)
 
-- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4 · B1-B2 · R1
-- [ ] **R2** Fallback chain (error / empty / limit only — never on long runtime)
+- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4 · B1-B2 · R1-R2
 - [ ] **S** Skills from chat, one owner approval tap before code-type skills run
 - [ ] **C1-C3** Brain export/import · connectors screen · cloud backup +
       bootstrap-from-cloud (PLAN §12)
@@ -200,6 +199,7 @@ schedules scroll (R18, wants pagination) · `kb_user_detail` has no `✕ Close`
 
 | Date | What shipped |
 |---|---|
+| 2026-08-14 | **R2 fallback chain** — `zilla/chain.py` + the walk inside `core.handle_message`. Fires on error channels ONLY: a backend error, an empty answer after cli_engine's own retry, or a limit signal inside an error-shaped response. The shape gate moved into `review()` itself, which fixes a live bug — a long correct answer about quotas/429s was being replaced by a "you're rate-limited" notice. Each chain entry (setting `backend_chain`, default agy → opencode → claude, filtered to installed binaries) is gated on a fresh `health.login_ok` probe (stale ⇒ probed on demand), tried once, in a throwaway conv carrying one primer line, and the winner's answer ships with `↷ answered via <backend>`. The session keeps its own backend and conv id. `usage.fallbacks` bumped per attempt; exhausted ⇒ one honest sentence. Also: every test file now pins `ZILLA_HOME` to a tmpdir — the suite was writing into the owner's real `~/Zilla/Runtime/logs`. `test_chain.py` (61). 1870 green. |
 | 2026-08-14 | **R1 router + effort controller** — `zilla/router.py`: one pre-lock pass decides the class (command/share/trivial/normal, built on `review.classify_route`) and the effort (fast/standard/deep). The rules are fixed and the owner is on top of them — "think hard"/"take your time"/`!deep` beat the classifier even on a one-word message, and the marker is stripped before the model sees it. `effort_map` (setting) maps an effort to `backend:model`, validated at write time: naming agy is refused with a plain reason, since agy's model is one global string shared with every agy terminal on the machine. A fast turn injects core MEMORY.md only, runs in a throwaway conv and never advances the session's conv id; empty or error-shaped ⇒ silently rerun as a normal turn. Per-turn model override now reaches claude/opencode's `--model` (agy's dispatch structurally cannot take one). `test_router.py` (105). 1807 green. |
 | 2026-08-14 | **B1-B2 background lane + incognito** — `zilla/tasks.py` (pure marker parse + owner-facing copy), `tasks` table (+ `sessions.incognito`, both added by an idempotent `ALTER` on open), `core.Tasks`: a job runs in its own `task:<id>` session under a per-task lock, never the chat lock, capped at `max_bg_tasks` (2) with a bounded queue; `/bg`, `/tasks` board with stop/retry, `BG_TASK:` marker owner-turn-only and tap-gated, a job's own output can neither relay nor spawn work, crashed rows failed at boot. B2: `/new incognito` injects no memory/graph/curiosity and is enforced in code — mtime snapshot around the turn, `git checkout`/`clean` in `Memory/` on any change, one plain notice; the zero-model `share` route is gated too (it wrote the message verbatim into the journal before the lock); `/end` deletes the conv dir. `test_tasks.py` (165). 1702 green. Live Telegram smoke of B1 not run. |
 | 2026-08-14 | **H4 self-update** — `zilla/update.py`: record commit → fetch → pull --ff-only → pip install → `VACUUM INTO` backup → migrations → restart → checks, with automatic rollback of both the commit and the database. Gate is two signals: a failed import always rolls back, an environment problem that predates the update never does. `/update` (owner, confirm tap) spawns `zilla update --announce <chat>` detached — the pipeline restarts the bot, so it can't run inside it. Beats may mention an available update (daily `git fetch --dry-run` on the health timer, cache-only read). `test_update.py` (99). 1533 green. |

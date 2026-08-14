@@ -44,6 +44,12 @@ def check(name, cond, detail=""):
 
 
 import install  # noqa: E402
+# Tests must never write into the owner's real ~/Zilla (logs, media,
+# Memory). config binds every path off ZILLA_HOME at import time, so this
+# has to happen before the first zilla import in this file.
+import os as _os, tempfile as _tf  # noqa: E402
+_os.environ.setdefault("ZILLA_HOME", _tf.mkdtemp(prefix="zilla_test_home_"))
+_os.makedirs(_os.path.join(_os.environ["ZILLA_HOME"], "Runtime", "logs"), exist_ok=True)
 import zilla.doctor as zdoctor  # noqa: E402
 import zilla.platform_compat as platform_compat  # noqa: E402
 

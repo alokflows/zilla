@@ -1,0 +1,16 @@
+{
+  "sessions": {
+    "8740189938_main": {
+      "name": "main",
+      "user_id": 8740189938,
+      "created": "2026-07-16 23:40:21",
+      "messages": 7,
+      "last_seen_step": 55,
+      "title": null,
+      "conversation_id": "a13cf2c9-1a7a-496f-ac21-6920de6738b6",
+      "conv_backend": "agy",
+      "last_used": "2026-07-17 00:25:18"
+    }
+  },
+  "active_per_user": {}
+}

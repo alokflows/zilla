@@ -177,16 +177,19 @@ def _installed(backend: str) -> bool:
 
 def default_effort_map() -> dict:
     """Cheapest and strongest among the per-invocation-flag backends that
-    are actually on this machine. Empty entries mean "no target" — the
-    turn runs on the session's backend, which is always a valid answer."""
+    are actually on this machine, following the chain's own priority
+    (PLAN.md §10 R2.1): opencode's free namespace is the cheapest thing
+    here, so it takes `fast` when present; claude's opus is the strongest,
+    so it takes `deep`. A missing entry means "no target" — the turn runs
+    on the session's backend, which is always a valid answer."""
     from zilla import config
     out: dict[str, dict] = {}
-    if _installed("claude"):
+    if _installed("opencode"):
+        out[FAST] = {"backend": "opencode", "model": config.get_model_for("opencode")}
+    elif _installed("claude"):
         out[FAST] = {"backend": "claude", "model": "haiku"}
+    if _installed("claude"):
         out[DEEP] = {"backend": "claude", "model": "opus"}
-    elif _installed("opencode"):
-        model = config.get_model_for("opencode")
-        out[FAST] = {"backend": "opencode", "model": model}
     return out
 
 

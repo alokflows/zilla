@@ -48,6 +48,12 @@ with open(_fake_agy, "w", encoding="utf-8") as f:
 os.environ["AGY_SETTINGS_FILE"] = _fake_agy
 os.environ["BACKEND"] = "agy"
 
+# Tests must never write into the owner's real ~/Zilla (logs, media,
+# Memory). config binds every path off ZILLA_HOME at import time, so this
+# has to happen before the first zilla import in this file.
+import os as _os, tempfile as _tf  # noqa: E402
+_os.environ.setdefault("ZILLA_HOME", _tf.mkdtemp(prefix="zilla_test_home_"))
+_os.makedirs(_os.path.join(_os.environ["ZILLA_HOME"], "Runtime", "logs"), exist_ok=True)
 import zilla.config as config  # noqa: E402
 config.DB_FILE = os.path.join(_tmpdir, "zilla_test.db")
 config.SETTINGS_FILE = config.DB_FILE
@@ -271,6 +277,17 @@ def _run_target_tests():
               backend == "opencode" and bool(model), (backend, model))
         check("and there is no deep target to promise",
               router.target_for(router.DEEP) == (None, None))
+    finally:
+        _restore_backends(old)
+
+    old = _with_backends(claude=True, opencode=True)
+    try:
+        check("with both present, fast goes to opencode — the free namespace "
+              "is the cheapest thing on the machine",
+              router.target_for(router.FAST)[0] == "opencode",
+              router.target_for(router.FAST))
+        check("and deep goes to claude's strongest",
+              router.target_for(router.DEEP) == ("claude", "opus"))
     finally:
         _restore_backends(old)
 

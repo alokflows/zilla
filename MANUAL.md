@@ -232,6 +232,17 @@ This isn't a bug — one thread just got too long.
 
 > Remember: **Inbox = stuff you sent in. Outbox = stuff the bot produced.**
 
+### If one AI is down 🔁
+
+If the AI that runs your chat fails — an error, an empty reply, or a real rate limit — Zilla
+quietly asks the next one you have installed instead of giving up. You'll see a small line at
+the bottom saying **`↷ answered via claude`** so you always know who answered. Your notebook
+stays on its own AI; the rescue is a one-off.
+
+It only does this on **real failures**. A perfectly good answer that happens to talk about
+quotas or error 429 is not a failure, and is never thrown away. If everything is down, Zilla
+says so in one plain sentence rather than pretending.
+
 ### If a reply looks wrong
 
 - Replies feel like they're **dragging in old context** → send **`/new`**.

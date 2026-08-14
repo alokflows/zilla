@@ -57,6 +57,29 @@ _GENERIC_EMPTY = (
 
 _EMPTY_NOTE = "I didn't get any output back — try rephrasing?"
 
+# A response long enough to be a real answer is never read as an error
+# signal, whatever words it contains (PLAN.md §10 R2.1). detect_limit()
+# substring-matches "quota"/"429"/"overloaded" ANYWHERE, so without this
+# gate a correct answer ABOUT rate limits would be replaced by a
+# "you're rate-limited" notice — and, under R2, thrown away and re-asked
+# on another backend context-free.
+ERROR_SHAPE_MAX_CHARS = 300
+
+
+def is_error_shaped(text: str) -> bool:
+    """Short and structured like a failure, rather than prose. The only
+    shape in which a limit signal is allowed to mean 'rate-limited'."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if len(stripped) > ERROR_SHAPE_MAX_CHARS:
+        return False
+    if stripped.startswith(FAIL_PREFIXES):
+        return True
+    # A short stub with no sentence structure: a CLI's own error line, not
+    # somebody's answer.
+    return stripped.count(".") <= 2 and "\n\n" not in stripped
+
 
 @dataclass
 class ReviewResult:
@@ -100,8 +123,9 @@ def review(user_message: str, response: str, *, exit_reason: str | None = None) 
     if not stripped or stripped.lower() in _GENERIC_EMPTY:
         return ReviewResult(verdict="stop", reason="empty", user_note=_EMPTY_NOTE)
 
-    # 2. limit
-    limit_reason = detect_limit(text)
+    # 2. limit — but ONLY in something shaped like an error. A long answer
+    # that merely discusses quotas and 429s is an answer.
+    limit_reason = detect_limit(text) if is_error_shaped(text) else None
     if limit_reason:
         return ReviewResult(
             verdict="stop", reason="limit",

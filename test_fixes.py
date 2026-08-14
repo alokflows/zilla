@@ -1132,6 +1132,12 @@ def test_platform_compat_imports_clean():
 #  MIGRATION (first-start JSON → SQLite import, PLAN.md §5 M1 step 3)
 # ════════════════════════════════════════════════════════════
 
+# Tests must never write into the owner's real ~/Zilla (logs, media,
+# Memory). config binds every path off ZILLA_HOME at import time, so this
+# has to happen before the first zilla import in this file.
+import os as _os, tempfile as _tf  # noqa: E402
+_os.environ.setdefault("ZILLA_HOME", _tf.mkdtemp(prefix="zilla_test_home_"))
+_os.makedirs(_os.path.join(_os.environ["ZILLA_HOME"], "Runtime", "logs"), exist_ok=True)
 import zilla.store as zstore  # noqa: E402
 from zilla.migrate import migrate_legacy_json  # noqa: E402
 
