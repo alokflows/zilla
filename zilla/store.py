@@ -121,6 +121,15 @@ CREATE TABLE IF NOT EXISTS curiosity (
     PRIMARY KEY (node_id, gap)
 );
 CREATE INDEX IF NOT EXISTS idx_curiosity_node ON curiosity(node_id);
+CREATE TABLE IF NOT EXISTS relay_log (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    alias TEXT, name TEXT,
+    target_uid INTEGER,
+    summary TEXT,
+    status TEXT
+);
 """
 
 
@@ -521,6 +530,30 @@ class Store:
                 (slug, code_hash, approved_at, approved_by),
             )
         self._write(_do)
+
+    # ── relay log (Phase K5 — the /relay audit trail) ───────────
+    #
+    # Append-only: one row per relay action the owner CONFIRMED (a proposal
+    # that was never confirmed, or was denied, is not a relay — it never
+    # left the machine). A relay action must never be a surprise days later
+    # (PLAN.md §6/K5 step 4, same spirit as M4's memory-change surfacing).
+
+    def relay_log_add(self, *, ts: str, kind: str, alias: str, name: str,
+                      target_uid: int | None, summary: str, status: str) -> None:
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO relay_log (ts, kind, alias, name, target_uid, summary, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ts, kind, alias, name, target_uid, summary, status),
+            )
+        self._write(_do)
+
+    def relay_log_recent(self, limit: int = 20) -> list[dict]:
+        """Newest first."""
+        rows = self._r().execute(
+            "SELECT * FROM relay_log ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     # ── mem_fts / mem_seen (Markdown search index — Phase M3 wires this in) ──
 

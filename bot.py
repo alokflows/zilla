@@ -78,7 +78,7 @@ from config import (
     DB_FILE, MEMORY_DIR, LOG_DIR, PID_FILE, LOCK_FILE, RUNTIME_DIR,
 )
 from zilla.store import get_store
-from zilla import memory, heartbeat, graph_html
+from zilla import memory, heartbeat, graph_html, relay as zrelay
 from sessions import SessionManager
 import zilla.core as zcore
 import zilla.backend_registry as backend_registry
@@ -578,6 +578,53 @@ def _elapsed_str(seconds: int) -> str:
 #  AUTH MIDDLEWARE
 # ══════════════════════════════════════════════════════════
 
+def _relay_inbound_line(update: Update, name: str) -> str:
+    """Phase K5 step 5: what the owner sees when a relay target replies.
+    Media is NAMED, never ingested or transcribed in v1 — auto-ingesting
+    media from an unauthorized sender is deliberately out of scope."""
+    msg = update.effective_message
+    text = (msg.text or msg.caption or "").strip() if msg else ""
+    kind = None
+    if msg is not None:
+        if msg.photo:
+            kind = "a photo"
+        elif msg.voice or msg.audio:
+            kind = "a voice message"
+        elif msg.document:
+            kind = "a file"
+        elif msg.video:
+            kind = "a video"
+    if kind:
+        return (f"💬 {name} sent {kind} (not saved) — reply here to have Zilla "
+                f"save or act on it.")
+    return f"💬 {name} said: {text}" if text else f"💬 {name} sent a message."
+
+
+async def _report_relay_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                uid: int) -> bool:
+    """Phase K5 step 5 (PLAN.md §6/K5 — report, never execute): an
+    unauthorized sender whose chat_id matches a `telegram_uid::` on a known
+    person page gets their message REPORTED to the owner as one plain line
+    instead of being silently dropped. It is a dead end by construction —
+    the message is never wrapped into a prompt, never reaches the model, and
+    the sender never gains any command or menu surface. Returns True if this
+    was such a sender (the caller still stops the update either way)."""
+    if update.callback_query or not update.effective_message:
+        return False
+    try:
+        node = zrelay.find_person_by_uid(get_store(DB_FILE), uid, MEMORY_DIR)
+    except Exception as e:
+        logger.debug(f"[RELAY] inbound lookup failed for {uid}: {e}")
+        return False
+    if node is None:
+        return False
+    name = node.get("title") or f"User {uid}"
+    if OWNER_CHAT_ID:
+        await safe_send(context.bot, OWNER_CHAT_ID, _relay_inbound_line(update, name))
+    logger.info(f"[RELAY] inbound from {name} ({uid}) reported to owner")
+    return True
+
+
 async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
         raise ApplicationHandlerStop()
@@ -586,6 +633,13 @@ async def auth_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth.is_authorized(uid):
         if update.callback_query:
             await update.callback_query.answer()
+        # K5: a known relay target is reported to the owner, not dropped —
+        # but the update still stops dead here, exactly like any other
+        # unauthorized message.
+        try:
+            await _report_relay_inbound(update, context, uid)
+        except Exception as e:
+            logger.error(f"[RELAY] inbound report failed: {e}")
         logger.info(f"[AUTH] Denied: {uid}")
         raise ApplicationHandlerStop()
 
@@ -859,6 +913,55 @@ async def _cb_approvals(query, context, data, uid, chat_id):
         await query.edit_message_text(f"❌ Denied {req['name']}'s request.")
         await safe_send(context.bot, req["chat_id"],
                         "🚫 The owner declined your request.")
+
+
+async def _cb_relay(query, context, data, uid, chat_id):
+    """Phase K5 (PLAN.md §6/K5): the owner's ✅/❌ on a proposed relay.
+    Owner-only — a relay goes out in the owner's name, so nobody else can
+    ever resolve one. core.relay owns the hold and the audit trail; this is
+    the Telegram remainder (edit the card, do the actual send)."""
+    if not auth.is_owner(uid):
+        return
+    if data.startswith("relay_no_"):
+        entry = core.relay.cancel(data.removeprefix("relay_no_"))
+        if not entry:
+            await query.edit_message_text("⏳ That relay expired or was already handled.")
+            return
+        await query.edit_message_text(f"❌ Not sent — {entry['name']} won't hear from me.")
+        return
+
+    if not data.startswith("relay_ok_"):
+        return
+    entry = core.relay.confirm(data.removeprefix("relay_ok_"))
+    if entry is None:
+        await query.edit_message_text("⏳ That relay expired or was already handled.")
+        return
+
+    name = entry["name"]
+    if entry["action"]["kind"] == "schedule":
+        if entry.get("ok"):
+            when = describe_schedule(entry["action"]["sched_kind"], entry["action"]["spec"])
+            await query.edit_message_text(f"✅ Set up — {name} will get it {when}.")
+        else:
+            await query.edit_message_text(
+                f"⚠️ I couldn't set that up for {name} — try telling me the timing again.")
+        return
+
+    # RELAY_SEND: core can't talk to Telegram, so the send happens here and
+    # the outcome goes back to core for the audit trail.
+    ok = True
+    try:
+        await context.bot.send_message(chat_id=entry["target_uid"],
+                                       text=entry["action"]["message"])
+    except Exception as e:
+        ok = False
+        logger.error(f"[RELAY] send to {entry['target_uid']} failed: {e}")
+    core.relay.mark_sent(entry, ok)
+    if ok:
+        await query.edit_message_text(f"✅ Sent to {name}.")
+    else:
+        await query.edit_message_text(
+            f"⚠️ I couldn't reach {name} — they may not have started a chat with me yet.")
 
 
 def _friendly_error(e: Exception) -> str:
@@ -1193,6 +1296,33 @@ async def cmd_graph(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Couldn't send the graph file.")
 
 
+async def cmd_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Phase K5 step 4 (PLAN.md §6/K5): owner-only, read-only audit trail —
+    the last 20 relay actions with target, time, and what went out, so a
+    relay is never a surprise days later."""
+    uid = update.effective_user.id
+    if not auth.is_owner(uid):
+        await update.message.reply_text("Owner only.")
+        return
+
+    rows = core.relay.recent(20)
+    if not rows:
+        await update.message.reply_text(
+            "No relays yet. Ask me to tell or remind someone and I'll show you a "
+            "confirm card first — nothing goes out without your ✅.")
+        return
+
+    icons = {"sent": "✅", "scheduled": "⏰", "failed": "⚠️"}
+    lines = ["📨 Relay log — last 20", ""]
+    for r in rows:
+        summary = (r.get("summary") or "").replace("\n", " ")
+        if len(summary) > 80:
+            summary = summary[:80] + "…"
+        lines.append(f"{icons.get(r.get('status'), '•')} {r.get('ts', '')} → "
+                     f"{r.get('name') or r.get('alias')}: {summary}")
+    await update.message.reply_text("\n".join(lines))
+
+
 # ══════════════════════════════════════════════════════════
 #  SCHEDULES
 # ══════════════════════════════════════════════════════════
@@ -1489,6 +1619,23 @@ async def _deliver_approval_request(ev) -> None:
         logger.error(f"[APPROVAL] could not notify owner: {e}")
 
 
+async def _deliver_relay_request(ev) -> None:
+    """Render a core.RelayRequest event — DM the owner the confirm card
+    (resolved person + the exact text about to go out) with ✅/❌ buttons.
+    Nothing has been sent at this point; _cb_relay resolves ev.id."""
+    if _application is None or not OWNER_CHAT_ID:
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Send", callback_data=f"relay_ok_{ev.id}"),
+        InlineKeyboardButton("❌ No", callback_data=f"relay_no_{ev.id}"),
+    ]])
+    try:
+        await _application.bot.send_message(chat_id=OWNER_CHAT_ID, text=ev.card,
+                                            reply_markup=kb)
+    except Exception as e:
+        logger.error(f"[RELAY] could not show the confirm card: {e}")
+
+
 async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> None:
     """Consume core's background event broadcast and render each event the
     way the old in-bot.py scheduler/bridge_watcher/approval flow used to.
@@ -1504,6 +1651,8 @@ async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> Non
                 await _deliver_ask(ev)
             elif isinstance(ev, zcore.ApprovalRequest):
                 await _deliver_approval_request(ev)
+            elif isinstance(ev, zcore.RelayRequest):
+                await _deliver_relay_request(ev)
         except Exception as e:
             logger.error(f"[SCHED] event render failed: {e}", exc_info=True)
 
@@ -2824,6 +2973,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_users(query, context, data, uid, chat_id)
         elif data.startswith("appr_"):
             await _cb_approvals(query, context, data, uid, chat_id)
+        elif data.startswith("relay_"):
+            await _cb_relay(query, context, data, uid, chat_id)
         else:
             await _cb_misc(query, context, data, uid, chat_id)
     except Exception as e:
@@ -2965,6 +3116,8 @@ COMMAND_REGISTRY: list[_CommandSpec] = [
     _CommandSpec("brain", "Inbox stats", cmd_brain),
     _CommandSpec("memory", "MEMORY.md, journal, recent memory commits", cmd_memory, scope="owner"),
     _CommandSpec("graph", "Visual map of what Zilla knows (/graph <name> to focus)", cmd_graph, scope="owner"),
+    _CommandSpec("relay", "Relay log — messages I sent to other people for you",
+                 cmd_relay, scope="owner"),
     _CommandSpec("schedule", "Add / manage scheduled jobs", cmd_schedule, aliases=("schedules",)),
     _CommandSpec("browse", "Browser control (/browse <url>)", cmd_browse),
     _CommandSpec("adduser", "Add an admin", cmd_adduser, scope="owner"),

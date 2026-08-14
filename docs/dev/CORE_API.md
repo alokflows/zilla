@@ -23,6 +23,7 @@ dataclasses:
 | `Ask(id, kind, prompt)` | agent needs a human (otp/password/text/confirm) | DM with force-reply | inline prompt |
 | `Response(text, files, meta)` | final answer (+ extracted file paths) | chunked HTML message | chat bubble |
 | `ApprovalRequest(id, user, prompt)` | limited user waiting | ✅/❌ buttons to owner | prompt to owner |
+| `RelayRequest(id, kind, alias, name, target_uid, card)` | K5: the model proposed reaching another person for the owner; **nothing is sent yet** | ✅/❌ confirm card to owner | prompt to owner |
 | `Alert(text, runbook)` | human-required health problem | one plain DM | banner |
 | `ScheduledResult(title, response)` | a schedule fired | ⏰ DM | notification line |
 
@@ -42,6 +43,16 @@ core.answer_ask(ask_id, text)       # any frontend can answer an Ask
 core.cancel(user_id)                # replaces _active_cancel poking
 
 core.approvals.pending() / .approve(id) / .deny(id)
+core.relay.pending() / .confirm(id) / .cancel(id) / .recent(limit)
+                                    # K5 team relay. confirm() completes a relay
+                                    # SCHEDULE itself; a relay SEND comes back for
+                                    # the frontend to deliver, then .mark_sent().
+                                    # No confirm => nothing is ever sent.
+core.relay.pending() / .confirm(id) / .cancel(id) / .recent(limit)
+                                    # K5 team relay. confirm() completes a relay
+                                    # SCHEDULE itself; a relay SEND comes back for
+                                    # the frontend to deliver, then .mark_sent().
+                                    # No confirm => nothing is ever sent.
 core.sessions.list/create/switch/rename/delete(user_id, ...)
 core.schedules.list/create/delete/toggle(user_id, ...)
 core.settings.get/set(key)          # same .env + settings.json — one source of truth
@@ -49,7 +60,8 @@ core.users …                        # wraps users.py as-is
 core.health.report()                # doctor data; health loop emits Alert events
 
 core.subscribe(sink)                # background events (Ask from schedules,
-                                    # Alert, ScheduledResult, ApprovalRequest)
+                                    # Alert, ScheduledResult, ApprovalRequest,
+                                    # RelayRequest)
                                     # → every connected frontend's async queue
 ```
 

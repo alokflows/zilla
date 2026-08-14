@@ -378,6 +378,20 @@ def _memory_block(ctx: "TurnContext | None") -> str:
             "interval when a fact is superseded, never delete the line."
         )
 
+    # Phase K5: the relay markers. Owner-only by construction — this block
+    # is only ever built for an owner turn, and core.py drops any marker
+    # that arrives on anyone else's.
+    relay_line = (
+        "- To reach someone else for the owner (\"tell Priya to send the report\", "
+        "\"remind Rahul every Monday at 9\"), end your reply with ONE line — "
+        "`RELAY_SEND: <name> :: <message>` or `RELAY_SCHEDULE: <name> :: "
+        "<once|interval|daily|weekly> :: <spec-json> :: <message>` (spec-json e.g. "
+        "{\"hh\": 9, \"mm\": 0} for daily, {\"days\": [0], \"hh\": 9, \"mm\": 0} for weekly). "
+        "Write the message as the owner would send it. The owner has to confirm it "
+        "before anything goes out — say you've asked them to confirm, never that "
+        "you've sent it. The person needs a Wiki page carrying `telegram_uid:: <number>`."
+    )
+
     parts = [
         "## Your memory (persistent, yours to maintain)",
         core_text.strip() or "(empty)",
@@ -398,6 +412,7 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         "(it's permanent — never auto-deleted) and append one line to today's "
         "Journal noting what it is and why it's kept.",
         "- Never store credentials, OTPs, or tokens in any memory file.",
+        relay_line,
     ]
     if schedule_line:
         parts.append(schedule_line)

@@ -434,17 +434,18 @@ merged into `main` and pushed; the planning branch
 both now fully merged, superseded shells — safe to delete. **PUSH TO
 MAIN EVERY SESSION, no exceptions** (an unpushed session nearly caused
 divergence before — this reconciliation is the proof of why).
-**Tests (fresh per-file recount, 2026-07-19 K4 session):** 291 fixes +
+**Tests (fresh per-file recount, 2026-08-14 K5 session):** 291 fixes +
 16 interactive + 116 core + 57 schedules_seam + 71 review + 17 tui +
-152 cli + 49 harness + 34 memory_m3 + 31 memory_m4 + 67 heartbeat +
+157 cli + 49 harness + 34 memory_m3 + 31 memory_m4 + 67 heartbeat +
 57 health + 23 service + 10 quickfix + 25 zilla_home + 36 memory_k1 +
-28 memory_k2 + 27 memory_k3 + 35 memory_k4 = **1142 green** —
+28 memory_k2 + 27 memory_k3 + 35 memory_k4 + 107 memory_k5 =
+**1254 green** (20-file gate) —
 `.venv/bin/python test_fixes.py / test_interactive.py / test_core.py /
 test_schedules_seam.py / test_review.py / test_tui.py / test_zilla_cli.py /
 test_harness.py / test_memory_m3.py / test_memory_m4.py /
 test_heartbeat.py / test_health.py / test_service.py / test_quickfix.py /
 test_zilla_home.py / test_memory_k1.py / test_memory_k2.py /
-test_memory_k3.py / test_memory_k4.py`
+test_memory_k3.py / test_memory_k4.py / test_memory_k5.py`
 (test_schedules_seam.py is a frozen acceptance spec — never edit it) +
 `import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
 import schedule_query; import zilla.graph; import zilla.graph_html;
@@ -621,13 +622,13 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 - [x] **K2** Turn-time entity linking + neighborhood injection (PLAN §6/K2) — DONE 2026-07-18. 1078 green (17-file gate + `test_memory_k2.py`'s 28). See session log below.
 - [x] **K3** Curiosity loop (PLAN §6/K3) — DONE 2026-07-19. 1105 green (18-file gate + `test_memory_k3.py`'s 27). See session log below.
 - [x] **K4** Graph views (`/graph` HTML export + TUI Graph screen, PLAN §6/K4) — DONE 2026-07-19. 1142 green (19-file gate + `test_memory_k4.py`'s 35). See session log below.
-- [ ] **K5** Team relay: delegated send & scheduling ("tell Priya X" / "remind Rahul every Monday") — owner-requested 2026-07-18, always-confirm policy (PLAN §6).
+- [x] **K5** Team relay: delegated send & scheduling ("tell Priya X" / "remind Rahul every Monday") — owner-requested 2026-07-18, always-confirm policy (PLAN §6). DONE 2026-08-14. 1254 green (20-file gate + `test_memory_k5.py`'s 107). Live smoke NOT done (needs the owner's real Telegram + a second real person — see Notes). See session log below.
 - [ ] **U1-U4** Generative UI + design system + presence (PLAN §7): ZUI protocol, agent education, STYLE.md, pinned status card.
 - [ ] **H4** Self-update with doctor-gated rollback (PLAN §8).
 - [ ] **B1-B2** Background task lane + /tasks; incognito sessions (PLAN §9).
 - [ ] **R1** Triage router refinement — MOSTLY DONE via `zilla/review.py` (P1.5 above); confirm against PLAN.md's exact spec before marking done, don't rebuild.
 - [ ] **R2** Fallback chain — genuinely new.
-- [ ] **R3** opencode adapter — genuinely new (was P8).
+- [x] **R3** opencode adapter — DONE 2026-07-19 (commit `474238f`: `zilla/backends.py` opencode adapter + dynamic registry entry + config model catalog). Ticked retroactively on 2026-08-14 — the commit shipped but the board was never updated. No dedicated test file; covered by the existing backend-registry tests.
 - [ ] **S** Skills from chat, ask-first approval — genuinely new (was P5).
 - [ ] **C1-C3** Brain export/import; connectors screen (MCP/native, per-backend); GitHub cloud backup + bootstrap-from-cloud (PLAN §12).
 - [ ] **G1** Engine facade extraction — PARTIAL via existing `zilla/core.py` (P1 above); the new part is the Unix-socket IPC daemon-attach model. PLAN.md flags this as the riskiest refactor in the plan — do it alone, no parallel fan-out.
@@ -640,7 +641,8 @@ first-run interview line if `Memory/MEMORY.md` is still the template.
 
 | Date | What shipped |
 |---|---|
-| 2026-07-19 | Test gate confirmed green (19/19). Stopped before K5 code (owner hit usage limit) — research saved to `docs/dev/K5_RESEARCH_NOTES.md`, no code changed. |
+| 2026-08-14 | **K5 COMPLETE** (PLAN.md §6/K5, team relay). New `zilla/relay.py` (pure): `parse_markers()` strips `RELAY_SEND: <alias> :: <msg>` / `RELAY_SCHEDULE: <alias> :: <kind> :: <spec-json> :: <text>` off a reply — every marker line is removed whether or not it parsed (the owner never sees the raw protocol), only the FIRST `::` splits a send so a relayed message may contain `::`, malformed markers come back as an `{"error": "malformed"}` action instead of raising, actions capped at 3; `resolve_target()` = `graph_alias_lookup` → node → re-read the page (attrs aren't stored in `nodes`) → `telegram_uid::` with `int()` coercion, degrading to `no_node`/`no_uid` on a missing page, a missing attribute, or a non-numeric one; `find_person_by_uid()` is the K5.5 reverse scan; `failure_line()`/`confirm_card()` carry the plain-language text (card always shows the RESOLVED name + exact message, never the alias). `store.py`: new `relay_log` table + `relay_log_add`/`relay_log_recent` (additive `CREATE TABLE IF NOT EXISTS` — verified on a COPY of the real `zilla.db`, existing rows intact). `core.py`: `RelayRequest` event + `Relay` wrapper over a new `_pending_relays` in-memory dict (same id-keyed-dict + broadcast shape as `Approvals`; `RELAY_TTL=3600`/`RELAY_MAX=20`, lazy prune on submit — an un-confirmed proposal is NOT a queued message, and a restart forgetting it is correct); `_process_relay_markers()` runs after `review()` and before `yield Response`, gated on `ctx.is_owner` (a non-owner turn, or `ctx=None`, gets the marker stripped and DROPPED — the injection guard), resolving each action and either holding it or appending one explanatory line while the reply itself always still delivers; the whole thing is wrapped so a relay bug returns the reply unchanged. `Relay.confirm()` completes a `RELAY_SCHEDULE` itself (`schedules.add(user_id=owner, chat_id=target_uid, payload_type="system_event", title="→ Name: …")` — verbatim delivery, zero model call, and the title is what makes it read as "→ Priya" in the owner's own `/schedules` with no new rendering code); a `RELAY_SEND` comes back for the frontend to deliver, which then calls `mark_sent()`. Only CONFIRMED actions are written to the audit trail — a denied or expired proposal never left the machine. `harness.py`: the marker protocol is taught in the owner-only memory block (so it can never reach another principal's prompt). `bot.py`: `_deliver_relay_request` (✅ Send / ❌ No card DM'd to the owner), `_cb_relay` (owner-gated; the send goes to the TARGET's chat, a failure is one calm line — "they may not have started a chat with me yet" — a double tap says "expired or already handled"), `cmd_relay` + one `COMMAND_REGISTRY` entry for `/relay` (owner-scoped audit trail, last 20), and the K5.5 carve-out in `auth_middleware`: an unauthorized sender matching a known person page's `telegram_uid::` gets their message REPORTED to the owner ("💬 Priya said: …", media named-not-ingested) and then still hits `ApplicationHandlerStop` exactly like any stranger — it never becomes a turn, never reaches the model, gains no command surface. New `test_memory_k5.py` (107 checks, all of PLAN.md §6/K5's Accept criteria across 10 groups): parse/strip/malformed/cap; resolution + both failure modes incl. a malformed uid and a page deleted out from under the graph; the reverse lookup; owner-gate + injection guard + explanatory lines + the never-break-the-reply guarantee; TTL/cap/cancel (no confirm ⇒ nothing held, nothing logged); the schedule round trip asserting `uid`=owner, `chat_id`=target, `payload_type=system_event`, and the failure path when the manager refuses; a full `handle_message` turn proving no marker ever reaches the delivered text; the bot layer (send lands in the target's chat not the owner's, non-owner tap is inert, decline logs nothing, send failure logs `failed`, `/relay` owner gate + empty state); and the middleware test proving report-AND-stop. **1254 green** (1142 + 107 memory_k5 + 5 registry-driven cli checks from the new `/relay` entry — 20-file gate, fresh per-file sum). Also ticked **R3** on the board: it shipped in `474238f` on 2026-07-19 but was never checked off. Live smoke deliberately NOT done — it needs the owner's real Telegram plus a second real person who has started a chat with the bot; the confirm card, the send, and an inbound reply are the three things to watch on the first real run. |
+| 2026-07-19 | Test gate confirmed green (19/19). Stopped before K5 code (owner hit usage limit) — research saved to `docs/dev/K5_RESEARCH_NOTES.md`, no code changed. (Those notes were consumed by the 2026-08-14 K5 build and deleted — the shipped code plus the K5 row below supersede them.) |
 | 2026-07-16 | Full codebase analysis + this handoff; Phase 0 findings (`docs/dev/PHASE0_FINDINGS.md`); modules moved into `zilla/` package with shims. |
 | 2026-07-16 | Turn-pipeline seam → `core.handle_message` (+`test_core.py`); scheduler seam Parts A+B → payload types, session modes, backend pins, retry ladder (+frozen `test_schedules_seam.py`). |
 | 2026-07-16 night | Live smoke: text/photo/doc/cancel ✅; `safe_send` 4× retry + raised PTB timeouts; voice fixed (`brew install flac` on Apple Silicon — add a doctor check in P2); reminder parser broadened; one-off reminders instant, `system_event` payloads (zero model call at fire), exact-time scheduler tick. |

@@ -42,6 +42,7 @@ import threading
 import time
 import time as _time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import zilla.interactive as interactive
 from zilla.autoharness import needs_browser
@@ -70,6 +71,13 @@ BRIDGE_PENDING_TTL = 900.0
 # store unbounded. Same values/semantics as bot.py's old _APPROVAL_TTL/_MAX.
 APPROVAL_TTL = 3600.0
 APPROVAL_MAX = 50
+
+# Team relay (Phase K5, PLAN.md §6/K5): a proposed relay waits this long for
+# the owner's ✅ before it is forgotten — an un-confirmed proposal is NOT a
+# pending message, nothing is queued anywhere, it simply expires. The cap
+# bounds the dict the same way APPROVAL_MAX does.
+RELAY_TTL = 3600.0
+RELAY_MAX = 20
 
 
 # ══════════════════════════════════════════════════════════
@@ -227,6 +235,32 @@ class ApprovalRequest:
 
 
 @dataclass
+class RelayRequest:
+    """Phase K5 (PLAN.md §6/K5): the model proposed reaching a real person
+    on the owner's behalf, the alias resolved to a person page carrying a
+    `telegram_uid::`, and the action is now held pending the owner's ✅.
+    Broadcast the moment core.relay.submit() registers the hold; a frontend
+    renders `card` with confirm/cancel buttons and later resolves `id` with
+    core.relay.confirm(id) / .cancel(id).
+
+    **Nothing has been sent when this event fires** — no confirm ⇒ nothing
+    sends, ever (owner decision 2026-07-18: always-confirm, no
+    trusted-contact bypass).
+
+    kind — "send" (deliver now) or "schedule" (create a recurring/one-off
+    delivery). name/target_uid — the RESOLVED person, never the alias the
+    model used. card — the owner-facing confirm text (resolved name + the
+    exact text about to go out). summary — one-line version for logs."""
+    id: str
+    kind: str
+    alias: str
+    name: str
+    target_uid: int
+    card: str
+    summary: str = ""
+
+
+@dataclass
 class Alert:
     """Human-required health problem. Placeholder — health loop is a later
     seam (CORE_API migration step 6 / Phase 7)."""
@@ -342,6 +376,132 @@ class Approvals:
 
 
 # ══════════════════════════════════════════════════════════
+#  TEAM RELAY  (Phase K5 — PLAN.md §6/K5)
+# ══════════════════════════════════════════════════════════
+#
+#  Same shape as Approvals above (id-keyed dict on ZillaCore + a broadcast
+#  event), for the same reason: the pending action is born inside core.py
+#  (marker-parsed out of a model reply), so it can't live in a frontend's
+#  per-chat state. It is deliberately in-memory — an un-confirmed relay
+#  proposal is not a queued message, and a restart forgetting it is the
+#  correct, safe behavior.
+#
+#  The audit trail (store.relay_log) records only CONFIRMED actions: a
+#  proposal that was denied or expired never left this machine.
+
+class Relay:
+    def __init__(self, core: "ZillaCore"):
+        self._core = core
+
+    def _db(self):
+        from zilla import store as _store
+        from zilla.config import DB_FILE
+        return _store.get_store(DB_FILE)
+
+    def _prune(self) -> None:
+        """Forget proposals older than RELAY_TTL — lazily, on the next
+        submit (same policy as Approvals; no timer loop)."""
+        now = time.time()
+        store = self._core._pending_relays
+        for rid in [r for r, v in store.items() if now - v.get("ts", 0) > RELAY_TTL]:
+            store.pop(rid, None)
+
+    def pending(self) -> list:
+        return [{"id": rid, **entry} for rid, entry in self._core._pending_relays.items()]
+
+    def peek(self, rid: str) -> dict | None:
+        entry = self._core._pending_relays.get(rid)
+        return {"id": rid, **entry} if entry else None
+
+    def submit(self, action: dict, target: dict, owner_uid: int) -> str | None:
+        """Hold a resolved relay action and broadcast RelayRequest so a
+        frontend can ask the owner. Returns the id, or None if the queue is
+        full (the frontend says so in one line)."""
+        from zilla import relay as _relay
+        self._prune()
+        store = self._core._pending_relays
+        if len(store) >= RELAY_MAX:
+            return None
+        rid = secrets.token_hex(6)
+        summary = _relay.summarize(action)
+        store[rid] = {"action": action, "owner_uid": owner_uid,
+                      "name": target.get("name") or target["alias"],
+                      "alias": target["alias"], "target_uid": target["uid"],
+                      "summary": summary, "ts": time.time()}
+        self._core._broadcast(RelayRequest(
+            id=rid, kind=action["kind"], alias=target["alias"],
+            name=store[rid]["name"], target_uid=target["uid"],
+            card=_relay.confirm_card(action, target), summary=summary,
+        ))
+        return rid
+
+    def confirm(self, rid: str) -> dict | None:
+        """Pop a held proposal and ACT on the owner's ✅.
+
+        `RELAY_SCHEDULE` is completed here — core owns the scheduler, so the
+        row is created (uid = owner, chat_id = the target, payload_type =
+        system_event: verbatim delivery, zero model call, no re-generation
+        drift) and logged. `RELAY_SEND` is a Telegram send, which core does
+        not do — the entry comes back with ok=True for the frontend to
+        deliver, which then calls mark_sent(). Returns None if the id is
+        unknown/expired/already handled (double-tap)."""
+        entry = self._core._pending_relays.pop(rid, None)
+        if entry is None:
+            return None
+        entry = {"id": rid, **entry}
+        action = entry["action"]
+        if action["kind"] != "schedule":
+            entry["ok"] = True
+            return entry
+        row = None
+        try:
+            row = self._core.schedules.add(
+                user_id=entry["owner_uid"], chat_id=entry["target_uid"],
+                prompt=action["text"], kind=action["sched_kind"], spec=action["spec"],
+                title=f"→ {entry['name']}: {action['text']}",
+                payload_type="system_event", is_owner=True,
+            )
+        except Exception as e:
+            logger.error(f"[RELAY] schedule create failed: {e}", exc_info=True)
+        entry["ok"] = row is not None
+        entry["schedule"] = row
+        self._log(entry, "scheduled" if row else "failed")
+        return entry
+
+    def cancel(self, rid: str) -> dict | None:
+        """Discard a proposal without acting. Nothing is logged — nothing
+        happened."""
+        entry = self._core._pending_relays.pop(rid, None)
+        return {"id": rid, **entry} if entry else None
+
+    def mark_sent(self, entry: dict, ok: bool) -> None:
+        """Record the outcome of a confirmed RELAY_SEND after the frontend
+        actually tried to deliver it."""
+        self._log(entry, "sent" if ok else "failed")
+
+    def _log(self, entry: dict, status: str) -> None:
+        try:
+            self._db().relay_log_add(
+                ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                kind=entry["action"]["kind"], alias=entry.get("alias", ""),
+                name=entry.get("name", ""), target_uid=entry.get("target_uid"),
+                summary=entry.get("summary", ""), status=status,
+            )
+        except Exception as e:  # the audit write must never break delivery
+            logger.error(f"[RELAY] audit log write failed: {e}")
+        log_event("relay", status=status, kind=entry["action"]["kind"],
+                  target=entry.get("target_uid"))
+
+    def recent(self, limit: int = 20) -> list[dict]:
+        """The `/relay log` audit trail — newest first."""
+        try:
+            return self._db().relay_log_recent(limit)
+        except Exception as e:
+            logger.error(f"[RELAY] audit log read failed: {e}")
+            return []
+
+
+# ══════════════════════════════════════════════════════════
 #  CORE
 # ══════════════════════════════════════════════════════════
 
@@ -384,6 +544,12 @@ class ZillaCore:
         # public surface (core.approvals.pending()/.submit()/.approve()/.deny()).
         self._pending_approvals: dict[str, dict] = {}
         self.approvals = Approvals(self)
+
+        # Team relay (Phase K5): relay actions the model proposed on an
+        # owner turn, held by short random id until the owner confirms.
+        # In-memory on purpose — see the Relay class above.
+        self._pending_relays: dict[str, dict] = {}
+        self.relay = Relay(self)
 
         # Per-(chat, user) cancel events — set to cancel the active CLI
         # request for that user in that chat. Keyed by a (chat_key, user_id)
@@ -827,6 +993,12 @@ class ZillaCore:
                     final_text = result.user_note or response
                 log_event("review", verdict=result.verdict, reason=result.reason, user=user_id)
 
+            # Phase K5: strip any relay marker the model proposed and turn it
+            # into a confirm card. Runs after review() so the owner-facing
+            # text is final, and before Response is yielded so the raw
+            # protocol never reaches a chat.
+            final_text = self._process_relay_markers(final_text, ctx)
+
             yield Response(
                 text=final_text,
                 files=tuple(detect_file_paths(final_text or "")),
@@ -1168,6 +1340,57 @@ class ZillaCore:
         self._broadcast(Alert(text=match.group(1).strip()))
         _health.mark_alerted(kind)
         log_event("schedule_owner_alert", id=sid)
+
+    def _process_relay_markers(self, text: str, ctx) -> str:
+        """Phase K5 (PLAN.md §6/K5): pull any RELAY_SEND:/RELAY_SCHEDULE:
+        marker off this turn's reply and hold it for the owner's ✅.
+
+        Returns the owner-facing text with every marker removed, plus one
+        plain-language line per action that could NOT be offered (unknown
+        person, no `telegram_uid::` on their page, malformed marker). The
+        reply itself always still delivers — a relay problem is never an
+        error screen (P4).
+
+        Markers are honored on OWNER turns only: on any other principal's
+        turn they are stripped and dropped, so a non-owner (or an injected
+        instruction inside a document a non-owner sent) can never even
+        propose reaching a third party in the owner's name.
+
+        Any unexpected failure in here degrades to "deliver the reply as
+        it was" — a relay bug must never cost the owner their answer."""
+        try:
+            from zilla import relay as _relay
+            clean, actions = _relay.parse_markers(text or "")
+            if not actions:
+                return text
+            if ctx is None or not ctx.is_owner:
+                log_event("relay_blocked", user=getattr(ctx, "uid", None),
+                          count=len(actions))
+                return clean
+
+            from zilla import store as _store
+            from zilla.config import DB_FILE, MEMORY_DIR
+            db = _store.get_store(DB_FILE)
+
+            notes: list[str] = []
+            for action in actions:
+                if action.get("error"):
+                    log_event("relay_malformed", user=ctx.uid)
+                    notes.append(_relay.MALFORMED_LINE)
+                    continue
+                target = _relay.resolve_target(db, action["alias"], MEMORY_DIR)
+                if target["uid"] is None:
+                    log_event("relay_unresolved", user=ctx.uid,
+                              alias=action["alias"][:40], reason=target["reason"])
+                    notes.append(_relay.failure_line(target))
+                    continue
+                if self.relay.submit(action, target, owner_uid=ctx.uid) is None:
+                    notes.append("(Too many relays are waiting for your ✅ right now — "
+                                 "clear a few and ask me again.)")
+            return "\n\n".join([clean, *notes]) if notes else clean
+        except Exception as e:
+            logger.error(f"[RELAY] marker processing failed: {e}", exc_info=True)
+            return text
 
     async def _run_and_record(self, s: dict) -> None:
         """Tick-loop path: run a due schedule, broadcast the result, and
