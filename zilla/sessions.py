@@ -34,6 +34,7 @@ def _row_to_dict(row: dict) -> dict:
         "messages": row.get("messages") or 0,
         "last_seen_step": row.get("last_seen_step") or 0,
         "title": row.get("auto_title"),
+        "incognito": bool(row.get("incognito")),
     }
 
 
@@ -120,14 +121,33 @@ class SessionManager:
 
     # ── CRUD ──────────────────────────────────────────────
 
-    def create_session(self, name: str, user_id: int) -> bool:
+    def create_session(self, name: str, user_id: int, incognito: bool = False) -> bool:
         if self._store.sessions_get(user_id, name) is not None:
             return False
         self._store.sessions_upsert(
             user_id, name, created_at=_now(), messages=0, last_seen_step=0,
+            incognito=1 if incognito else 0,
         )
         self.set_active_name(name, user_id)
         return True
+
+    # ── Incognito (Phase B2, PLAN.md §9/B2) ───────────────
+    #
+    #  A per-session flag, not a per-user mode: the owner can keep one
+    #  private session alongside their normal ones and switch between them.
+    #  Everything downstream reads it from here — the harness gate
+    #  (no memory/graph/journal injection), core's enforcement snapshot,
+    #  and /end deleting the conversation directory.
+
+    def is_incognito(self, user_id: int, session_name: str = None) -> bool:
+        name = session_name or self.get_active_name(user_id)
+        row = self._store.sessions_get(user_id, name)
+        return bool(row and row.get("incognito"))
+
+    def set_incognito(self, user_id: int, session_name: str, incognito: bool) -> None:
+        if self._store.sessions_get(user_id, session_name) is not None:
+            self._store.sessions_upsert(
+                user_id, session_name, incognito=1 if incognito else 0)
 
     def delete_session(self, name: str, user_id: int) -> bool:
         if self._store.sessions_get(user_id, name) is None:
@@ -162,5 +182,6 @@ class SessionManager:
             "created": row.get("created_at"),
             "last_used": row.get("last_used"),
             "messages": row.get("messages") or 0,
+            "incognito": bool(row.get("incognito")),
             "is_active": row["name"] == self.get_active_name(user_id),
         }

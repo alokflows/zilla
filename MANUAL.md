@@ -169,8 +169,30 @@ A **session** is like a separate notebook for a separate topic. They don't mix. 
 | `/sessions`        | See all your notebooks (tap to switch, 🗑 to delete) |
 | `/switch recipes`  | Jump to your "recipes" notebook (resumes its memory) |
 | `/end`             | Close the current notebook            |
+| `/new incognito`   | Start a **private** notebook (nothing is remembered) |
 
 > 🖲️ Same thing with buttons: `/menu` → **📁 Sessions**.
+
+### Private notebooks 🕶
+
+`/new incognito` starts a session Zilla does **not** learn from:
+
+- Nothing from your memory is shown to the AI during that session — no MEMORY.md, no wiki pages, no journal instructions, no "here's what I know about this person".
+- Nothing said there is written back. Zilla **checks** this after every message rather than trusting the AI: if anything under `Memory/` changed, it puts the file back the way it was and tells you in one line.
+- `/end` (or `/close`) deletes that session's conversation as well.
+
+**The honest limit.** The AI program itself (agy / Claude Code / opencode) keeps its own transcript of a conversation on this computer while it runs. Incognito guarantees *Zilla's* memory is untouched, and the conversation folder is deleted when you close the session — but until you close it, that folder exists on your own disk. Nothing is sent anywhere; it is your computer either way.
+
+### Background jobs 🧵
+
+A long job used to freeze your chat until it finished. Now it doesn't:
+
+| Command | What it does |
+|---|---|
+| `/bg research three suppliers and compare them` | Runs it in the background — keep chatting |
+| `/tasks` | See what's running, what's waiting, what just finished |
+
+Two jobs run at a time; the rest wait their turn. When one finishes, Zilla sends you the result. If the AI itself suggests moving something to the background, you get a card with a **Run it** button — nothing starts until you tap it.
 
 ### The one thing to remember: use `/new` for new topics
 

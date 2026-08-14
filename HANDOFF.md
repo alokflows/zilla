@@ -89,19 +89,19 @@ review gate, every route logged).
 | **K5** | Team relay: "tell Priya to send the report" / "remind Rahul every Monday at 9" → resolved against the graph, owner taps ✅, then it goes. `/relay` audit log. A relay target's reply is reported to the owner and never becomes a turn |
 | **U1-U4** | Generative UI: the model emits a fenced ```zui block and Telegram renders it natively — buttons/card/table/contacts/location (`zilla/zui.py`) · the protocol is taught in the preamble, never hard-coded · one design system (`docs/dev/STYLE.md`) applied across every menu · presence replaces the startup blast: one pinned status card edited in place, a new message only for a first install, an update, or real downtime (`zilla/presence.py`) |
 | **R3** | opencode as a third backend |
+| **B1-B2** | Background lane: a job runs in its own session under its own lock, so the chat never waits (`zilla/tasks.py`, `core.Tasks`, `/bg`, `/tasks`) · incognito sessions (`/new incognito`) where nothing is remembered — enforced by reverting the memory tree after the turn, not by asking the model nicely |
 
-**Tests: 1533 green across 23 files** (as of 2026-08-14), plus the import
+**Tests: 1702 green across 24 files** (as of 2026-08-14), plus the import
 smoke: `import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
 import schedule_query; import zilla.graph; import zilla.graph_html; import
 memgraph; import zilla.relay; import zilla.zui; import zilla.presence; import
-zilla.update`. `test_schedules_seam.py` is a frozen
+zilla.update; import zilla.tasks`. `test_schedules_seam.py` is a frozen
 acceptance spec — never edit it. Recount fresh per file rather than trusting
 any grand total.
 
 ### Checklist — build in this order (PLAN.md §13)
 
-- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4
-- [ ] **B1-B2** Background task lane + `/tasks`; incognito sessions (PLAN §9)
+- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4 · B1-B2
 - [ ] **R1** Triage router refinement — mostly shipped as `zilla/review.py`;
       confirm against PLAN's spec, don't rebuild
 - [ ] **R2** Fallback chain (error / empty / limit only — never on long runtime)
@@ -202,6 +202,7 @@ schedules scroll (R18, wants pagination) · `kb_user_detail` has no `✕ Close`
 
 | Date | What shipped |
 |---|---|
+| 2026-08-14 | **B1-B2 background lane + incognito** — `zilla/tasks.py` (pure marker parse + owner-facing copy), `tasks` table (+ `sessions.incognito`, both added by an idempotent `ALTER` on open), `core.Tasks`: a job runs in its own `task:<id>` session under a per-task lock, never the chat lock, capped at `max_bg_tasks` (2) with a bounded queue; `/bg`, `/tasks` board with stop/retry, `BG_TASK:` marker owner-turn-only and tap-gated, a job's own output can neither relay nor spawn work, crashed rows failed at boot. B2: `/new incognito` injects no memory/graph/curiosity and is enforced in code — mtime snapshot around the turn, `git checkout`/`clean` in `Memory/` on any change, one plain notice; the zero-model `share` route is gated too (it wrote the message verbatim into the journal before the lock); `/end` deletes the conv dir. `test_tasks.py` (165). 1702 green. Live Telegram smoke of B1 not run. |
 | 2026-08-14 | **H4 self-update** — `zilla/update.py`: record commit → fetch → pull --ff-only → pip install → `VACUUM INTO` backup → migrations → restart → checks, with automatic rollback of both the commit and the database. Gate is two signals: a failed import always rolls back, an environment problem that predates the update never does. `/update` (owner, confirm tap) spawns `zilla update --announce <chat>` detached — the pipeline restarts the bot, so it can't run inside it. Beats may mention an available update (daily `git fetch --dry-run` on the health timer, cache-only read). `test_update.py` (99). 1533 green. |
 | 2026-08-14 | **U1-U4 generative UI** — `zilla/zui.py` (```zui block → buttons/card/table/contacts/location, caps + owner gate + `ButtonStore`), `_ZUI_PROTOCOL` taught in `harness.py`, `docs/dev/STYLE.md` (22 numbered rules) applied across `keyboards.py`, `zilla/presence.py` + pinned status card replacing the startup blast, `/status` alias. `test_zui.py` (137) + `test_presence.py` (41). 1432 green. |
 | 2026-08-14 | **K5 team relay** — `zilla/relay.py` (marker parse/strip, alias→`telegram_uid::` resolution), `relay_log` table, `RelayRequest` + `core.relay` hold/confirm/audit, owner-only marker processing on the turn pipeline, confirm card + `/relay` + inbound-report carve-out in `bot.py`, `test_memory_k5.py` (107 checks). Ticked R3 (shipped 2026-07-19). 1254 green. |

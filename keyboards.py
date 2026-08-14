@@ -427,3 +427,43 @@ def kb_schedules(items: list):
         ])
     rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
     return InlineKeyboardMarkup(rows)
+
+
+# Phase B1 (PLAN.md §9/B1 step 4): the /tasks board. Live jobs get a stop
+# button, finished ones a retry — nothing else, so the board still fits one
+# phone screen (R18) once a few jobs have run.
+TASKS_PAGE = 4
+
+
+def kb_tasks(running: list, queued: list, finished: list):
+    """One row per live job (stop), then one row per recent finished job
+    (run again), then the nav row."""
+    rows = []
+    for t in (running + queued)[:TASKS_PAGE]:
+        rows.append([InlineKeyboardButton(
+            f"🗑 Stop {(t.get('title') or '')[:16]}",
+            callback_data=f"task_stop_{t['id']}",
+        )])
+    for t in finished[:TASKS_PAGE]:
+        rows.append([InlineKeyboardButton(
+            f"▶ Again: {(t.get('title') or '')[:14]}",
+            callback_data=f"task_retry_{t['id']}",
+        )])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu_back"), _close_btn()])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_task_confirm(pid: str):
+    """The agent proposed background work — one tap starts it, one dismisses
+    it. A card attached to a message carries no Close (R20)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶ Run it", callback_data=f"bgt_ok_{pid}"),
+        InlineKeyboardButton("Not now", callback_data=f"bgt_no_{pid}"),
+    ]])
+
+
+def kb_task_retry(tid: str):
+    """Attached to a failed job's notice — one action, no Close (R20)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶ Try again", callback_data=f"task_retry_{tid}"),
+    ]])

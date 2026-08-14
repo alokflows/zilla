@@ -68,13 +68,22 @@ class TurnContext:
                never any other principal's — a non-owner turn must contain
                zero MEMORY.md / wiki index / journal-protocol content.
     origin   — why this turn is running: 'user' (live chat), 'schedule',
-               'heartbeat' (Phase H, not wired yet), or 'approval' (an
-               Approval-mode request the owner just approved).
+               'heartbeat' (Phase H, not wired yet), 'approval' (an
+               Approval-mode request the owner just approved), or 'task'
+               (a Phase B1 background job).
+    incognito — this turn runs in an incognito session (Phase B2, PLAN.md
+               §9/B2). A SECOND gate on top of is_owner: the memory block,
+               the journal/memory protocol, the graph card and the
+               curiosity question are all omitted, so nothing about the
+               turn can be written back. Enforcement that the model
+               obeyed is core's (a Memory-tree snapshot around the turn) —
+               this is only the injection half.
     """
     uid: int
     role: str
     is_owner: bool
     origin: str = "user"
+    incognito: bool = False
 
 
 # ══════════════════════════════════════════════════════════
@@ -348,8 +357,14 @@ def _memory_block(ctx: "TurnContext | None") -> str:
     """The 'Your memory' block appended to every OWNER turn, built fresh
     each time (a few file reads + one index scan — cheap). '' for any
     non-owner turn or when ctx is None: memory is the owner's, and this is
-    the single gate that keeps it out of every other principal's prompt."""
-    if ctx is None or not ctx.is_owner:
+    the single gate that keeps it out of every other principal's prompt.
+
+    Also '' for an incognito turn (Phase B2): no MEMORY.md, no wiki index,
+    and — the part that matters — no memory protocol, so the model is never
+    told to journal or update a page this turn. Skipping the block also
+    skips the FTS reindex below, so nothing said in incognito can even
+    trigger an index write."""
+    if ctx is None or not ctx.is_owner or getattr(ctx, "incognito", False):
         return ""
 
     from zilla import memory as _memory
@@ -414,6 +429,16 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         "you've sent it. The person needs a Wiki page carrying `telegram_uid:: <number>`."
     )
 
+    # Phase B1: the background lane. Same owner-only construction as the
+    # relay markers above — core.py drops a BG_TASK: marker that arrives on
+    # anyone else's turn, and the owner still has to tap before it runs.
+    bg_line = (
+        "- If the owner wants long work to run in the BACKGROUND while they keep "
+        "chatting, end your reply with ONE line — `BG_TASK: <full standalone "
+        "instruction>` (it runs in its own conversation). They must tap to start "
+        "it: say you've asked them to confirm, never that it has started."
+    )
+
     parts = [
         "## Your memory (persistent, yours to maintain)",
         core_text.strip() or "(empty)",
@@ -435,6 +460,7 @@ def _memory_block(ctx: "TurnContext | None") -> str:
         "Journal noting what it is and why it's kept.",
         "- Never store credentials, OTPs, or tokens in any memory file.",
         relay_line,
+        bg_line,
     ]
     if schedule_line:
         parts.append(schedule_line)
@@ -515,9 +541,12 @@ def _graph_hits(user_message: str, ctx: "TurnContext | None"):
     """Shared alias_scan() call site for both the K2 graph card and the K3
     curiosity question — same single owner-only gate as `_memory_block` (the
     graph lives under Memory/Wiki, so it's the owner's, never any other
-    principal's). Returns (db, hits); (None, []) on any gate-closed or
-    error path so both callers degrade to their own no-op."""
-    if ctx is None or not ctx.is_owner or not user_message:
+    principal's) plus the B2 incognito gate (no graph cards, no curiosity
+    questions on a private turn). Returns (db, hits); (None, []) on any
+    gate-closed or error path so both callers degrade to their own
+    no-op."""
+    if (ctx is None or not ctx.is_owner or not user_message
+            or getattr(ctx, "incognito", False)):
         return None, []
     try:
         from zilla import graph as _graph

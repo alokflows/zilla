@@ -1380,8 +1380,8 @@ Execute strictly top-to-bottom. Check items off here (this file) as they land.
 - [x] U3 Design system (STYLE.md + menu refactor)
 - [x] U4 Presence (pinned status card, silent restarts)
 - [x] H4 Self-update with rollback — 2026-08-14 *(`zilla/update.py`: owner-triggered pipeline, doctor-gated, rolls back commit + database. The gate is two signals, not one — a failed import always rolls back, an environment problem that predates the update never does, so a box missing `flac` can't revert a good release. `/update` shows a confirm card and the tap spawns `zilla update --announce <chat>` detached, since the pipeline restarts the bot mid-run. `test_update.py` (99).)*
-- [ ] B1 Background task lane + /tasks
-- [ ] B2 Incognito sessions
+- [x] B1 Background task lane + /tasks — 2026-08-14 *(`zilla/tasks.py` (pure: marker parse + copy) + `tasks` table + `core.Tasks`. A job runs in its own `task:<id>` session under a per-task lock — never `get_user_lock(uid)` — so the chat answers while it runs. Cap `max_bg_tasks` (2), queue beyond it, backlog bounded at 20. `/bg`, `/tasks` board with stop/retry taps; `BG_TASK:` marker is owner-turn-only and always needs a tap; a job's own output can neither relay nor spawn more work. Rows left `running` by a crash are failed at boot, never resurrected. Live smoke (long job + chat + result card on Telegram) not run — needs a live bot.)*
+- [x] B2 Incognito sessions — 2026-08-14 *(`/new incognito`: no memory block, no memory protocol, no graph card, no curiosity, no FTS. Enforced in code — mtime snapshot around the turn, `git checkout -- . && git clean -fd` inside `Memory/` on any change, one plain notice to the owner. The zero-model `share` route is gated too: it would have written the message verbatim into the journal before the lock. `/end` deletes the conversation directory. The honest ceiling (the CLI's own transcript) is in MANUAL.md §7.)*
 - [ ] R1 Triage router + effort controller
 - [ ] R2 Fallback chain
 - [x] R3 opencode adapter — 2026-07-19

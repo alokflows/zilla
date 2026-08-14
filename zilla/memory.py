@@ -464,3 +464,60 @@ def git_diff_latest(base: str | None = None) -> str:
     except Exception as e:
         logger.debug(f"[MEMORY] git_diff_latest failed: {e}")
         return ""
+
+
+# ══════════════════════════════════════════════════════════
+#  INCOGNITO ENFORCEMENT  (Phase B2 — PLAN.md §9/B2 step 1)
+# ══════════════════════════════════════════════════════════
+#  Incognito is CODE-ENFORCED, not a promise the model makes. The harness
+#  omits the memory instructions; these two functions are the backstop that
+#  proves it stayed omitted: snapshot the tree before the turn, compare
+#  after, and if anything moved, put it back from the memory repo.
+
+def tree_snapshot(base: str | None = None) -> dict:
+    """{relative path: (mtime, size)} for every file under Memory/, .git
+    excluded. Cheap (one stat per file) and total: a new file, a deleted
+    file and an edited file all show up as a difference."""
+    mem_dir = _mem_dir(base)
+    snapshot: dict[str, tuple] = {}
+    try:
+        for root, dirs, files in os.walk(mem_dir):
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for name in files:
+                full = os.path.join(root, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                snapshot[os.path.relpath(full, mem_dir)] = (st.st_mtime, st.st_size)
+    except Exception as e:
+        logger.debug(f"[MEMORY] tree_snapshot failed: {e}")
+    return snapshot
+
+
+def git_restore(base: str | None = None) -> bool:
+    """Put Memory/ back exactly as the last commit left it: revert tracked
+    edits AND delete files that were created since. Returns True iff the
+    restore ran cleanly.
+
+    Scoped entirely to Memory/ (`cwd=mem_dir`, pathspec `.`), so it can
+    never touch the Zilla source repo. Requires a memory repo with at least
+    one commit — with no repo there is nothing to restore FROM, so it
+    reports False and the caller tells the owner rather than pretending."""
+    import subprocess
+    mem_dir = _mem_dir(base)
+    if not os.path.isdir(os.path.join(mem_dir, ".git")):
+        return False
+    try:
+        head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=mem_dir,
+                              capture_output=True, text=True, timeout=10)
+        if head.returncode != 0:
+            return False
+        checkout = subprocess.run(["git", "checkout", "--", "."], cwd=mem_dir,
+                                  capture_output=True, text=True, timeout=20)
+        clean = subprocess.run(["git", "clean", "-fdq", "--", "."], cwd=mem_dir,
+                               capture_output=True, text=True, timeout=20)
+        return checkout.returncode == 0 and clean.returncode == 0
+    except Exception as e:
+        logger.debug(f"[MEMORY] git_restore failed: {e}")
+        return False

@@ -543,6 +543,32 @@ def gc_orphaned_conv_dirs(referenced: set, max_age_days: float = 7) -> int:
     return removed
 
 
+def delete_conv_dir(conversation_id: str | None) -> bool:
+    """Phase B2 (PLAN.md §9/B2 step 2): delete ONE conversation's directory
+    now, rather than waiting for the H1 age-based sweep. Closing an
+    incognito session is the owner asking for the backend's own transcript
+    to go, so it goes immediately.
+
+    Path-guarded: the resolved directory must sit directly inside BRAIN_DIR,
+    so a conv_id carrying `..` or an absolute path can never delete anything
+    else. Returns True iff a directory was actually removed; never raises."""
+    if not conversation_id:
+        return False
+    try:
+        brain = os.path.realpath(BRAIN_DIR)
+        full = os.path.realpath(os.path.join(BRAIN_DIR, conversation_id))
+        if os.path.dirname(full) != brain or full == brain:
+            logger.warning("[GC] refusing to delete a conv dir outside the brain dir")
+            return False
+        if not os.path.isdir(full):
+            return False
+        shutil.rmtree(full)
+        return True
+    except Exception as e:
+        logger.debug(f"[GC] conv dir delete failed: {e}")
+        return False
+
+
 # ══════════════════════════════════════════════════════════
 #  CORE — Run CLI via ConPTY
 # ══════════════════════════════════════════════════════════

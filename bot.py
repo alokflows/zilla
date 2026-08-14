@@ -48,6 +48,7 @@ import json
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Callable
 
 from telegram import (
@@ -80,12 +81,14 @@ from config import (
 from zilla.store import get_store
 from zilla import (
     memory, heartbeat, graph_html, relay as zrelay, zui as zzui,
-    presence as zpresence, update as zupdate,
+    presence as zpresence, update as zupdate, tasks as ztasks,
 )
 from sessions import SessionManager
 import zilla.core as zcore
 import zilla.backend_registry as backend_registry
-from zilla.cli_engine import detect_limit, backend_status, gc_orphaned_conv_dirs
+from zilla.cli_engine import (
+    detect_limit, backend_status, gc_orphaned_conv_dirs, delete_conv_dir,
+)
 from media import (
     is_audio_capable, get_audio_status, transcribe_audio,
     save_photo, save_voice, save_audio, save_document, save_video,
@@ -106,6 +109,7 @@ from keyboards import (
     kb_back, kb_error, kb_users, kb_user_detail,
     kb_inbox_categories, kb_inbox_list, kb_outbox_categories, kb_outbox_list,
     kb_schedules, kb_health, kb_sysjobs, _can_change_model, _fmt_next,
+    kb_tasks, kb_task_confirm, kb_task_retry,
     _IDLE_OPTIONS, _RETENTION_OPTIONS, INBOX_PAGE, INBOX_CAT_META, OUTBOX_CAT_META,
 )
 
@@ -1242,22 +1246,37 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nothing is running right now.")
 
 
+def _next_session_name(uid: int, stem: str) -> str:
+    existing = sessions.list_sessions(uid)
+    i = 1
+    while f"{stem}-{i}" in existing:
+        i += 1
+    return f"{stem}-{i}"
+
+
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/new [name] — a fresh session. `/new incognito` (Phase B2, PLAN.md
+    §9/B2) makes it a PRIVATE one: nothing from that session is injected
+    into a turn and nothing it says is written to memory."""
     uid = update.effective_user.id
-    if context.args:
-        name = "-".join(context.args).lower().strip()
+    args = list(context.args or [])
+    incognito = bool(args) and args[0].lower() == "incognito"
+    if incognito:
+        args = args[1:]
+
+    if args:
+        name = "-".join(args).lower().strip()
         name = "".join(c for c in name if c.isalnum() or c in "-_")
     else:
-        existing = sessions.list_sessions(uid)
-        i = 1
-        while True:
-            name = f"session-{i}"
-            if name not in existing:
-                break
-            i += 1
+        name = _next_session_name(uid, "incognito" if incognito else "session")
 
-    created = sessions.create_session(name, uid)
-    if created:
+    created = sessions.create_session(name, uid, incognito=incognito)
+    if created and incognito:
+        await update.message.reply_text(
+            f"🕶 Private session [{name}] started.\n\n"
+            "I won't remember any of it — nothing goes into your memory, and "
+            "/end deletes the conversation.")
+    elif created:
         await update.message.reply_text(
             f"📁 Session [{name}] created. Next message starts fresh."
         )
@@ -1301,9 +1320,22 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/end (alias /close) — end the active session. If it was incognito,
+    the backend's own conversation directory goes with it (PLAN.md §9/B2
+    step 2): Zilla's memory was never touched, and this is the other half —
+    the CLI's transcript doesn't outlive the session either."""
     uid = update.effective_user.id
     name = sessions.get_active_name(uid)
+    incognito = sessions.is_incognito(uid, name)
+    conv_id = sessions.get_conversation_id(user_id=uid, session_name=name)
     sessions.delete_session(name, uid)
+    if incognito:
+        wiped = await asyncio.to_thread(delete_conv_dir, conv_id)
+        await update.message.reply_text(
+            f"🕶 Private session [{name}] ended and "
+            f"{'the conversation is deleted' if wiped else 'nothing was left to delete'}."
+        )
+        return
     await update.message.reply_text(
         f"Session [{name}] ended. Active: [{sessions.get_active_name(uid)}]."
     )
@@ -1447,6 +1479,143 @@ async def cmd_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{icons.get(r.get('status'), '•')} {r.get('ts', '')} → "
                      f"{r.get('name') or r.get('alias')}: {summary}")
     await update.message.reply_text("\n".join(lines))
+
+
+# ══════════════════════════════════════════════════════════
+#  BACKGROUND TASKS  (Phase B1 — PLAN.md §9/B1)
+# ══════════════════════════════════════════════════════════
+#  The chat must never freeze behind a long job. core.tasks owns the lane
+#  (its own session, its own lock, the cap and the queue); this is the
+#  Telegram remainder — the two commands, the taps, and the delivery.
+#
+#  Creation is deterministic (P5): either the owner TYPES /bg, or the agent
+#  proposes and the owner TAPS. Admin-gated, because a background task is a
+#  full agentic run on this computer — the same privilege a chat turn has,
+#  minus the owner watching it happen. Limited users keep going through
+#  Approval mode.
+
+async def cmd_bg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bg <prompt> — run something in the background lane."""
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not auth.can(uid, "admin"):
+        await update.message.reply_text("Background jobs need admin access.")
+        return
+    prompt = " ".join(context.args).strip() if context.args else ""
+    if not prompt:
+        await update.message.reply_text(
+            "🧵 Background jobs\n\n"
+            "Send /bg and what you want done — for example "
+            "/bg research three suppliers and write me a comparison.")
+        return
+
+    row = await core.tasks.submit(uid, chat_id, prompt)
+    if row is None:
+        await update.message.reply_text(
+            "🧵 Too many background jobs are already waiting. /tasks shows them.")
+        return
+    await update.message.reply_text(
+        ztasks.started_line(row.get("title") or "", bool(row.get("queued"))))
+
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tasks — the board: running with live progress, queued, last finished."""
+    uid = update.effective_user.id
+    if not auth.can(uid, "admin"):
+        await update.message.reply_text("Background jobs need admin access.")
+        return
+    board = core.tasks.board(uid=None if auth.is_owner(uid) else uid)
+    await _open_menu(
+        update, context, ztasks.board_text(**board),
+        kb_tasks(board["running"], board["queued"], board["finished"]),
+        parse_mode="HTML",
+    )
+
+
+async def _cb_tasks(query, context, data, uid, chat_id):
+    """Phase B1: the taps — ✅/❌ on a proposed job, stop a live one, run a
+    finished one again. Admin-gated the same way the commands are; a
+    proposal is owner-only, since only an owner turn can produce one."""
+    if not auth.can(uid, "admin"):
+        return
+
+    if data.startswith("bgt_no_"):
+        entry = core.tasks.decline(data.removeprefix("bgt_no_"))
+        await query.edit_message_text(
+            "Left it — nothing is running." if entry
+            else "⏳ That job offer expired or was already handled.")
+        return
+
+    if data.startswith("bgt_ok_"):
+        row = await core.tasks.accept(data.removeprefix("bgt_ok_"))
+        if row is None:
+            await query.edit_message_text(
+                "⏳ That job offer expired or was already handled.")
+            return
+        await query.edit_message_text(
+            ztasks.started_line(row.get("title") or "", bool(row.get("queued"))))
+        return
+
+    if data.startswith("task_stop_"):
+        row = core.tasks.cancel(data.removeprefix("task_stop_"))
+        await query.edit_message_text(
+            ztasks.canceled_line(row) if row
+            else "That job has already finished.")
+        return
+
+    if data.startswith("task_retry_"):
+        row = await core.tasks.retry(data.removeprefix("task_retry_"))
+        if row is None:
+            await query.edit_message_text("I can't find that job any more.")
+            return
+        await query.edit_message_text(
+            ztasks.started_line(row.get("title") or "", bool(row.get("queued"))))
+
+
+async def _deliver_task_proposal(ev) -> None:
+    """Render a core.TaskProposal — the agent wants to move work to the
+    background lane and needs one tap. Nothing is queued until _cb_tasks
+    resolves ev.id."""
+    if _application is None:
+        return
+    target = ev.chat_id or OWNER_CHAT_ID
+    if not target:
+        return
+    try:
+        await _application.bot.send_message(chat_id=target, text=ev.card,
+                                            reply_markup=kb_task_confirm(ev.id))
+    except Exception as e:
+        logger.error(f"[TASK] could not show the confirm card: {e}")
+
+
+async def _deliver_task_result(ev) -> None:
+    """Render a core.TaskResult — the header card, then the answer itself
+    through the normal response pipeline (so ZUI blocks, chunking and file
+    delivery all work exactly as they do for a chat turn). A failure is one
+    calm sentence plus a retry button; a cancel needs no result at all."""
+    if _application is None:
+        return
+    target = ev.chat_id or OWNER_CHAT_ID
+    if not target:
+        return
+    bot = _application.bot
+    try:
+        if ev.status == ztasks.CANCELED:
+            return  # the tap that canceled it already said so
+        if ev.status == ztasks.FAILED:
+            await bot.send_message(
+                chat_id=target,
+                text=ztasks.failure_line({"title": ev.title}),
+                reply_markup=kb_task_retry(ev.id))
+            return
+        if ev.card:
+            await safe_send(bot, target, zzui.render_text(ev.card),
+                            parse_mode="HTML")
+        if (ev.response or "").strip():
+            await send_response(None, SimpleNamespace(bot=bot), ev.response,
+                                ev.uid, target)
+    except Exception as e:
+        logger.error(f"[TASK] could not deliver result {ev.id}: {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1854,6 +2023,10 @@ async def _core_events_task(core: "zcore.ZillaCore", sink: asyncio.Queue) -> Non
                 await _deliver_approval_request(ev)
             elif isinstance(ev, zcore.RelayRequest):
                 await _deliver_relay_request(ev)
+            elif isinstance(ev, zcore.TaskProposal):
+                await _deliver_task_proposal(ev)
+            elif isinstance(ev, zcore.TaskResult):
+                await _deliver_task_result(ev)
         except Exception as e:
             logger.error(f"[SCHED] event render failed: {e}", exc_info=True)
 
@@ -3178,6 +3351,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_relay(query, context, data, uid, chat_id)
         elif data.startswith("upd_"):
             await _cb_update(query, context, data, uid, chat_id)
+        elif data.startswith("bgt_") or data.startswith("task_"):
+            await _cb_tasks(query, context, data, uid, chat_id)
         elif data.startswith("zui_"):
             await _cb_zui(query, context, data, uid, chat_id)
         else:
@@ -3419,10 +3594,12 @@ COMMAND_REGISTRY: list[_CommandSpec] = [
     _CommandSpec("ping", "Status check", cmd_ping, aliases=("status",)),
     _CommandSpec("menu", "Open the control panel", cmd_menu),
     _CommandSpec("cancel", "Stop a running request", cmd_cancel),
-    _CommandSpec("new", "Start a new session", cmd_new),
+    _CommandSpec("new", "Start a new session (/new incognito for a private one)", cmd_new),
     _CommandSpec("sessions", "List your sessions", cmd_sessions),
     _CommandSpec("switch", "Switch session", cmd_switch),
-    _CommandSpec("end", "End the current session", cmd_end),
+    _CommandSpec("end", "End the current session", cmd_end, aliases=("close",)),
+    _CommandSpec("bg", "Run something in the background (/bg <what to do>)", cmd_bg),
+    _CommandSpec("tasks", "Background jobs — running, waiting, finished", cmd_tasks),
     _CommandSpec("model", "Select the AI model", cmd_model),
     _CommandSpec("settings", "Bot settings", cmd_settings),
     _CommandSpec("brain", "Inbox stats", cmd_brain),

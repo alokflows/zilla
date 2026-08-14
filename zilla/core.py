@@ -79,6 +79,13 @@ APPROVAL_MAX = 50
 RELAY_TTL = 3600.0
 RELAY_MAX = 20
 
+# Background tasks (Phase B1, PLAN.md §9/B1): a proposal the model made and
+# the owner hasn't tapped yet expires like a relay proposal does — nothing is
+# queued anywhere, it simply stops being offered. The task rows themselves are
+# durable (store.tasks_*); only the un-confirmed PROPOSAL is in memory.
+BG_PROPOSAL_TTL = 3600.0
+BG_PROPOSAL_MAX = 20
+
 
 # ══════════════════════════════════════════════════════════
 #  P1.5 TRIAGE ROUTER — deterministic, zero-model-call classification
@@ -258,6 +265,42 @@ class RelayRequest:
     target_uid: int
     card: str
     summary: str = ""
+
+
+@dataclass
+class TaskProposal:
+    """Phase B1 (PLAN.md §9/B1 step 2): the model ended an OWNER turn with a
+    `BG_TASK:` marker — it wants work moved to the background lane. Nothing
+    is queued when this fires: a frontend renders `card` with a confirm tap
+    and resolves `id` with core.tasks.accept(id) / .decline(id). The model
+    cannot spawn work without that tap (or the owner typing /bg).
+    """
+    id: str
+    uid: int
+    prompt: str
+    card: str
+    chat_id: int = None
+
+
+@dataclass
+class TaskResult:
+    """Phase B1 (PLAN.md §9/B1 step 3): a background task reached a terminal
+    state. Telegram renders the header card + the result body; the TUI gets
+    its own Tasks screen in Phase T.
+
+    status — 'done' | 'failed' | 'canceled'. response is the answer text for
+    a completed task (and whatever partial output there was for a failed
+    one). duration is wall-clock seconds, or None if the row lost its start
+    time. card is the validated ZUI header block (zilla/tasks.result_card).
+    """
+    id: str
+    uid: int
+    title: str
+    status: str
+    response: str = ""
+    chat_id: int = None
+    duration: float = None
+    card: dict = None
 
 
 @dataclass
@@ -502,6 +545,330 @@ class Relay:
 
 
 # ══════════════════════════════════════════════════════════
+#  BACKGROUND TASKS  (Phase B1 — PLAN.md §9/B1)
+# ══════════════════════════════════════════════════════════
+#
+#  The lane that keeps the chat free. The ONE invariant this class exists to
+#  hold, and the reason it is not just "a scheduled job that runs now":
+#
+#      A BACKGROUND TASK NEVER TOUCHES THE PER-USER CHAT LOCK.
+#
+#  Every other run path in this file (handle_message, _execute_message_
+#  schedule, approvals) acquires `get_user_lock(uid)` — correct there,
+#  because those all write back to the user's ACTIVE session and would
+#  otherwise interleave on one conversation (docs/dev/AI_CONTEXT.md I-CONV).
+#  A task writes to its OWN session (`task:<id>`) and its own fresh
+#  conversation, so there is nothing to serialize against the chat: it takes
+#  a task-scoped lock instead, and the owner can keep talking while it runs.
+#  (The agy global new-conv detection lock still applies for the moment the
+#  conversation is created — unavoidable, and brief.)
+#
+#  Durability split: the row is in SQLite (survives a restart, so a crashed
+#  job leaves evidence), the cancel event and the asyncio task are in memory.
+#  A row still marked `running` at boot is reconciled to `failed`, never
+#  resurrected — silently re-running an agentic prompt nobody is watching is
+#  not a safe default.
+
+class Tasks:
+    def __init__(self, core: "ZillaCore"):
+        self._core = core
+
+    def _db(self):
+        from zilla import store as _store
+        from zilla.config import DB_FILE
+        return _store.get_store(DB_FILE)
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def max_concurrent(self) -> int:
+        """`max_bg_tasks` (default 2). Coerced and floored at 1 — a setting
+        typed as "two" or 0 must not silently stop the lane forever."""
+        from zilla.tasks import DEFAULT_MAX_BG_TASKS
+        try:
+            return max(1, int(get_setting("max_bg_tasks", DEFAULT_MAX_BG_TASKS)))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_BG_TASKS
+
+    # ── proposals (model asked; owner hasn't tapped) ───────
+
+    def _prune_proposals(self) -> None:
+        now = time.time()
+        store = self._core._pending_bg
+        for pid in [p for p, v in store.items() if now - v.get("ts", 0) > BG_PROPOSAL_TTL]:
+            store.pop(pid, None)
+
+    def pending(self) -> list:
+        return [{"id": pid, **entry} for pid, entry in self._core._pending_bg.items()]
+
+    def propose(self, prompt: str, uid: int, chat_id: int = None) -> str | None:
+        """Hold a `BG_TASK:` proposal and broadcast TaskProposal so a
+        frontend can ask for the tap. Returns the proposal id, or None if
+        too many are already waiting."""
+        from zilla import tasks as _tasks
+        self._prune_proposals()
+        store = self._core._pending_bg
+        if len(store) >= BG_PROPOSAL_MAX:
+            return None
+        pid = secrets.token_hex(6)
+        store[pid] = {"prompt": prompt, "uid": uid, "chat_id": chat_id,
+                      "ts": time.time()}
+        self._core._broadcast(TaskProposal(id=pid, uid=uid, prompt=prompt,
+                                           chat_id=chat_id,
+                                           card=_tasks.confirm_card(prompt)))
+        return pid
+
+    async def accept(self, pid: str) -> dict | None:
+        """The owner tapped ✅ on a proposal — create the task. None if the
+        id is unknown/expired/already handled (double-tap)."""
+        entry = self._core._pending_bg.pop(pid, None)
+        if entry is None:
+            return None
+        return await self.submit(entry["uid"], entry.get("chat_id"), entry["prompt"])
+
+    def decline(self, pid: str) -> dict | None:
+        """Discard a proposal. Nothing was created, so nothing is recorded."""
+        entry = self._core._pending_bg.pop(pid, None)
+        return {"id": pid, **entry} if entry else None
+
+    # ── the lane ───────────────────────────────────────────
+
+    async def submit(self, uid: int, chat_id: int | None, prompt: str) -> dict | None:
+        """Create a task and start it if a lane is free, else queue it.
+        Returns the stored row (with "queued": True when it had to wait), or
+        None if the backlog is already at MAX_PENDING."""
+        from zilla import tasks as _tasks
+        db = self._db()
+        prompt = (prompt or "").strip()[:_tasks.MAX_PROMPT]
+        if not prompt:
+            return None
+        if db.tasks_count_by_status(_tasks.LIVE_STATUSES) >= _tasks.MAX_PENDING:
+            return None
+        tid = secrets.token_hex(4)
+        db.tasks_add(tid=tid, uid=uid, chat_id=chat_id, prompt=prompt,
+                     title=_tasks.title_for(prompt), status=_tasks.QUEUED,
+                     created_at=self._now())
+        log_event("bg_task_created", id=tid, user=uid)
+        await self.pump()
+        row = db.tasks_get(tid) or {}
+        return {**row, "queued": row.get("status") == _tasks.QUEUED}
+
+    async def pump(self) -> None:
+        """Start queued tasks while the concurrency cap allows. The row is
+        claimed (status -> running) BEFORE the coroutine is spawned, so two
+        pumps racing on the same tick can never start the same task twice."""
+        from zilla import tasks as _tasks
+        db = self._db()
+        while db.tasks_count_by_status((_tasks.RUNNING,)) < self.max_concurrent():
+            waiting = db.tasks_by_status((_tasks.QUEUED,), limit=1)
+            if not waiting:
+                return
+            tid = waiting[0]["id"]
+            db.tasks_update(tid, status=_tasks.RUNNING, started_at=self._now(),
+                            progress="")
+            self._core._bg_runners[tid] = asyncio.create_task(self._run(tid))
+
+    def _lock_for(self, tid: str) -> asyncio.Lock:
+        lock = self._core._bg_locks.get(tid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._core._bg_locks[tid] = lock
+        return lock
+
+    async def _run(self, tid: str) -> None:
+        """Execute one claimed task. Deliberately mirrors
+        _execute_message_schedule's shape — same review()-based failure
+        classification, same conv-id bookkeeping — with the per-user lock
+        swapped for a task-scoped one."""
+        from zilla import tasks as _tasks
+        db = self._db()
+        row = db.tasks_get(tid)
+        if row is None:
+            return
+        uid = row["uid"]
+        sname = f"task:{tid}"
+        started = time.time()
+        cancel_event = threading.Event()
+        self._core._bg_cancels[tid] = cancel_event
+
+        last_write = [0.0]
+
+        def _on_progress(step: str) -> None:
+            # Called from the backend's worker thread. Throttled: a step a
+            # second is normal and the board only ever shows the latest one.
+            now = time.time()
+            if now - last_write[0] < 2.0:
+                return
+            last_write[0] = now
+            try:
+                db.tasks_update(tid, progress=(step or "")[:200])
+            except Exception:
+                pass
+
+        ok, response, detail = True, "", ""
+        try:
+            async with self._lock_for(tid):
+                ctx = TurnContext(
+                    uid=uid, role=self._core.auth.role_of(uid) if self._core.auth else "admin",
+                    is_owner=bool(self._core.auth and self._core.auth.is_owner(uid)),
+                    origin="task",
+                )
+                response, detected = await run_cli_async(
+                    row["prompt"], None,
+                    progress_callback=_on_progress,
+                    cancel_event=cancel_event,
+                    skip_permissions=(self._core.auth.can(uid, "admin")
+                                      if self._core.auth else False),
+                    ctx=ctx,
+                )
+                if detected:
+                    self._core.sessions.set_conversation_id(
+                        detected, user_id=uid, session_name=sname,
+                        backend=get_backend())
+        except Exception as e:
+            ok, detail, response = False, str(e), ""
+            logger.error(f"[TASK] {tid} failed: {e}", exc_info=True)
+
+        canceled = cancel_event.is_set()
+        if ok and not canceled:
+            result = review(row["prompt"], response)
+            if result.verdict != "deliver":
+                ok = False
+                detail = (result.user_note or result.reason or "failed")[:200]
+
+        # A background job may not act on the owner's behalf and may not
+        # spawn more work: strip both marker families from its output and
+        # honor neither. The owner never asked for a relay from something
+        # they aren't watching (PLAN.md §9 — nothing outward-facing without
+        # a confirm tap).
+        response = self._strip_markers(response)
+
+        status = (_tasks.CANCELED if canceled
+                  else _tasks.DONE if ok else _tasks.FAILED)
+        duration = time.time() - started
+        try:
+            db.tasks_update(tid, status=status, progress="",
+                            result=(response or detail or "")[:20000],
+                            finished_at=self._now())
+        except Exception as e:
+            logger.error(f"[TASK] {tid} could not be recorded: {e}")
+        self._record_usage(ok and not canceled)
+        log_event("bg_task_end", id=tid, user=uid, status=status,
+                  secs=round(duration, 1), detail=detail[:200])
+
+        # The session row existed only so H1's sweep could see this
+        # conversation as referenced while it ran. Dropping it now hands the
+        # brain dir back to that sweep (PLAN.md §9/B1 step 1).
+        try:
+            self._core.sessions.delete_session(sname, uid)
+        except Exception:
+            pass
+        self._core._bg_cancels.pop(tid, None)
+        self._core._bg_locks.pop(tid, None)
+        self._core._bg_runners.pop(tid, None)
+
+        final = db.tasks_get(tid) or row
+        self._core._broadcast(TaskResult(
+            id=tid, uid=uid, chat_id=row.get("chat_id"),
+            title=final.get("title") or _tasks.title_for(row["prompt"]),
+            status=status, response=response or "", duration=duration,
+            card=self._header_card(final, duration),
+        ))
+        await self.pump()
+
+    @staticmethod
+    def _strip_markers(text: str) -> str:
+        try:
+            from zilla import relay as _relay
+            from zilla import tasks as _tasks
+            clean, actions = _relay.parse_markers(text or "")
+            clean, proposals = _tasks.parse_markers(clean)
+            if actions or proposals:
+                log_event("bg_task_markers_dropped",
+                          relays=len(actions), tasks=len(proposals))
+            return clean
+        except Exception:
+            return text
+
+    @staticmethod
+    def _header_card(row: dict, duration: float | None) -> dict | None:
+        from zilla import tasks as _tasks
+        from zilla import zui as _zui
+        return _zui.validate(_tasks.result_card(row, duration))
+
+    def _record_usage(self, ok: bool) -> None:
+        """A background run spends the same rented quota a chat turn does —
+        count it, so the usage view stays honest (PLAN.md §9/B1 step 1)."""
+        try:
+            self._db().usage_bump(datetime.now().strftime("%Y-%m-%d"),
+                                  get_backend(), turns=1,
+                                  errors=0 if ok else 1)
+        except Exception as e:
+            logger.debug(f"[TASK] usage bump failed: {e}")
+
+    # ── control surface (/tasks) ───────────────────────────
+
+    def get(self, tid: str) -> dict | None:
+        try:
+            return self._db().tasks_get(tid)
+        except Exception:
+            return None
+
+    def cancel(self, tid: str) -> dict | None:
+        """I-CANCEL semantics: a RUNNING task's cancel event is set and the
+        backend stops; a QUEUED task never starts. Returns the row, or None
+        if the id is unknown or the task already finished."""
+        from zilla import tasks as _tasks
+        db = self._db()
+        row = db.tasks_get(tid)
+        if row is None or row.get("status") not in _tasks.LIVE_STATUSES:
+            return None
+        event = self._core._bg_cancels.get(tid)
+        if event is not None and not event.is_set():
+            event.set()
+            log_event("bg_task_cancel", id=tid, was="running")
+            return row
+        db.tasks_update(tid, status=_tasks.CANCELED, finished_at=self._now(),
+                        progress="")
+        log_event("bg_task_cancel", id=tid, was=row.get("status"))
+        return db.tasks_get(tid)
+
+    async def retry(self, tid: str) -> dict | None:
+        """Run a finished task's prompt again as a NEW task (the old row
+        stays as history). None if the id is unknown."""
+        row = self.get(tid)
+        if row is None:
+            return None
+        return await self.submit(row["uid"], row.get("chat_id"), row["prompt"])
+
+    def board(self, uid: int | None = None) -> dict:
+        """The `/tasks` view: running, queued, and the last few finished."""
+        from zilla import tasks as _tasks
+        db = self._db()
+        return {
+            "running": db.tasks_by_status((_tasks.RUNNING,), uid=uid),
+            "queued": db.tasks_by_status((_tasks.QUEUED,), uid=uid),
+            "finished": db.tasks_by_status(_tasks.TERMINAL_STATUSES, uid=uid,
+                                           limit=_tasks.BOARD_FINISHED,
+                                           newest_first=True),
+        }
+
+    def reconcile_startup(self) -> int:
+        """Rows left `running` by a process that died: mark them failed so
+        the board tells the truth and the cap isn't held by ghosts. Returns
+        how many were reconciled."""
+        from zilla import tasks as _tasks
+        db = self._db()
+        stale = db.tasks_by_status((_tasks.RUNNING,))
+        for row in stale:
+            db.tasks_update(row["id"], status=_tasks.FAILED,
+                            finished_at=self._now(), progress="")
+            log_event("bg_task_orphaned", id=row["id"])
+        return len(stale)
+
+
+# ══════════════════════════════════════════════════════════
 #  CORE
 # ══════════════════════════════════════════════════════════
 
@@ -550,6 +917,16 @@ class ZillaCore:
         # In-memory on purpose — see the Relay class above.
         self._pending_relays: dict[str, dict] = {}
         self.relay = Relay(self)
+
+        # Background lane (Phase B1). The rows live in SQLite; these three
+        # maps are the live half — the un-confirmed proposals, the cancel
+        # event per running task, its asyncio task, and its OWN lock (never
+        # the per-user chat lock — see the Tasks class docstring).
+        self._pending_bg: dict[str, dict] = {}
+        self._bg_cancels: dict[str, threading.Event] = {}
+        self._bg_runners: dict[str, asyncio.Task] = {}
+        self._bg_locks: dict[str, asyncio.Lock] = {}
+        self.tasks = Tasks(self)
 
         # Per-(chat, user) cancel events — set to cancel the active CLI
         # request for that user in that chat. Keyed by a (chat_key, user_id)
@@ -633,6 +1010,13 @@ class ZillaCore:
         self-healing, alert-on-human-needed loop on top of it."""
         if self.schedules is not None and self._sched_task is None:
             self._sched_task = asyncio.create_task(self._scheduler_loop())
+        # Phase B1: rows a previous process left mid-run are failed, not
+        # resurrected; anything still queued picks up where it left off.
+        try:
+            self.tasks.reconcile_startup()
+            await self.tasks.pump()
+        except Exception as e:
+            logger.error(f"[TASK] startup reconcile failed: {e}")
         interactive.ensure_bridge_dir(self._bridge_dir)
         if self._bridge_task is None:
             self._bridge_task = asyncio.create_task(self._bridge_watcher_loop())
@@ -671,6 +1055,15 @@ class ZillaCore:
             except Exception as e:  # pragma: no cover - defensive
                 logger.error(f"[HEALTH] stop() cleanup error: {e}")
             self._health_task = None
+        # Phase B1: stop the backends of any running task before the loop
+        # goes away. The row stays `running` and the next start reconciles
+        # it to failed — a job the owner can re-run beats a ghost lane.
+        for tid, runner in list(self._bg_runners.items()):
+            event = self._bg_cancels.get(tid)
+            if event is not None:
+                event.set()
+            runner.cancel()
+        self._bg_runners.clear()
         if self._media_sweep_task is not None:
             self._media_sweep_task.cancel()
             try:
@@ -876,6 +1269,15 @@ class ZillaCore:
         if route == "share" and not self.auth.is_owner(user_id):
             route = "full"
 
+        # Phase B2: the share route writes the message verbatim into the
+        # journal and commits it — the one thing a private session must never
+        # do. It runs before the lock, so it has to be gated here rather than
+        # by the post-turn enforcement below: fall through to the full route,
+        # which records nothing.
+        if route == "share" and self._is_incognito(
+                user_id, self.sessions.get_active_name(user_id)):
+            route = "full"
+
         if route == "share":
             ack = _append_to_journal(text)
             log_event("route", route="share", user=user_id)
@@ -924,6 +1326,8 @@ class ZillaCore:
         response = ""
         final_conv = None
         sname = None
+        incognito = False
+        mem_before = None
         try:
             async with self.get_user_lock(user_id):
                 # Pin the session to whatever is active the moment WE start running, and
@@ -931,6 +1335,16 @@ class ZillaCore:
                 self._active_cancel[key] = cancel_event
                 sname = self.sessions.get_active_name(user_id)
                 conv_id = self._conv_for_run(user_id, sname)
+
+                # Phase B2 (PLAN.md §9/B2): pinned with the session, so a
+                # /switch mid-queue can't turn a private turn into a
+                # recorded one or the reverse. The snapshot is taken inside
+                # the lock, immediately before the run, so the comparison
+                # afterwards can only see what THIS turn changed.
+                incognito = self._is_incognito(user_id, sname)
+                if incognito:
+                    from zilla import memory as _memory
+                    mem_before = await asyncio.to_thread(_memory.tree_snapshot)
 
                 if auto_title:
                     info = self.sessions.get_session_info(user_id=user_id, session_name=sname)
@@ -940,6 +1354,7 @@ class ZillaCore:
                 ctx = TurnContext(
                     uid=user_id, role=self.auth.role_of(user_id),
                     is_owner=self.auth.is_owner(user_id), origin=origin,
+                    incognito=incognito,
                 )
                 run_task = loop.create_task(run_cli_async(
                     text, conv_id,
@@ -999,14 +1414,27 @@ class ZillaCore:
             # protocol never reaches a chat.
             final_text = self._process_relay_markers(final_text, ctx)
 
+            # Phase B1: a `BG_TASK:` marker becomes a confirm card, never a
+            # running job — same strip-then-hold discipline as the relay
+            # markers above.
+            final_text = self._process_bg_markers(final_text, ctx, chat_key)
+
             yield Response(
                 text=final_text,
                 files=tuple(detect_file_paths(final_text or "")),
                 meta={"session": sname, "conv_id": final_conv,
-                      "canceled": cancel_event.is_set()},
+                      "canceled": cancel_event.is_set(),
+                      "incognito": incognito},
             )
-            untrusted = untrusted_input or not ctx.is_owner or needs_browser(text)
-            await self._autocommit_memory(f"chat turn — uid {user_id}", untrusted=untrusted)
+            if incognito:
+                # Phase B2: an incognito turn is never committed to the
+                # memory repo — it is checked against it, and anything the
+                # model wrote anyway is put back.
+                await self._enforce_incognito(mem_before)
+            else:
+                untrusted = untrusted_input or not ctx.is_owner or needs_browser(text)
+                await self._autocommit_memory(f"chat turn — uid {user_id}",
+                                              untrusted=untrusted)
         finally:
             if self._active_cancel.get(key) is cancel_event:
                 self._active_cancel.pop(key, None)
@@ -1391,6 +1819,80 @@ class ZillaCore:
         except Exception as e:
             logger.error(f"[RELAY] marker processing failed: {e}", exc_info=True)
             return text
+
+    def _process_bg_markers(self, text: str, ctx, chat_key: int | None) -> str:
+        """Phase B1 step 2 (PLAN.md §9/B1): pull any `BG_TASK:` marker off
+        this turn's reply and hold it for the owner's tap.
+
+        Same three properties as the relay markers: the raw protocol never
+        reaches a chat, the marker is honored on OWNER turns only (an
+        injected instruction inside someone else's document can't queue work
+        on this machine), and any unexpected failure degrades to delivering
+        the reply unchanged."""
+        try:
+            from zilla import tasks as _tasks
+            clean, prompts = _tasks.parse_markers(text or "")
+            if not prompts:
+                return text
+            if ctx is None or not ctx.is_owner:
+                log_event("bg_task_blocked", user=getattr(ctx, "uid", None),
+                          count=len(prompts))
+                return clean
+            notes: list[str] = []
+            for prompt in prompts:
+                if self.tasks.propose(prompt, ctx.uid,
+                                      chat_key if chat_key is not None else ctx.uid) is None:
+                    notes.append("(Too many background jobs are waiting for your "
+                                 "go-ahead — clear a few and ask me again.)")
+                    break
+            return "\n\n".join([clean, *notes]) if notes else clean
+        except Exception as e:
+            logger.error(f"[TASK] marker processing failed: {e}", exc_info=True)
+            return text
+
+    def _is_incognito(self, uid: int, sname: str) -> bool:
+        """Phase B2: does this session carry the incognito flag? Any failure
+        reads as False — a broken lookup must not silently turn a private
+        session into a recorded one OR a normal one into a session whose
+        memory writes get reverted."""
+        try:
+            return bool(self.sessions.is_incognito(uid, sname))
+        except Exception as e:
+            logger.debug(f"[INCOGNITO] flag lookup failed: {e}")
+            return False
+
+    async def _enforce_incognito(self, before: dict | None) -> None:
+        """Phase B2 step 1 (PLAN.md §9/B2): CODE enforcement, not a model
+        promise. Compare the Memory tree against the snapshot taken before
+        the turn; if anything was written, restore it from the memory repo
+        and tell the owner in one line.
+
+        The notice fires on a detected write whether or not the restore
+        worked — the owner needs to know either way, and the wording says
+        which happened (R5: one calm sentence, one thing to do)."""
+        if before is None:
+            return
+        from zilla import memory as _memory
+        try:
+            after = await asyncio.to_thread(_memory.tree_snapshot)
+        except Exception as e:
+            logger.error(f"[INCOGNITO] could not re-check memory: {e}")
+            return
+        if after == before:
+            return
+        changed = sorted(set(before) ^ set(after)) or sorted(
+            p for p in after if before.get(p) != after.get(p))
+        restored = await asyncio.to_thread(_memory.git_restore)
+        log_event("incognito_write_reverted", restored=restored,
+                  files=len(changed))
+        if restored:
+            self._broadcast(Alert(
+                text="🕶 That was a private chat, so I undid the note it tried "
+                     "to save. Nothing was kept."))
+        else:
+            self._broadcast(Alert(
+                text="🕶 That was a private chat, but something was written to "
+                     "your memory and I couldn't undo it — check /memory."))
 
     async def _run_and_record(self, s: dict) -> None:
         """Tick-loop path: run a due schedule, broadcast the result, and

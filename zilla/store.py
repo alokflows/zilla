@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     messages INTEGER DEFAULT 0,
     last_used TEXT,
     created_at TEXT, updated_at TEXT,
+    incognito INTEGER DEFAULT 0,
     PRIMARY KEY (uid, name)
 );
 CREATE TABLE IF NOT EXISTS schedules (
@@ -130,7 +131,29 @@ CREATE TABLE IF NOT EXISTS relay_log (
     summary TEXT,
     status TEXT
 );
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    uid INTEGER NOT NULL,
+    chat_id INTEGER,
+    prompt TEXT NOT NULL,
+    title TEXT,
+    status TEXT NOT NULL,
+    progress TEXT,
+    result TEXT,
+    created_at TEXT, started_at TEXT, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_uid ON tasks(uid);
 """
+
+# Columns added to a table that already shipped. `CREATE TABLE IF NOT EXISTS`
+# does nothing to an existing database, so every post-M1 column needs an
+# idempotent ALTER here — checked against PRAGMA table_info on every open, so
+# a database created before the column existed picks it up on the next start
+# and one created after is untouched.
+_ADDED_COLUMNS = (
+    ("sessions", "incognito", "INTEGER DEFAULT 0"),
+)
 
 
 def _configure(conn: sqlite3.Connection, *, read_only: bool) -> None:
@@ -186,6 +209,12 @@ class Store:
         self._write_conn.execute("PRAGMA journal_mode=WAL")
         with self._write_lock:
             self._write_conn.executescript(_SCHEMA)
+            for table, column, decl in _ADDED_COLUMNS:
+                cols = {r["name"] for r in self._write_conn.execute(
+                    f"PRAGMA table_info({table})")}
+                if column not in cols:
+                    self._write_conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
             cur = self._write_conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             )
@@ -374,10 +403,10 @@ class Store:
     def sessions_upsert(self, uid: int, name: str, **fields) -> None:
         """Create the row if absent, else patch only the given columns.
         fields may include any of: conv_id, conv_backend, last_seen_step,
-        auto_title, messages, last_used, created_at, updated_at."""
+        auto_title, messages, last_used, created_at, updated_at, incognito."""
         allowed = {
             "conv_id", "conv_backend", "last_seen_step", "auto_title",
-            "messages", "last_used", "created_at", "updated_at",
+            "messages", "last_used", "created_at", "updated_at", "incognito",
         }
         bad = set(fields) - allowed
         if bad:
@@ -554,6 +583,69 @@ class Store:
             "SELECT * FROM relay_log ORDER BY id DESC LIMIT ?", (int(limit),)
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # ── background tasks (Phase B1 — the background lane) ───────
+    #
+    # The durable half of the lane: a task survives a restart as a row, so a
+    # crash mid-run leaves evidence instead of a silently vanished job. The
+    # live half (the cancel event, the asyncio task) is in-memory in
+    # core.Tasks — a task that was `running` when the process died is
+    # reconciled to `failed` on the next start, never resurrected: re-running
+    # an agentic prompt nobody is watching is not a safe default.
+
+    def tasks_add(self, *, tid: str, uid: int, chat_id: int | None, prompt: str,
+                  title: str, status: str, created_at: str) -> None:
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO tasks (id, uid, chat_id, prompt, title, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (tid, uid, chat_id, prompt, title, status, created_at),
+            )
+        self._write(_do)
+
+    def tasks_get(self, tid: str) -> dict | None:
+        row = self._r().execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        return dict(row) if row else None
+
+    def tasks_update(self, tid: str, **fields) -> bool:
+        allowed = {"status", "progress", "result", "title",
+                   "started_at", "finished_at"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"tasks_update: unknown fields {bad}")
+        if not fields:
+            return False
+
+        def _do(conn):
+            set_clause = ", ".join(f"{k}=?" for k in fields)
+            cur = conn.execute(f"UPDATE tasks SET {set_clause} WHERE id=?",
+                               list(fields.values()) + [tid])
+            return cur.rowcount > 0
+        return self._write(_do)
+
+    def tasks_by_status(self, statuses: tuple, *, uid: int | None = None,
+                        limit: int | None = None, newest_first: bool = False) -> list[dict]:
+        """Rows in one of `statuses`, oldest first (queue order) unless
+        newest_first — which is what the finished list wants."""
+        marks = ", ".join("?" for _ in statuses)
+        sql = f"SELECT * FROM tasks WHERE status IN ({marks})"
+        params: list = list(statuses)
+        if uid is not None:
+            sql += " AND uid=?"
+            params.append(uid)
+        sql += " ORDER BY created_at DESC, rowid DESC" if newest_first else \
+               " ORDER BY created_at ASC, rowid ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [dict(r) for r in self._r().execute(sql, params).fetchall()]
+
+    def tasks_count_by_status(self, statuses: tuple) -> int:
+        marks = ", ".join("?" for _ in statuses)
+        row = self._r().execute(
+            f"SELECT COUNT(*) AS n FROM tasks WHERE status IN ({marks})", statuses
+        ).fetchone()
+        return row["n"] if row else 0
 
     # ── mem_fts / mem_seen (Markdown search index — Phase M3 wires this in) ──
 
