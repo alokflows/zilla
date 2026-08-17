@@ -1,7 +1,8 @@
 # ============================================================
 #  CLI — the `zilla` console entrypoint (Phase 2 steps 1-2)
 # ============================================================
-#  Subcommands: config / doctor / start / stop / status / update / logs.
+#  Subcommands: config / doctor / start / stop / status / update /
+#  export / import / logs.
 #  These PROMOTE what already exists — install.py --doctor, start.sh /
 #  stop.sh, the pid/lock files — never duplicate their logic; every
 #  subcommand here is a thin wrapper that imports and calls the real
@@ -151,6 +152,53 @@ def cmd_update(args) -> int:
     return 0 if result["ok"] else 1
 
 
+def _ask_passphrase(confirm: bool) -> str:
+    """Read a passphrase from the terminal without echoing it. Never taken
+    from argv — `ps` is public (PLAN.md §15)."""
+    import getpass
+
+    while True:
+        first = getpass.getpass("  Passphrase (nothing is shown as you type): ")
+        if not first:
+            return ""
+        if not confirm:
+            return first
+        again = getpass.getpass("  Type it again: ")
+        if first == again:
+            return first
+        print("  Those didn't match — try again.")
+
+
+def cmd_export(args) -> int:
+    """PLAN.md §12/C1. One archive with everything that's the owner's:
+    memory, settings, schedules, people, and small media."""
+    import zilla.brain as brain
+
+    passphrase = _ask_passphrase(confirm=True) if args.encrypt else None
+    if args.encrypt and not passphrase:
+        print("  Cancelled — an encrypted export needs a passphrase.")
+        return 1
+    print("  Saving your brain…")
+    result = brain.export_brain(args.path, encrypt=args.encrypt, passphrase=passphrase)
+    print(brain.format_steps(result))
+    return 0 if result["ok"] else 1
+
+
+def cmd_import(args) -> int:
+    """PLAN.md §12/C1. Restore from an archive or an unpacked folder; the
+    search index and the entity graph are rebuilt from the Markdown, never
+    carried, which is the whole point of the format."""
+    import zilla.brain as brain
+
+    src = os.path.expanduser(args.path)
+    passphrase = (_ask_passphrase(confirm=False)
+                  if src.endswith(brain.ENCRYPTED_SUFFIX) else None)
+    print("  Restoring…")
+    result = brain.import_brain(src, passphrase=passphrase)
+    print(brain.format_steps(result))
+    return 0 if result["ok"] else 1
+
+
 def cmd_bare(_args) -> int:
     """Bare `zilla`: launch the TUI if it exists, else a friendly fallback."""
     try:
@@ -185,6 +233,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("--announce", type=int, default=0, metavar="CHAT_ID",
                           help="send the one-line result to this Telegram chat")
 
+    p_export = sub.add_parser("export", help="save your whole brain to one file")
+    p_export.add_argument("path", nargs="?", default=None,
+                          help="where to write it (default: ~/Zilla/Runtime/Exports/)")
+    p_export.add_argument("--encrypt", action="store_true",
+                          help="lock the file with a passphrase (AES-256)")
+
+    p_import = sub.add_parser("import", help="restore a brain from a backup")
+    p_import.add_argument("path", help="the backup file or unpacked folder")
+
     p_logs = sub.add_parser("logs", help="tail the bot log")
     p_logs.add_argument("-n", "--lines", type=int, default=50, help="lines to show (default 50)")
     p_logs.add_argument("-f", "--follow", action="store_true", help="keep tailing")
@@ -209,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
         "stop": cmd_stop,
         "status": cmd_status,
         "update": cmd_update,
+        "export": cmd_export,
+        "import": cmd_import,
         "logs": cmd_logs,
     }
     handler = handlers.get(args.command, cmd_bare)

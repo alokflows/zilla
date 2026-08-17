@@ -109,6 +109,14 @@ LOCK_FILE = os.path.join(RUNTIME_DIR, "zilla_bot_instance.lock")
 # Human-in-the-loop ask/answer relay files (zilla/interactive.py) — machine
 # plumbing, not owner-facing knowledge, so it lives in Runtime, not Memory.
 BRIDGE_DIR = os.path.join(RUNTIME_DIR, "Bridge")
+# C1 brain exports. Runtime is the constitution's home for "zilla.db +
+# backups" (§17/F1) and an export IS a backup — Outbox was the other
+# candidate and lost because F3 sweeps it on a timer, which must never
+# happen to a backup. `zilla export` always prints the full path.
+EXPORT_DIR = os.path.join(RUNTIME_DIR, "Exports")
+# Where an import parks the Memory tree it is about to replace — owner data
+# is never deleted, only moved aside.
+REPLACED_DIR = os.path.join(RUNTIME_DIR, "Replaced")
 
 # M2's memory.py creates this tree (MEMORY.md, Journal/, etc). Now that F1
 # has landed, it lives under ZILLA_HOME, not the repo root (see the

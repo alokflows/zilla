@@ -243,6 +243,41 @@ It only does this on **real failures**. A perfectly good answer that happens to 
 quotas or error 429 is not a failure, and is never thrown away. If everything is down, Zilla
 says so in one plain sentence rather than pretending.
 
+### Moving to a new computer 📦
+
+Everything Zilla knows about you is yours, in plain files. You can take it with you.
+
+**On the old computer**, in the Zilla folder:
+
+```
+zilla export
+```
+
+It writes one file and tells you exactly where it is (inside `~/Zilla/Runtime/Exports/`).
+Copy that file to a pen drive, or email it to yourself. Inside it: your memory and its whole
+history, your reminders, your settings, the people you've added, and any small files you asked
+Zilla to keep.
+
+Want it locked? `zilla export --encrypt` asks for a passphrase and locks the file with it.
+**Nobody can open it without that passphrase — not even us.** Write it down somewhere safe.
+
+**On the new computer**, install Zilla as normal; the installer asks *"Moving from another
+computer?"* — give it the file and it does the rest. If you've already installed:
+
+```
+zilla import /path/to/zilla-brain-....tar.gz
+```
+
+Two things to know:
+
+- Your **bot token is never inside the backup** — that's on purpose, so the file is safe to
+  email. The new computer asks you for it (or you paste it into `.env` as in §3).
+- **Saved skills come across, switched off.** Zilla shows them in `/skills` and you tap to
+  turn each one back on. A backup can't give itself permission to run things.
+
+Your old memory on the new computer isn't thrown away either — it's moved into
+`~/Zilla/Runtime/Replaced/` in case you want it back.
+
 ### If a reply looks wrong
 
 - Replies feel like they're **dragging in old context** → send **`/new`**.

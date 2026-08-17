@@ -8,7 +8,7 @@
 #       uses it automatically; only asks if BOTH are present. Then asks for the
 #       bot token, your Telegram ID, and whether to auto-start at login.
 #    3. Tells you exactly how to log into your AI CLI (agy or Claude Code).
-#    4. Writes the .env file.
+#    4. Writes the .env file, then offers to restore a Zilla backup (C1).
 #    5. Optionally sets the bot to auto-start at login.
 #    6. Starts the bot in the background.
 #
@@ -233,6 +233,38 @@ def pip_install():
     except subprocess.CalledProcessError:
         bad("pip install failed — check your internet / Python, then re-run.")
         sys.exit(1)
+
+
+def restore_from_backup(path: str | None = None, interactive: bool = True) -> bool:
+    """PLAN.md §12/C1 step 2 — the onboarding question that makes a new
+    machine wake up as the owner's own assistant. Non-interactive callers
+    pass `--restore <path>`; the interactive installer asks once and takes
+    Enter as "no". Returns True if a brain was restored.
+
+    (The TUI asks the same question from its own onboarding flow — T1.)"""
+    if not path and not interactive:
+        return False
+    if not path:
+        print()
+        print("  Moving from another computer? I can restore a Zilla backup.")
+        path = ask("  Backup file or folder (Enter to skip)", "").strip()
+    if not path:
+        return False
+
+    import zilla.brain as brain
+
+    passphrase = None
+    if path.endswith(brain.ENCRYPTED_SUFFIX):
+        if not interactive:
+            bad("That backup is locked — restore it with `zilla import` so I can "
+                "ask for the passphrase.")
+            return False
+        passphrase = ask_secret("  Passphrase for the backup (hidden as you type)", "")
+    result = brain.import_brain(path, passphrase=passphrase)
+    print(brain.format_steps(result))
+    if not result["ok"]:
+        bad("Nothing was restored — continuing with a fresh brain.")
+    return bool(result["ok"])
 
 
 def write_env(values: dict):
@@ -592,6 +624,10 @@ def main():
     if cli_path:
         vals["CLAUDE_PATH" if cli == "claude" else "CLI_PATH"] = cli_path
     write_env(vals)
+
+    # After .env (so ZILLA_HOME is settled) and before the bot starts, so the
+    # first turn already sees the restored memory.
+    restore_from_backup(_arg("--restore"), interactive=not non_interactive)
 
     if auto:
         setup_autostart()

@@ -91,21 +91,25 @@ review gate, every route logged).
 | **R3** | opencode as a third backend |
 | **S** | Skills from chat, ask-first: the agent OFFERS to save a procedure, the owner taps, and the skill index — the only place a skill is ever advertised — carries approved, unmodified skills only (`zilla/skills.py`, `/skills`). Every approved skill is also a slash command |
 | **B1-B2** | Background lane: a job runs in its own session under its own lock, so the chat never waits (`zilla/tasks.py`, `core.Tasks`, `/bg`, `/tasks`) · incognito sessions (`/new incognito`) where nothing is remembered — enforced by reverting the memory tree after the turn, not by asking the model nicely |
+| **C1** | The portable brain: `zilla export [--encrypt]` / `zilla import` (`zilla/brain.py`) — one archive of `Memory/` (with its git history), a state snapshot, a keys-only `.env.template` and small media. No database inside: the graph and search index are rebuilt from the Markdown on import, which is what makes the knowledge portable |
 
-**Tests: 2024 green across 27 files** (as of 2026-08-14), plus the import
+**Tests: 2140 green across 28 files** (as of 2026-08-17), plus the import
 smoke: `import bot; import zilla.core; import zilla.cli; import zilla.tui.app;
 import schedule_query; import zilla.graph; import zilla.graph_html; import
 memgraph; import zilla.relay; import zilla.zui; import zilla.presence; import
 zilla.update; import zilla.tasks; import zilla.router; import zilla.chain;
-import zilla.skills`. `test_schedules_seam.py` is a frozen
+import zilla.skills; import zilla.brain`. `test_schedules_seam.py` is a frozen
 acceptance spec — never edit it. Recount fresh per file rather than trusting
 any grand total.
 
 ### Checklist — build in this order (PLAN.md §13)
 
-- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4 · B1-B2 · R1-R2 · S
-- [ ] **C1-C3** Brain export/import · connectors screen · cloud backup +
-      bootstrap-from-cloud (PLAN §12)
+- [x] M1-M4 · H1-H4 · F1-F5 · K1-K4 · K5 · R3 · U1-U4 · B1-B2 · R1-R2 · S · C1
+- [ ] **C2-C3** Connectors screen (MCP + native, per-backend) · cloud backup +
+      bootstrap-from-cloud (PLAN §12). C3 builds directly on C1: the nightly
+      `state-snapshot.json` commit and "Restore from GitHub" both reuse
+      `brain.build_snapshot()` / `brain.import_brain()` — don't write a second
+      export path
 - [ ] **G1** Engine facade: Unix-socket IPC daemon-attach. The riskiest
       refactor in the plan — do it alone
 - [ ] **T1** Terminal app completion: Sessions/Schedules/Memory screens,
@@ -154,6 +158,11 @@ any grand total.
 - **Every `admin` is effectively unsandboxed shell access** on the host, so
   "adding people" is a trust decision, not a seat count. Delegation is what
   the owner actually wanted, and that's K5.
+- **A C1 snapshot carries the `backend` setting**, so a brain restored onto a
+  machine where that CLI isn't installed comes up pointing at nothing. F2's
+  registry and `zilla doctor` both surface it honestly, and the owner switches
+  in `/settings` — but if C3's bootstrap-from-cloud ever runs unattended, that
+  is the line to re-read.
 - **Latency is the owner's #1 complaint** — a full CLI call per turn (17s to
   ~2m30s). The triage router is the lever; keep widening the deterministic
   fast paths.
@@ -203,6 +212,7 @@ schedules scroll (R18, wants pagination) · `kb_user_detail` has no `✕ Close`
 
 | Date | What shipped |
 |---|---|
+| 2026-08-17 | **C1 the portable brain** — `zilla/brain.py` + `zilla export [--encrypt] [path]` / `zilla import <archive\|dir>` + the installer's onboarding "Restore from a backup?" (`--restore <path>` non-interactively; the TUI asks the same question when T1 builds onboarding). One `.tar.gz`: `Memory/` including its `.git`, `System/state-snapshot.json` (settings · schedules · users · curiosity), `System/manifest.json`, a keys-only `.env.template`, `Media/` under `export_media_max_mb` (10) each with the oversize files named back to the owner. **The database is deliberately not in it** — the graph and FTS index are recomputed from the Markdown on import (`graph.rebuild` + new `Store.fts_clear` then `memory.reindex`), so the round-trip test asserts identical nodes/aliases/edges and identical `neighbors()`/`find_path()`/search answers after a full wipe. That is the P1 claim, tested. Curiosity travels keyed by wiki page (ids are rebuild artefacts) and only restores `asked_at` for a gap the rebuild actually detected. Three things stay behind on purpose: **secrets** (credential-shaped settings dropped, `.env` reduced to key names, nothing of a token anywhere in the archive), **skill approvals** (an import must never arrive with code pre-authorized — files travel, the tap doesn't), and **sessions** (conv ids belong to the backend). `--encrypt` = AES-256-CBC + pbkdf2 via openssl, passphrase on stdin never argv, plaintext removed after. Import moves the existing `Memory/` to `Runtime/Replaced/` instead of deleting it, never overwrites local media, refuses a `..` member in a tarball, and tells the owner which `.env` keys the new machine still needs. New paths `EXPORT_DIR`/`REPLACED_DIR` under `Runtime` (an export is a backup; Outbox lost because F3 sweeps it). `test_brain.py` (116). 2140 green. Real export+import round trip run on the live install into a scratch `ZILLA_HOME` — counts matched exactly. |
 | 2026-08-14 | **S skills from chat** — `zilla/skills.py` (pure) + `skill_approvals.enabled` + `core.Skills` + `/skills`. The agent may only OFFER (`SKILL_PROPOSAL: <name> — <one-liner>`, owner-turn-only, never in incognito, never re-offered after a ❌); ✅ arms a one-shot write instruction that rides the owner's NEXT prompt, and the turn after it Zilla reads what was actually written. **Ambiguity in §11 resolved the safe way:** a Markdown-only skill goes live on the tap that authorized it, but anything carrying a script stays unapproved — unindexed, uncallable — until a second explicit tap in `/skills`, so no code-type skill ever runs without an owner approval tap. The index gate is the enforcement, not the model: only a live approval row whose sha256 (SKILL.md + every other byte) still matches disk gets named to the model or turned into a command, so a SKILL.md that appeared out-of-band is invisible; an edit after approval auto-switches it off with one owner line. Every approved skill is also an owner-scope slash command running the skill's wording through the same `_run_text_turn` path as typed text (`handle_message` refactored onto it). Legacy backend-native skills coexist ungated but became owner-turn-only. `test_skills.py` (152). 2024 green. Live Telegram smoke of the offer → ✅ → `/` autocomplete round trip not run. |
 | 2026-08-14 | **R2 fallback chain** — `zilla/chain.py` + the walk inside `core.handle_message`. Fires on error channels ONLY: a backend error, an empty answer after cli_engine's own retry, or a limit signal inside an error-shaped response. The shape gate moved into `review()` itself, which fixes a live bug — a long correct answer about quotas/429s was being replaced by a "you're rate-limited" notice. Each chain entry (setting `backend_chain`, default agy → opencode → claude, filtered to installed binaries) is gated on a fresh `health.login_ok` probe (stale ⇒ probed on demand), tried once, in a throwaway conv carrying one primer line, and the winner's answer ships with `↷ answered via <backend>`. The session keeps its own backend and conv id. `usage.fallbacks` bumped per attempt; exhausted ⇒ one honest sentence. Also: every test file now pins `ZILLA_HOME` to a tmpdir — the suite was writing into the owner's real `~/Zilla/Runtime/logs`. `test_chain.py` (61). 1870 green. |
 | 2026-08-14 | **R1 router + effort controller** — `zilla/router.py`: one pre-lock pass decides the class (command/share/trivial/normal, built on `review.classify_route`) and the effort (fast/standard/deep). The rules are fixed and the owner is on top of them — "think hard"/"take your time"/`!deep` beat the classifier even on a one-word message, and the marker is stripped before the model sees it. `effort_map` (setting) maps an effort to `backend:model`, validated at write time: naming agy is refused with a plain reason, since agy's model is one global string shared with every agy terminal on the machine. A fast turn injects core MEMORY.md only, runs in a throwaway conv and never advances the session's conv id; empty or error-shaped ⇒ silently rerun as a normal turn. Per-turn model override now reaches claude/opencode's `--model` (agy's dispatch structurally cannot take one). `test_router.py` (105). 1807 green. |

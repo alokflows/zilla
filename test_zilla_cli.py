@@ -371,8 +371,9 @@ def test_build_parser_subcommands():
     names = set()
     for action in parser._subparsers._group_actions:
         names |= set(action.choices.keys())
-    check("cli: all seven subcommands registered",
-          names == {"config", "doctor", "start", "stop", "status", "update", "logs"},
+    check("cli: every subcommand registered",
+          names == {"config", "doctor", "start", "stop", "status", "update",
+                    "export", "import", "logs"},
           detail=str(names))
 
 

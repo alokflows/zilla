@@ -355,6 +355,17 @@ class Store:
             return True
         return self._write(_do)
 
+    def denied_add(self, uid: int, denied_at: str) -> None:
+        """Record a denied uid directly (no user row to remove first) — the
+        C1 import path restoring a snapshot's denied list."""
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO denied (uid, denied_at) VALUES (?, ?) "
+                "ON CONFLICT(uid) DO UPDATE SET denied_at=excluded.denied_at",
+                (uid, denied_at),
+            )
+        self._write(_do)
+
     def users_is_denied(self, uid: int) -> bool:
         row = self._r().execute("SELECT 1 FROM denied WHERE uid=?", (uid,)).fetchone()
         return row is not None
@@ -690,6 +701,17 @@ class Store:
         def _do(conn):
             conn.execute("DELETE FROM mem_fts WHERE path=?", (path,))
             conn.execute("DELETE FROM mem_seen WHERE path=?", (path,))
+        self._write(_do)
+
+    def fts_clear(self) -> None:
+        """Drop the whole Markdown index (docs AND the mtime/size ledger), so
+        the next reindex reads every file back off disk. The C1 import path
+        needs this: a restored page can legitimately land with the same size
+        and mtime as the page it replaced (copy2 preserves mtime), which the
+        ledger would read as 'unchanged' and keep the old machine's body."""
+        def _do(conn):
+            conn.execute("DELETE FROM mem_fts")
+            conn.execute("DELETE FROM mem_seen")
         self._write(_do)
 
     def fts_search(self, query: str, limit: int = 10) -> list[dict]:
