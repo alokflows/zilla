@@ -189,6 +189,24 @@ AGY_SETTINGS_FILE = os.getenv(
     os.path.join(HOME_DIR, ".gemini", "antigravity-cli", "settings.json"),
 )
 
+# --- Connectors (C2): where each backend keeps its OWN MCP config ------
+# Zilla never proxies a connector — it manages the backend's config
+# (PLAN.md §12/C2). These files belong to the backends, not to ZILLA_HOME
+# (F1: conversations and tool configs belong to brains), so they live in
+# each CLI's own home. Secrets (env/headers) live ONLY inside them.
+CLAUDE_CONFIG_FILE = os.getenv(
+    "CLAUDE_CONFIG_FILE",
+    os.path.join(HOME_DIR, ".claude.json"),
+)
+AGY_MCP_CONFIG = os.getenv(
+    "AGY_MCP_CONFIG",
+    os.path.join(HOME_DIR, ".gemini", "config", "mcp_config.json"),
+)
+OPENCODE_CONFIG_FILE = os.getenv(
+    "OPENCODE_CONFIG_FILE",
+    os.path.join(HOME_DIR, ".config", "opencode", "opencode.jsonc"),
+)
+
 # --- ffmpeg (voice-note transcription) ---
 # Windows: bundled copy under ZILLA_HOME\Tools. Unix: system ffmpeg (brew/apt).
 FFMPEG_PATH = os.getenv("FFMPEG_PATH") or _find_exe(
