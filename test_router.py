@@ -617,6 +617,58 @@ def _run_turn_done_tests():
         _restore_backends(old)
 
 
+def _run_fast_prompt_purity_tests():
+    print("\n[11] R4b — the smalltalk fast path is prompt-from-text-only, any uid")
+    old = _with_backends(claude=True)
+    core = _fresh_core("r4b")
+    old_fast = zcore._run_fast_claude
+
+    # Plant distinctive owner-memory content: if the widening ever teaches
+    # the fast path to inject context, THIS string is what would leak.
+    os.makedirs(config.MEMORY_DIR, exist_ok=True)
+    mem_file = os.path.join(config.MEMORY_DIR, memory.MEMORY_FILENAME)
+    marker = "PRIVATE-MEMORY-LINE-NONE-OF-THE-FAST-PATHS-BUSINESS-4242"
+    original_mem = None
+    if os.path.exists(mem_file):
+        with open(mem_file, encoding="utf-8") as f:
+            original_mem = f.read()
+    with open(mem_file, "a", encoding="utf-8") as f:
+        f.write(f"\n{marker}\n")
+
+    seen = []
+
+    def _spy(prompt):
+        seen.append(prompt)
+        return "Hey!"
+
+    async def _turn(uid, msg):
+        out = []
+        async for ev in core.handle_message(uid, msg):
+            out.append(ev)
+        return out
+
+    try:
+        zcore._run_fast_claude = _spy
+        asyncio.run(_turn(OWNER, "ok"))
+        check("an ack reaches the one-shot as bare text, nothing else",
+              len(seen) == 1 and seen[-1] == "ok", seen)
+        check("zero memory content rides along for the owner",
+              marker not in seen[-1], repr(seen[-1]))
+        asyncio.run(_turn(222, "done"))
+        check("a non-owner's ack is treated identically",
+              len(seen) == 2 and seen[-1] == "done", seen)
+        check("…and carries zero memory content too",
+              marker not in seen[-1], repr(seen[-1]))
+    finally:
+        zcore._run_fast_claude = old_fast
+        if original_mem is None:
+            os.remove(mem_file)
+        else:
+            with open(mem_file, "w", encoding="utf-8") as f:
+                f.write(original_mem)
+        _restore_backends(old)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  PHASE R1 — ROUTER + EFFORT CONTROLLER TESTS")
@@ -631,6 +683,7 @@ if __name__ == "__main__":
     _run_fast_profile_tests()
     _run_lean_injection_test()
     _run_turn_done_tests()
+    _run_fast_prompt_purity_tests()
     print("\n" + "=" * 60)
     print(f"  {_passed} passed, {_failed} failed")
     print("=" * 60)

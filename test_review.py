@@ -31,7 +31,8 @@ def check(name, cond, detail=""):
 import os as _os, tempfile as _tf  # noqa: E402
 _os.environ.setdefault("ZILLA_HOME", _tf.mkdtemp(prefix="zilla_test_home_"))
 _os.makedirs(_os.path.join(_os.environ["ZILLA_HOME"], "Runtime", "logs"), exist_ok=True)
-from zilla.review import review, classify_route, ReviewResult, FAIL_PREFIXES  # noqa: E402
+from zilla.review import (review, classify_route, is_trivial, ReviewResult,  # noqa: E402
+                          FAIL_PREFIXES)
 
 
 # ── review() ──────────────────────────────────────────────
@@ -182,6 +183,110 @@ def test_classify_full_default():
         check(f"{msg!r} -> full", classify_route(msg) == "full", classify_route(msg))
 
 
+# ── R4b: is_trivial() — three matchers behind the shared guards ──
+
+def test_trivial_exact_matcher():
+    print("\n[12] is_trivial() — EXACT: the original whitelist, byte-identical")
+    exact = [
+        "hi", "HELLO", "Yo", "hey there", "good morning", "gm",
+        "good night", "thanks!", "thank you.", "ty", "tysm",
+        "much appreciated", "ok", "okay", "kk", "alright", "cool",
+        "sounds good", "got it", "noted", "no worries", "np",
+        "yes", "Nope", "bye", "see ya", "you're welcome",
+    ]
+    for msg in exact:
+        check(f"{msg!r} -> trivial (exact)", is_trivial(msg) is True, msg)
+
+
+def test_trivial_tokens_matcher():
+    print("\n[13] is_trivial() — TOKENS: short acks from the closed vocabulary")
+    token_hits = [
+        "done",            # CEO's example — a bare new ack word
+        "ok done",
+        "ok cool",
+        "great thanks",
+        "hey man",
+        "thanks guys",
+        "night all",
+        "bye then",
+    ]
+    for msg in token_hits:
+        check(f"{msg!r} -> trivial (tokens)", is_trivial(msg) is True, msg)
+
+    token_misses = [
+        "yes sir",                    # unknown word ⇒ full path
+        "ok where is the invoice",    # content words are never in the vocab
+        "done for today",
+        "yes and no",
+        "cool story",
+        "ok do it",                   # pinned since P1.5 — verbs never widen in
+        "noted, but check the numbers again",
+    ]
+    for msg in token_misses:
+        check(f"{msg!r} -> NOT trivial (unknown/content words)",
+              is_trivial(msg) is False, msg)
+
+
+def test_trivial_emoji_matcher():
+    print("\n[14] is_trivial() — EMOJI: glyph-only messages, no alnum anywhere")
+    emoji_hits = ["👍", "🙏🙏🙏", "🎉 🎉", "👍🏻", "❤️", ":)"]
+    for msg in emoji_hits:
+        check(f"{msg!r} -> trivial (emoji)", is_trivial(msg) is True, msg)
+
+    emoji_misses = [
+        "ok 👍",   # ANY alphanumeric anywhere disqualifies
+        "2!",
+        "a 🙏",
+        "ok then 👍 ok then 👍 ok then 👍 ok then 👍",  # >40 normalized chars
+    ]
+    for msg in emoji_misses:
+        check(f"{msg!r} -> NOT trivial", is_trivial(msg) is False, msg)
+
+
+def test_trivial_hard_negatives():
+    print("\n[15] is_trivial() — hard negatives: questions and state never widen")
+    hard_negatives = [
+        # A question mark anywhere kills it, even on an ack-shaped message.
+        "ok?", "done?", "👍?", "yes?", "hi, can you check my email?",
+        # State questions — with or without '?', they must hit the full path.
+        "what did I say",
+        "when is it",
+        "remind me ok",
+        "schedule tomorrow",
+        "tell me when you are done",
+        "what did we decide about the lease",
+        "hi what time is it",
+        # Length guard: a 40+ char ack-shaped string is not small talk.
+        "ok " * 14,
+        # Empty is nothing, not a greeting.
+        "", "   ",
+    ]
+    for msg in hard_negatives:
+        check(f"{msg!r} -> NOT trivial", is_trivial(msg) is False, msg)
+
+
+def test_router_sees_the_widening():
+    print("\n[16] router.classify / resolve_effort — widening can't outrank the owner")
+    from zilla import router
+    for msg in ("done", "ok cool", "👍", "hey man"):
+        check(f"router.classify({msg!r}) -> TRIVIAL",
+              router.classify(msg) == router.TRIVIAL, router.classify(msg))
+    for msg in ("ok?", "what did I say", "remind me ok", "ok where is my invoice?"):
+        check(f"router.classify({msg!r}) stays NORMAL",
+              router.classify(msg) == router.NORMAL, router.classify(msg))
+
+    # Emphasis and `!deep` beat the widened classifier, absolutely.
+    effort, _text, why = router.resolve_effort("ok, think hard about this",
+                                               router.TRIVIAL)
+    check("emphasis on an ack-shaped message still goes deep",
+          effort == router.DEEP and why == "emphasis", (effort, why))
+    effort, text, why = router.resolve_effort("!deep 👍", router.NORMAL)
+    check("`!deep` on an emoji message still goes deep",
+          effort == router.DEEP and why == "prefix", (effort, why))
+    check("…and the marker is stripped, leaving the emoji",
+          text == "👍", repr(text))
+
+
 def main():
     tests = [
         test_review_empty,
@@ -195,6 +300,11 @@ def main():
         test_classify_share,
         test_classify_share_conservative_exclusions,
         test_classify_full_default,
+        test_trivial_exact_matcher,
+        test_trivial_tokens_matcher,
+        test_trivial_emoji_matcher,
+        test_trivial_hard_negatives,
+        test_router_sees_the_widening,
     ]
     print("Running zilla.review tests...\n")
     for t in tests:

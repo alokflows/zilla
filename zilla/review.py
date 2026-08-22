@@ -197,13 +197,78 @@ def _normalize(text: str) -> str:
     return t
 
 
-def _is_smalltalk(text: str) -> bool:
+_TRIVIAL_MAX_TOKENS = 4
+
+# Closed token vocabularies for the widened matcher. A message passes the
+# TOKENS matcher only if EVERY token is in this vocabulary AND at least one
+# comes from a required set (ack / greeting / thanks / yes-no) — so "ok cool"
+# is trivial, but "ok where is the invoice" is not, because "where"/"invoice"
+# are not words this matcher has ever heard of. Unknown word ⇒ full path.
+_ACK_TOKENS = {
+    "ok", "okay", "kk", "k", "alright", "right", "cool", "nice", "great",
+    "awesome", "perfect", "good", "got", "noted", "fine", "done",
+}
+_GREETING_TOKENS = {
+    "hi", "hii", "hiya", "hello", "hey", "yo", "gm", "gn", "morning",
+    "afternoon", "evening", "night", "bye", "goodbye", "later", "cya",
+}
+_THANKS_TOKENS = {"thanks", "thank", "ty", "tysm", "thx", "appreciated"}
+_YESNO_TOKENS = {"yes", "no", "yep", "yup", "nope", "sure"}
+_TAIL_TOKENS = {
+    # Function-word tails only — glue that turns one required token into a
+    # natural phrase ("thanks so much"), never content.
+    "there", "you", "so", "much", "a", "the", "then", "too", "all", "lot",
+    "welcome", "guys", "man",
+}
+_REQUIRED_TOKENS = (_ACK_TOKENS | _GREETING_TOKENS | _THANKS_TOKENS
+                    | _YESNO_TOKENS)
+_VOCAB = _REQUIRED_TOKENS | _TAIL_TOKENS
+
+
+def _matches_exact(norm: str) -> bool:
+    return norm in _SMALLTALK_PHRASES
+
+
+def _matches_tokens(norm: str) -> bool:
+    tokens = norm.split()
+    if not 1 <= len(tokens) <= _TRIVIAL_MAX_TOKENS:
+        return False
+    if not any(tok in _REQUIRED_TOKENS for tok in tokens):
+        return False
+    return all(tok in _VOCAB for tok in tokens)
+
+
+def _matches_emoji(norm: str) -> bool:
+    glyphs = [ch for ch in norm if not ch.isspace()]
+    if not 1 <= len(glyphs) <= 8:
+        return False
+    return all(not ch.isalnum() for ch in glyphs)
+
+
+def is_trivial(text: str) -> bool:
+    """True when the message is pure small talk and can take the fast path.
+
+    R4b widening of R1's whitelist: three deterministic matchers behind the
+    same shared guards (no '?', ≤40 chars normalized, exactly one
+    _normalize pass):
+
+      EXACT   — today's closed phrase table, unchanged.
+      TOKENS  — 1–4 tokens, every token from a closed vocabulary, at least
+                one an ack/greeting/thanks/yes-no; tails limited to function
+                words. Catches "ok cool" and "great thanks" without ever
+                letting a content word through.
+      EMOJI   — 1–8 emoji/punctuation/symbol glyphs; ANY alphanumeric
+                anywhere means it isn't trivial.
+
+    Deliberately still a whitelist at heart: unknown words fall to 'full'.
+    """
     if "?" in text:
         return False
     norm = _normalize(text)
     if not norm or len(norm) > 40:
         return False
-    return norm in _SMALLTALK_PHRASES
+    return (_matches_exact(norm) or _matches_tokens(norm)
+            or _matches_emoji(norm))
 
 
 def classify_route(text: str) -> str:
@@ -220,6 +285,6 @@ def classify_route(text: str) -> str:
         # "remember?" (nothing to note) is a question, not a share.
         if payload and payload.strip("?!.,; ") != "":
             return "share"
-    if _is_smalltalk(t):
+    if is_trivial(t):
         return "smalltalk"
     return "full"
