@@ -322,7 +322,7 @@ def _run_decide_tests():
               and d.fast_profile is False, d)
         check("the decision logs as flat fields",
               set(router.decide("hi").as_log()) ==
-              {"class", "effort", "why", "target", "model"})
+              {"class", "effort", "why", "target", "model", "ms"})
         check("a demoted decision is an ordinary turn",
               router.decide("hi").demoted().fast_profile is False)
     finally:
@@ -525,6 +525,98 @@ def _run_lean_injection_test():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _run_turn_done_tests():
+    print("\n[10] R4a — every routed turn ends in exactly one real-ms turn_done")
+    old = _with_backends(claude=True)
+    core = _fresh_core("r4a")
+    original = zcore.run_cli_async
+    old_fast = zcore._run_fast_claude
+
+    from zilla import harness as _harness
+
+    def _events_matching(name, start_line=0):
+        out = []
+        with open(_harness._TRUST_LOG, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i < start_line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == name:
+                    out.append(ev)
+        return out
+
+    def _log_lines():
+        if not os.path.exists(_harness._TRUST_LOG):
+            return 0
+        with open(_harness._TRUST_LOG, encoding="utf-8") as f:
+            return sum(1 for _ in f)
+
+    async def _fake(prompt, conv_id=None, progress_callback=None, cancel_event=None,
+                    skip_permissions=False, ctx=None):
+        return "an answer", "conv-x"
+
+    async def _turn(msg):
+        out = []
+        async for ev in core.handle_message(OWNER, msg):
+            out.append(ev)
+        return out
+
+    try:
+        zcore.run_cli_async = _fake
+        # The smalltalk one-shot would spawn a real claude; pin it to a
+        # deterministic answer so the smalltalk exit is what's measured.
+        zcore._run_fast_claude = lambda prompt: "Hey!"
+
+        start = _log_lines()
+        asyncio.run(_turn("remember the milk is on Priya"))
+        done = _events_matching("turn_done", start)
+        check("a share turn lands exactly one turn_done",
+              len(done) == 1 and done[-1].get("route") == "share", done)
+        check("the share ms is a real non-negative int",
+              isinstance(done[-1].get("ms"), int) and done[-1]["ms"] >= 0, done[-1])
+
+        asyncio.run(_turn("hi"))
+        done = [e for e in _events_matching("turn_done", start) if e.get("route") == "smalltalk"]
+        check("a smalltalk turn lands exactly one smalltalk turn_done",
+              len(done) == 1 and done[-1].get("ms", -1) >= 0, done)
+
+        asyncio.run(_turn("draft a reply to the landlord"))
+        done = [e for e in _events_matching("turn_done", start) if e.get("route") == "full"]
+        check("a full turn lands exactly one full turn_done",
+              len(done) == 1 and done[-1].get("ms", -1) >= 0, done)
+        total = len([e for e in _events_matching("turn_done", start)])
+        check("three turns produced three lines — never more than one per turn",
+              total == 3, total)
+
+        # A demoted fast turn pays double; the rerun line should show it.
+        # Unreachable one-shot forces 'hi' down the fast-profile path, where
+        # an empty answer is what triggers the demotion.
+        zcore._run_fast_claude = lambda prompt: None
+        answers = ["", "The real answer."]
+
+        async def _empty_then_real(prompt, conv_id=None, progress_callback=None,
+                                   cancel_event=None, skip_permissions=False, ctx=None):
+            return answers.pop(0), "conv-rerun"
+
+        zcore.run_cli_async = _empty_then_real
+        asyncio.run(_turn("hi"))
+        reruns = _events_matching("router_rerun", start)
+        check("the demoted fast turn logs router_rerun with an int ms",
+              len(reruns) == 1 and isinstance(reruns[-1].get("ms"), int)
+              and reruns[-1]["ms"] >= 0, reruns)
+
+        d = router.decide("hello world, build me a website")
+        check("decide() itself reports its own cost",
+              isinstance(d.ms, int) and d.ms >= 0 and d.as_log()["ms"] == d.ms, d.as_log())
+    finally:
+        zcore.run_cli_async = original
+        zcore._run_fast_claude = old_fast
+        _restore_backends(old)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  PHASE R1 — ROUTER + EFFORT CONTROLLER TESTS")
@@ -538,6 +630,7 @@ if __name__ == "__main__":
     _run_agy_untouched_test()
     _run_fast_profile_tests()
     _run_lean_injection_test()
+    _run_turn_done_tests()
     print("\n" + "=" * 60)
     print(f"  {_passed} passed, {_failed} failed")
     print("=" * 60)

@@ -1579,6 +1579,9 @@ class ZillaCore:
         # Phase R1 folds the effort controller into the same pass: the class
         # decides the route, the effort decides how hard the turn is allowed
         # to try. Both are deterministic; the model is told neither.
+        # R4a: every routed turn ends with exactly one turn_done line, so
+        # widening a fast path is measured against real elapsed time.
+        t0 = time.monotonic()
         decision = router.decide(text)
         text = decision.text          # `!deep` stripped — the model never sees it
         route = {router.SHARE: "share", router.TRIVIAL: "smalltalk"}.get(
@@ -1603,8 +1606,11 @@ class ZillaCore:
         if route == "share":
             ack = _append_to_journal(text)
             log_event("route", route="share", user=user_id)
-            yield Response(text=ack, files=(),
-                           meta={"session": None, "conv_id": None, "canceled": False})
+            log_event("turn_done", user=user_id, route="share",
+                      ms=int((time.monotonic() - t0) * 1000))
+            yield Response(
+                text=ack, files=(),
+                meta={"session": None, "conv_id": None, "canceled": False})
             await self._autocommit_memory(f"journal entry — uid {user_id}")
             return
 
@@ -1614,6 +1620,8 @@ class ZillaCore:
                 result = review(text, fast_text)
                 if result.verdict != "stop":
                     log_event("route", route="smalltalk", user=user_id, verdict=result.verdict)
+                    log_event("turn_done", user=user_id, route="smalltalk",
+                              ms=int((time.monotonic() - t0) * 1000))
                     yield Response(
                         text=fast_text,
                         files=tuple(detect_file_paths(fast_text or "")),
@@ -1741,7 +1749,8 @@ class ZillaCore:
                     verdict = review(text, response)
                     if verdict.verdict == "stop" and verdict.reason in ("empty", "error"):
                         log_event("router_rerun", user=user_id, reason=verdict.reason,
-                                  was=decision.backend or "session")
+                                  was=decision.backend or "session",
+                                  ms=int((time.monotonic() - t0) * 1000))
                         decision = decision.demoted()
                         conv_id = self._conv_for_run(user_id, sname)
                         ctx = TurnContext(
@@ -1851,6 +1860,8 @@ class ZillaCore:
             # switched on or held for a second tap.
             final_text = self._process_skill_markers(final_text, ctx, chat_key)
 
+            log_event("turn_done", user=user_id, route="full",
+                      ms=int((time.monotonic() - t0) * 1000))
             yield Response(
                 text=final_text,
                 files=tuple(detect_file_paths(final_text or "")),

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 
 from zilla.review import classify_route
@@ -105,6 +106,8 @@ class Decision:
                     session's conv id (I-CONV).
     reason        — short tag for the log: 'emphasis', 'prefix', 'trivial',
                     'default'.
+    ms            — milliseconds spent inside decide() itself (R4a): the
+                    proof, forever, that classification costs ~nothing.
     """
     text: str
     klass: str = NORMAL
@@ -113,6 +116,7 @@ class Decision:
     model: str | None = None
     fast_profile: bool = False
     reason: str = "default"
+    ms: int | None = None
 
     def demoted(self) -> "Decision":
         """The same turn, run the ordinary way — what a misclassified fast
@@ -124,7 +128,7 @@ class Decision:
     def as_log(self) -> dict:
         return {"class": self.klass, "effort": self.effort,
                 "why": self.reason, "target": self.backend or "session",
-                "model": self.model}
+                "model": self.model, "ms": self.ms}
 
 
 # ══════════════════════════════════════════════════════════
@@ -278,6 +282,7 @@ def target_for(effort: str) -> tuple[str | None, str | None]:
 
 def decide(text: str) -> Decision:
     """One call, everything the turn needs to know about how to run."""
+    t0 = time.monotonic()
     klass = classify(text)
     effort, cleaned, reason = resolve_effort(text, klass)
     backend, model = target_for(effort)
@@ -291,4 +296,5 @@ def decide(text: str) -> Decision:
         # profile, and the turn runs exactly as it always did.
         fast_profile=(effort == FAST and backend is not None),
         reason=reason,
+        ms=int((time.monotonic() - t0) * 1000),
     )
