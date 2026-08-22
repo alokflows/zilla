@@ -42,7 +42,7 @@ import threading
 import time
 import time as _time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 import zilla.interactive as interactive
 from zilla.autoharness import needs_browser
@@ -57,7 +57,7 @@ from zilla.harness import log_event, TurnContext
 from zilla import chain
 from zilla import health as _health
 from zilla import router
-from zilla.review import review
+from zilla.review import clock_answer, review
 from zilla.schedules import resolve_session_mode, backend_pin_mismatch
 
 logger = logging.getLogger(__name__)
@@ -1584,9 +1584,23 @@ class ZillaCore:
         t0 = time.monotonic()
         decision = router.decide(text)
         text = decision.text          # `!deep` stripped — the model never sees it
-        route = {router.SHARE: "share", router.TRIVIAL: "smalltalk"}.get(
-            decision.klass, "full")
+        route = {router.SHARE: "share", router.TRIVIAL: "smalltalk",
+                 router.CLOCK: "clock"}.get(decision.klass, "full")
         log_event("router", user=user_id, **decision.as_log())
+
+        # R4c: a bare clock/date question answers with zero model calls and
+        # zero writes — no lock, no backend, no memory — for ANY authorized
+        # principal. Owner emphasis still wins: a deep ask takes the full
+        # path even when it only wanted the time.
+        if route == "clock" and decision.effort != router.DEEP:
+            log_event("route", route="clock", user=user_id)
+            answer = clock_answer(datetime.now(timezone.utc))
+            log_event("turn_done", user=user_id, route="clock",
+                      ms=int((time.monotonic() - t0) * 1000))
+            yield Response(text=answer, files=(),
+                           meta={"session": None, "conv_id": None,
+                                 "canceled": False})
+            return
 
         # Journal is the OWNER's memory (PLAN.md §4 scope guard) — any other
         # principal's "share"-shaped message falls through to the full route

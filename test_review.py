@@ -10,6 +10,7 @@
 # ============================================================
 
 import sys
+from datetime import datetime, timezone, timedelta
 
 _passed = 0
 _failed = 0
@@ -31,8 +32,8 @@ def check(name, cond, detail=""):
 import os as _os, tempfile as _tf  # noqa: E402
 _os.environ.setdefault("ZILLA_HOME", _tf.mkdtemp(prefix="zilla_test_home_"))
 _os.makedirs(_os.path.join(_os.environ["ZILLA_HOME"], "Runtime", "logs"), exist_ok=True)
-from zilla.review import (review, classify_route, is_trivial, ReviewResult,  # noqa: E402
-                          FAIL_PREFIXES)
+from zilla.review import (review, classify_route, is_trivial, clock_answer,  # noqa: E402
+                          ReviewResult, FAIL_PREFIXES)
 
 
 # ── review() ──────────────────────────────────────────────
@@ -287,6 +288,67 @@ def test_router_sees_the_widening():
           text == "👍", repr(text))
 
 
+# ── R4c: the zero-model clock/date route ──
+
+def test_clock_classification():
+    print("\n[17] classify_route() — a bare clock/date question -> 'clock'")
+    hits = [
+        "what time is it",
+        "what time is it?",
+        "What Time Is It?",
+        "what time is it.",           # trailing period normalizes away
+        "whats the time",
+        "what is the time",
+        "what's the date",
+        "what is todays date",
+        "what day is it",
+        "what day is it today?",
+        "what's the day",
+        "what date is it now",
+        "what time is it right now",
+    ]
+    for msg in hits:
+        check(f"{msg!r} -> clock", classify_route(msg) == "clock",
+              classify_route(msg))
+
+    misses = [
+        # extra words break the anchor — those need a real turn
+        "what time is it in London",
+        "what time is the meeting",
+        "what day is it tomorrow",
+        "tell me the time",
+        "time please",
+        # an explicit share still wins over clock
+        "remember what time it is",
+        # state questions are untouched
+        "what did I say about the lease",
+        "when is it",
+    ]
+    for msg in misses:
+        check(f"{msg!r} -> NOT clock", classify_route(msg) != "clock",
+              classify_route(msg))
+
+
+def test_clock_answer_is_plain_and_pure():
+    print("\n[18] clock_answer() — one plain sentence, pure in its inputs")
+    ist = timezone(timedelta(hours=5, minutes=30))  # fixed offset: hermetic
+    now = datetime(2026, 8, 22, 11, 15, tzinfo=timezone.utc)
+    ans = clock_answer(now, zone=ist)
+    check("answers time, day and date in ONE plain line",
+          ans == "It's 4:45 pm, Saturday 22 August 2026.", ans)
+    check("same inputs, same answer — no clock reads inside",
+          clock_answer(now, zone=ist) == ans)
+
+    midnight = clock_answer(datetime(2026, 1, 1, 18, 30, tzinfo=timezone.utc),
+                            zone=ist)
+    check("midnight reads am with no leading zero, correct day rollover",
+          midnight == "It's 12:00 am, Friday 2 January 2026.", midnight)
+
+    local = clock_answer(datetime.now(timezone.utc))
+    check("zone=None resolves the local zone and still answers plainly",
+          isinstance(local, str) and local.startswith("It's "), local)
+
+
 def main():
     tests = [
         test_review_empty,
@@ -305,6 +367,8 @@ def main():
         test_trivial_emoji_matcher,
         test_trivial_hard_negatives,
         test_router_sees_the_widening,
+        test_clock_classification,
+        test_clock_answer_is_plain_and_pure,
     ]
     print("Running zilla.review tests...\n")
     for t in tests:

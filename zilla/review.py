@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, tzinfo
 
 from zilla.cli_engine import detect_limit
 from zilla import verify
@@ -164,6 +165,40 @@ _SHARE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── clock/date questions (R4c) — the zero-model clock route ──
+# Anchored over NORMALIZED text only, and deliberately narrow: a "what
+# time/date/day" question with nothing else attached. Any extra words ("in
+# London", "is the meeting") break the anchor and fall to the full path,
+# because a wrong instant answer is worse than a slow right one. A trailing
+# "?" is allowed through (it IS a question) — but only trailing.
+_CLOCK_RE = re.compile(
+    r"^what(?:'?s| is)?(?: the| todays| today's)?"
+    r" (?:time|date|day)"
+    r"(?: is it| it is| today| now| right now| tonight)*$"
+)
+
+
+def _is_clock_question(text: str) -> bool:
+    probe = _normalize(text).rstrip("?").rstrip()
+    if not probe:
+        return False
+    return bool(_CLOCK_RE.match(probe))
+
+
+def clock_answer(now: datetime, zone: tzinfo | None = None) -> str:
+    """One plain-language sentence answering time, day AND date together —
+    so one matcher can serve all three phrasings without plumbing the kind
+    through. Pure given its inputs; with zone=None the local zone comes
+    from schedules._local_zone() (the scheduler's own DST-aware resolver),
+    resolved lazily so this module stays import-light."""
+    if zone is None:
+        from zilla.schedules import _local_zone
+        zone = _local_zone()
+    local = now.astimezone(zone)
+    hour = local.strftime("%I").lstrip("0")
+    return (f"It's {hour}:{local:%M} {local.strftime('%p').lower()}, "
+            f"{local:%A} {local.day} {local:%B %Y}.")
+
 # CONSERVATIVE closed whitelist: pure greetings / thanks / acknowledgments.
 # Normalized (stripped, lowercased, trailing punctuation removed) before
 # matching. Anything with a '?' or that doesn't fully match one of these is
@@ -273,8 +308,8 @@ def is_trivial(text: str) -> bool:
 
 def classify_route(text: str) -> str:
     """Deterministic, zero-model-call route for an incoming message.
-    Returns 'share', 'smalltalk', or 'full' (the safe default for anything
-    that doesn't cleanly match one of the narrow patterns above)."""
+    Returns 'share', 'clock', 'smalltalk', or 'full' (the safe default for
+    anything that doesn't cleanly match one of the narrow patterns above)."""
     t = text or ""
     if not t.strip():
         return "full"
@@ -285,6 +320,10 @@ def classify_route(text: str) -> str:
         # "remember?" (nothing to note) is a question, not a share.
         if payload and payload.strip("?!.,; ") != "":
             return "share"
+    # R4c: a bare clock/date question — after share (an explicit "remember
+    # what time it is" is a journal entry), before smalltalk.
+    if _is_clock_question(t):
+        return "clock"
     if is_trivial(t):
         return "smalltalk"
     return "full"

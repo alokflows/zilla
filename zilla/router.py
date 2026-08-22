@@ -6,7 +6,8 @@
 #  same input:
 #
 #    1. class   — 'command' (leading /), 'share' (zero-model journal
-#                 append), 'trivial' (greeting/thanks/ack), 'normal'.
+#                 append), 'clock' (zero-model time/date answer), 'trivial'
+#                 (greeting/thanks/ack), 'normal'.
 #                 The class patterns themselves live in review.py; this
 #                 module is the seam that names them and adds 'command'.
 #
@@ -51,6 +52,7 @@ from zilla.review import classify_route
 # ── classes ──────────────────────────────────────────────────
 COMMAND = "command"
 SHARE = "share"
+CLOCK = "clock"
 TRIVIAL = "trivial"
 NORMAL = "normal"
 
@@ -136,14 +138,16 @@ class Decision:
 # ══════════════════════════════════════════════════════════
 
 def classify(text: str) -> str:
-    """'command' | 'share' | 'trivial' | 'normal'. 'normal' is the safe
-    default for everything that doesn't cleanly match."""
+    """'command' | 'share' | 'clock' | 'trivial' | 'normal'. 'normal' is the
+    safe default for everything that doesn't cleanly match."""
     t = (text or "").strip()
     if t.startswith("/"):
         return COMMAND
     route = classify_route(t)
     if route == "share":
         return SHARE
+    if route == "clock":
+        return CLOCK
     if route == "smalltalk":
         return TRIVIAL
     return NORMAL

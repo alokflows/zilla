@@ -669,6 +669,85 @@ def _run_fast_prompt_purity_tests():
         _restore_backends(old)
 
 
+def _run_clock_tests():
+    print("\n[12] R4c — a clock/date question answers with zero model calls")
+    old = _with_backends(claude=True)
+    core = _fresh_core("r4c")
+    original_run = zcore.run_cli_async
+    old_fast = zcore._run_fast_claude
+    spawned = []
+
+    async def _must_not_spawn(prompt, conv_id=None, progress_callback=None,
+                              cancel_event=None, skip_permissions=False,
+                              ctx=None):
+        spawned.append(prompt)
+        return "THE BACKEND SHOULD NOT HAVE RUN", "conv-x"
+
+    from zilla import harness as _harness
+
+    def _turn_done_events():
+        out = []
+        with open(_harness._TRUST_LOG, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == "turn_done" and ev.get("route") == "clock":
+                    out.append(ev)
+        return out
+
+    async def _turn(uid, msg):
+        out = []
+        async for ev in core.handle_message(uid, msg):
+            out.append(ev)
+        return out
+
+    mem_before = memory.tree_snapshot()
+    try:
+        zcore.run_cli_async = _must_not_spawn
+        zcore._run_fast_claude = lambda prompt: spawned.append(f"fast:{prompt}") or "Hey!"
+
+        core.sessions.set_active_name("main", OWNER)
+        core.sessions.set_conversation_id("real-conv", user_id=OWNER,
+                                          session_name="main", backend="agy")
+
+        for uid in (OWNER, 222):  # any authorized principal, owner or not
+            events = asyncio.run(_turn(uid, "what time is it"))
+            replies = [e for e in events if isinstance(e, Response)]
+            check(f"uid {uid} gets exactly one instant answer",
+                  len(replies) == 1 and replies[0].text.startswith("It's "),
+                  [(e.text if hasattr(e, "text") else str(e)) for e in events])
+            meta = replies[0].meta
+            check(f"uid {uid}'s answer writes nothing into any session",
+                  meta.get("session") is None and meta.get("conv_id") is None
+                  and meta.get("canceled") is False, meta)
+
+        check("neither the full backend nor the fast one-shot ever spawned",
+              spawned == [], spawned)
+        check("the session's own conv id is untouched",
+              core.sessions.get_conversation_id(user_id=OWNER, session_name="main")
+              == "real-conv")
+        done = _turn_done_events()
+        check("each clock turn logs exactly one turn_done route=clock with ms",
+              len(done) == 2 and all(isinstance(e.get("ms"), int) and e["ms"] >= 0
+                                     for e in done), done)
+        check("memory is untouched by the clock turns",
+              memory.tree_snapshot() == mem_before)
+
+        # Owner emphasis beats the instant answer — the deep ask takes the
+        # full path even when it only asked for the time.
+        asyncio.run(_turn(OWNER, "!deep what time is it"))
+        check("`!deep` sends the same question to the real backend instead",
+              len(spawned) == 1, spawned)
+        reply = [e for e in asyncio.run(_turn(OWNER, "draft a note"))]
+        check("…and the pipeline itself still works afterwards", bool(reply))
+    finally:
+        zcore.run_cli_async = original_run
+        zcore._run_fast_claude = old_fast
+        _restore_backends(old)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  PHASE R1 — ROUTER + EFFORT CONTROLLER TESTS")
@@ -684,6 +763,7 @@ if __name__ == "__main__":
     _run_lean_injection_test()
     _run_turn_done_tests()
     _run_fast_prompt_purity_tests()
+    _run_clock_tests()
     print("\n" + "=" * 60)
     print(f"  {_passed} passed, {_failed} failed")
     print("=" * 60)
